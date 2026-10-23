@@ -2730,12 +2730,16 @@ ui <- fluidPage(
       )
   ),
   
-  # Inyección de Catálogo de Válvulas y Motor JavaScript Canvas
+  # Inyección de Catálogo de Válvulas, Logo Oficial ACP y Motor JavaScript Canvas
   tags$script(HTML(sprintf("
     const VALVES_DATA = %s;
-  ", json_valvulas))),
+    const LOGO_ACP_SRC = %s;
+  ", json_valvulas, toJSON(logo_cerro_prieto_src, auto_unbox = TRUE)))),
   
   tags$script(HTML("
+    const acpLogoImg = new Image();
+    acpLogoImg.src = (typeof LOGO_ACP_SRC !== 'undefined' && LOGO_ACP_SRC) ? LOGO_ACP_SRC : 'www/logo_cerro_prieto.png';
+
     /* ==================================================================== */
     /* APPLE iOS HIG LOADER CONTROLLER                                     */
     /* ==================================================================== */
@@ -3654,9 +3658,9 @@ ui <- fluidPage(
           const mapContentH = Math.round(bboxH * scaleW);
           
           const headerY = 32;
-          const headerH = 146;
+          const headerH = 180; // Altura ejecutiva optimizada para logo ACP y tipografía de alto impacto
           const mapX = 36;
-          const mapY = headerY + headerH + 20;
+          const mapY = headerY + headerH + 24;
           
           // Altura adaptativa del mapa para no dejar vacíos gigantescos en módulos alargados (ej. M4)
           const mapH = Math.min(2300, Math.max(1200, mapContentH + 120));
@@ -3670,31 +3674,21 @@ ui <- fluidPage(
           
           // Criterio inteligente: ¿cabe en la esquina superior izquierda dentro del mapa (ej. Módulo 12)?
           const candTL_X = mapX + 36;
-          const candTL_Y = mapY + 45;
+          const candTL_Y = mapY + 36;
           let candTL_Free = true;
           
-          // Leyenda de días en la esquina superior derecha
-          const legW = 1580;
-          const legH = 88;
-          const legX = mapX + mapW - legW - 24;
-          const legY = mapY + 20;
-          
-          if (candTL_X + tableW >= legX - 25) {
-            candTL_Free = false;
-          } else {
-            for (let i = 0; i < VALVES_DATA.length; i++) {
-              const v = VALVES_DATA[i];
-              if (hasFilter && !filteredIds.has(v.id)) continue;
-              const vx1 = v.x * fitScale + mapPanX;
-              const vy1 = v.y * fitScale + mapPanY;
-              const vx2 = (v.x + v.w) * fitScale + mapPanX;
-              const vy2 = (v.y + v.h) * fitScale + mapPanY;
-              
-              // Verificación de colisión con margen de seguridad (25px)
-              if (!(vx2 < candTL_X - 25 || vx1 > candTL_X + tableW + 25 || vy2 < candTL_Y - 25 || vy1 > candTL_Y + tableH + 25)) {
-                candTL_Free = false;
-                break;
-              }
+          for (let i = 0; i < VALVES_DATA.length; i++) {
+            const v = VALVES_DATA[i];
+            if (hasFilter && !filteredIds.has(v.id)) continue;
+            const vx1 = v.x * fitScale + mapPanX;
+            const vy1 = v.y * fitScale + mapPanY;
+            const vx2 = (v.x + v.w) * fitScale + mapPanX;
+            const vy2 = (v.y + v.h) * fitScale + mapPanY;
+            
+            // Verificación de colisión con margen de seguridad (25px)
+            if (!(vx2 < candTL_X - 25 || vx1 > candTL_X + tableW + 25 || vy2 < candTL_Y - 25 || vy1 > candTL_Y + tableH + 25)) {
+              candTL_Free = false;
+              break;
             }
           }
           
@@ -3745,33 +3739,79 @@ ui <- fluidPage(
           octx.fill();
           octx.stroke();
           
+          // Renderizado del Logo ACP en el Encabezado Ejecutivo
+          const logoH = 104;
+          const logoW = Math.round(logoH * 2.05); // ~213 px (aspect ratio 416x203)
+          const logoX = 64;
+          const logoY = headerY + Math.round((headerH - logoH) / 2);
+          let textX = 64;
+          
+          if (typeof acpLogoImg !== 'undefined' && acpLogoImg && acpLogoImg.complete && acpLogoImg.naturalWidth > 0) {
+            octx.drawImage(acpLogoImg, logoX, logoY, logoW, logoH);
+            
+            // Línea divisoria vertical sutil entre logo y textos
+            const divX = logoX + logoW + 28;
+            octx.strokeStyle = '#CBD5E1';
+            octx.lineWidth = 2.5;
+            octx.beginPath();
+            octx.moveTo(divX, headerY + 24);
+            octx.lineTo(divX, headerY + headerH - 24);
+            octx.stroke();
+            
+            textX = divX + 28;
+          }
+
           octx.textAlign = 'left';
           octx.textBaseline = 'top';
           
           octx.fillStyle = '#64748B';
           octx.font = 'bold 18px Inter, -apple-system, sans-serif';
-          octx.fillText('AGRÍCOLA DEL FUNDO • CAMPAÑA 2026', 64, headerY + 18);
+          octx.fillText('AGRÍCOLA CERRO PRIETO • CAMPAÑA 2026', textX, headerY + 22);
           
           octx.fillStyle = '#0F172A';
           octx.font = 'bold 36px Inter, -apple-system, sans-serif';
-          octx.fillText('🗺️ PROGRAMA Y RUTA DE COSECHA DE ARÁNDANO', 64, headerY + 44);
+          octx.fillText('PROGRAMA Y RUTA DE COSECHA DE ARÁNDANO', textX, headerY + 52);
           
+          // Título Ejecutivo Normalizado: SEM X - M Y - PASADA Z
+          let modTitle = '';
+          const fM = $('#filtro_modulo').val();
+          if (fM && fM.length) {
+            const mods = Array.isArray(fM) ? fM : [fM];
+            modTitle = mods.length === 1 ? `M ${mods[0]}` : `M ${mods.join(', ')}`;
+          } else {
+            const visibleMods = [...new Set(VALVES_DATA.filter(v => filteredIds === null || filteredIds.has(v.id)).map(v => String(v.Módulo)))].sort((a,b) => Number(a) - Number(b));
+            if (visibleMods.length === 1) {
+              modTitle = `M ${visibleMods[0]}`;
+            } else if (visibleMods.length > 1 && visibleMods.length <= 4) {
+              modTitle = `M ${visibleMods.join(', ')}`;
+            } else {
+              modTitle = 'FUNDO COMPLETO';
+            }
+          }
+          const pasadaUpper = activePass === 1 ? '1ª PASADA' : '2ª PASADA';
+          const titleText = `SEM ${semNum} - ${modTitle} - ${pasadaUpper}`;
+
           let filtroInfo = [];
           const fG = $('#filtro_grupo').val();
-          const fM = $('#filtro_modulo').val();
           const fT = $('#filtro_turno').val();
           const fVal = $('#filtro_valvula').val();
           const fV = $('#filtro_variedad').val();
           if (fG && fG.length) filtroInfo.push('Grupos: ' + (Array.isArray(fG) ? fG.join(', ') : fG));
-          if (fM && fM.length) filtroInfo.push('Módulos: ' + (Array.isArray(fM) ? fM.join(', ') : fM));
           if (fT && fT.length) filtroInfo.push('Turnos: ' + (Array.isArray(fT) ? fT.join(', ') : fT));
           if (fVal && fVal.length) filtroInfo.push('Válvulas: ' + (Array.isArray(fVal) ? fVal.join(', ') : fVal));
           if (fV && fV.length) filtroInfo.push('Variedades: ' + (Array.isArray(fV) ? fV.join(', ') : fV));
-          const txtFiltro = filtroInfo.length > 0 ? filtroInfo.join(' • ') : 'Todo el Fundo (Vista General)';
-          
-          octx.fillStyle = '#475569';
-          octx.font = '600 19px Inter, -apple-system, sans-serif';
-          octx.fillText(`Semana ${semNum} • ${modoLabel} • ${pasadaLabel} • ${txtFiltro}`, 64, headerY + 98);
+          const txtExtra = filtroInfo.length > 0 ? (' • ' + filtroInfo.join(' • ')) : '';
+
+          octx.fillStyle = '#0F172A';
+          octx.font = 'bold 30px Inter, -apple-system, sans-serif';
+          octx.fillText(titleText, textX, headerY + 112);
+
+          if (txtExtra) {
+            const tw = octx.measureText(titleText).width;
+            octx.fillStyle = '#64748B';
+            octx.font = '600 22px Inter, -apple-system, sans-serif';
+            octx.fillText(txtExtra, textX + tw, headerY + 118);
+          }
           
           // Badges del Encabezado (Derecha)
           octx.textAlign = 'right';
@@ -3779,19 +3819,21 @@ ui <- fluidPage(
           
           const modeBg = activeMode === 'CosechaCampo' ? '#16A34A' : (activeMode === 'CosechaOficial' ? '#0F172A' : '#007AFF');
           const modeTxt = `${modoLabel} (${pasadaLabel})`;
-          octx.font = 'bold 20px Inter, -apple-system, sans-serif';
+          octx.font = 'bold 22px Inter, -apple-system, sans-serif';
           const mTextW = octx.measureText(modeTxt).width;
+          const badgeH = 50;
+          const badgeY = headerY + 28;
           
           octx.fillStyle = modeBg;
-          drawRoundRect(octx, outW - 64 - mTextW - 40, headerY + 20, mTextW + 40, 46, 23);
+          drawRoundRect(octx, outW - 64 - mTextW - 44, badgeY, mTextW + 44, badgeH, 25);
           octx.fill();
           octx.fillStyle = '#FFFFFF';
-          octx.fillText(modeTxt, outW - 64 - 20, headerY + 43);
+          octx.fillText(modeTxt, outW - 64 - 22, badgeY + badgeH / 2);
           
           const nowStr = new Date().toLocaleString('es-PE', { dateStyle: 'short', timeStyle: 'short' });
-          octx.fillStyle = '#64748B';
-          octx.font = '500 16px Inter, -apple-system, sans-serif';
-          octx.fillText(`Exportado: ${nowStr} • ${totalValvulasVisibles} válvulas (${totalAreaFisica.toFixed(2)} ha física)`, outW - 64, headerY + 98);
+          octx.fillStyle = '#1E293B';
+          octx.font = 'bold 22px Inter, -apple-system, sans-serif';
+          octx.fillText(`Exportado: ${nowStr} • ${totalValvulasVisibles} válvulas (${totalAreaFisica.toFixed(2)} ha física)`, outW - 64, headerY + 128);
           octx.restore();
           
           // -------------------------------------------------------------
@@ -3935,9 +3977,15 @@ ui <- fluidPage(
               let fSizeCode = normCodePx / fitScale;
               let fSizeHa   = normAreaPx / fitScale;
               
-              // A. Código de Válvula (En negro puro, sin contorno, normalizado)
+              // A. Código de Válvula (En formato T - V, sin prefijo M, negro puro, sin contorno)
+              let codeLabel = v.codigo || '';
+              if (v.Turno && v.Válvula) {
+                codeLabel = 'T' + v.Turno + '-V' + v.Válvula;
+              } else {
+                codeLabel = codeLabel.replace(/^M[0-9]+-/, '');
+              }
               octx.font = 'bold ' + fSizeCode + 'px Inter, -apple-system, sans-serif';
-              let codeW = octx.measureText(v.codigo).width;
+              let codeW = octx.measureText(codeLabel).width;
               if (codeW > maxTextW) {
                 fSizeCode = Math.max(11 / fitScale, fSizeCode * (maxTextW / codeW));
                 octx.font = 'bold ' + fSizeCode + 'px Inter, -apple-system, sans-serif';
@@ -3948,12 +3996,10 @@ ui <- fluidPage(
               }
               const y1 = v.y + v.h * ry1;
               octx.fillStyle = '#000000';
-              octx.fillText(v.codigo, cx, y1);
+              octx.fillText(codeLabel, cx, y1);
               
-              // B. Área Física + Kilos Asignados (En negro puro, sin contorno, normalizado)
-              const kgVal = activeSlot.totalKg || 0;
-              const textHa = (v.Área !== undefined && v.Área !== null ? v.Área : '') + ' ha' +
-                             (kgVal > 0 ? ' • ' + Math.round(kgVal).toLocaleString() + ' kg' : '');
+              // B. Área Física (En negro puro, sin contorno, normalizado, solo ha, sin kilos)
+              const textHa = (v.Área !== undefined && v.Área !== null ? v.Área : '') + ' ha';
               octx.font = 'bold ' + fSizeHa + 'px Inter, -apple-system, sans-serif';
               let haW = octx.measureText(textHa).width;
               if (haW > maxTextW) {
@@ -3972,90 +4018,7 @@ ui <- fluidPage(
             }
           }
           
-          // Banners de Módulos (Solo si pertenecen a la selección visible)
-          octx.save();
-          octx.textAlign = 'center';
-          octx.textBaseline = 'middle';
-          const moduleBanners = [
-            { idMod: '12', text: 'MÓDULO 12', x: 4294, y: 1410, w: 1554, h: 38, bg: '#FCE7F3', border: '#F472B6', col: '#831843' },
-            { idMod: '7',  text: 'MÓDULO 7',  x: 5900, y: 855,  w: 748,  h: 38, bg: '#CFFAFE', border: '#06B6D4', col: '#164E63' },
-            { idMod: '6',  text: 'MÓDULO 6',  x: 6788, y: 345,  w: 1412, h: 38, bg: '#D1FAE5', border: '#10B981', col: '#064E3B' },
-            { idMod: '5',  text: 'MÓDULO 5',  x: 6788, y: 1495, w: 1412, h: 38, bg: '#D1FAE5', border: '#10B981', col: '#064E3B' },
-            { idMod: '4',  text: 'MÓDULO 4',  x: 6788, y: 2010, w: 1412, h: 38, bg: '#D1FAE5', border: '#10B981', col: '#064E3B' },
-            { idMod: '3',  text: 'MÓDULO 3',  x: 8320, y: 345,  w: 2243, h: 38, bg: '#E0F2FE', border: '#38BDF8', col: '#0C4A6E' },
-            { idMod: '2',  text: 'MÓDULO 2',  x: 8320, y: 1495, w: 1186, h: 38, bg: '#FFEDD5', border: '#FB923C', col: '#7C2D12' },
-            { idMod: '1',  text: 'MÓDULO 1',  x: 9596, y: 1495, w: 967,  h: 38, bg: '#FEF08A', border: '#FACC15', col: '#713F12' },
-            { idMod: '13', text: 'MÓDULO 13', x: 8320, y: 2645, w: 1186, h: 38, bg: '#E0E7FF', border: '#818CF8', col: '#312E81' },
-            { idMod: '14', text: 'MÓDULO 14', x: 9596, y: 2645, w: 967,  h: 38, bg: '#EDE9FE', border: '#A78BFA', col: '#4C1D95' },
-            { idMod: '10', text: 'MÓDULO 10', x: 4060, y: 5065, w: 1788, h: 38, bg: '#FFEDD5', border: '#FB923C', col: '#7C2D12' },
-            { idMod: '11', text: 'MÓDULO 11', x: 4790, y: 3155, w: 1058, h: 36, bg: '#86EFAC', border: '#22C55E', col: '#14532D' },
-            { idMod: '9',  text: 'MÓDULO 9',  x: 4790, y: 4265, w: 1058, h: 36, bg: '#86EFAC', border: '#22C55E', col: '#14532D' }
-          ];
-          
-          const pasadaText = activePass === 1 ? '1ª PASADA' : '2ª PASADA';
-          
-          moduleBanners.forEach(mb => {
-            const modSeleccionado = !hasFilter || (Array.isArray(fM) && fM.includes(mb.idMod)) || (fM === mb.idMod);
-            if (!modSeleccionado) return;
-            
-            octx.fillStyle = mb.bg;
-            octx.strokeStyle = mb.border;
-            octx.lineWidth = Math.max(2.2 / fitScale, 1.5);
-            octx.fillRect(mb.x, mb.y, mb.w, mb.h);
-            octx.strokeRect(mb.x, mb.y, mb.w, mb.h);
-            
-            const bannerText = `${mb.text} • ${pasadaText}`;
-            octx.fillStyle = mb.col;
-            const fSizeBanner = Math.max(24 / fitScale, mb.h * 0.70);
-            octx.font = 'bold ' + fSizeBanner + 'px Inter, -apple-system, sans-serif';
-            octx.fillText(bannerText, mb.x + mb.w / 2, mb.y + mb.h / 2);
-          });
-          octx.restore();
-          
           octx.restore(); // fin del clip del mapa
-          
-          // Leyenda Flotante Destacada (Esquina superior derecha del mapa - Letra y pastillas grandes)
-          octx.save();
-          const legItems = [
-            { label: 'Lun', color: DAY_COLORS.lunes },
-            { label: 'Mar', color: DAY_COLORS.martes },
-            { label: 'Mié', color: DAY_COLORS.miercoles },
-            { label: 'Jue', color: DAY_COLORS.jueves },
-            { label: 'Vie', color: DAY_COLORS.viernes },
-            { label: 'Sáb', color: DAY_COLORS.sabado }
-          ];
-          
-          octx.fillStyle = 'rgba(255, 255, 255, 0.98)';
-          octx.strokeStyle = 'rgba(0, 0, 0, 0.20)';
-          octx.lineWidth = 2.5;
-          drawRoundRect(octx, legX, legY, legW, legH, 18);
-          octx.fill();
-          octx.stroke();
-          
-          octx.textBaseline = 'middle';
-          octx.textAlign = 'left';
-          octx.fillStyle = '#0F172A';
-          octx.font = 'bold 30px Inter, -apple-system, sans-serif';
-          octx.fillText('DÍAS:', legX + 32, legY + legH / 2);
-          
-          const legItemStep = (legW - 150) / 6;
-          legItems.forEach((it, idx) => {
-            const ix = legX + 150 + idx * legItemStep;
-            const iy = legY + legH / 2;
-            
-            octx.fillStyle = it.color;
-            octx.beginPath();
-            octx.arc(ix + 18, iy, 16, 0, Math.PI * 2);
-            octx.fill();
-            octx.strokeStyle = 'rgba(0, 0, 0, 0.3)';
-            octx.lineWidth = 2;
-            octx.stroke();
-            
-            octx.fillStyle = '#0F172A';
-            octx.font = 'bold 32px Inter, -apple-system, sans-serif';
-            octx.fillText(it.label, ix + 44, iy);
-          });
-          octx.restore();
           octx.restore(); // fin contenedor mapa
           
           // -------------------------------------------------------------
@@ -4218,7 +4181,8 @@ ui <- fluidPage(
               return;
             }
             const nowFile = new Date().toISOString().slice(0, 10);
-            const fileName = `Ruta_Cosecha_Semana_${semNum}_${activeMode}_Pasada${activePass}_${nowFile}.png`;
+            const fileMod = modTitle ? (modTitle.replace(/[^A-Za-z0-9]+/g, '_') + '_') : '';
+            const fileName = `Ruta_Cosecha_${fileMod}Sem_${semNum}_Pasada${activePass}_${nowFile}.png`;
             const link = document.createElement('a');
             link.download = fileName;
             link.href = URL.createObjectURL(blob);
