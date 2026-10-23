@@ -1,0 +1,29 @@
+
+
+
+
+
+
+
+
+
+
+completados
+
+- Ahora se puede editar/ingresar área determinada dando doble click sobre la valvula
+- Se separaron las opciones de borrado al 10 y 100% y solo se podrá borrar datos del dia activo
+- El mapa se puede mover dando anticlick
+- Se habilito el ctrl + Z para deshacer el ultimo movimiento
+-Faltan mapas de las m6 - v40,v42,v51
+-Mejorar el exportar imágenes
+
+- para los modulos 1,2,3 el pintado debe ser horizontal
+-El dia activo será el dia anterior al dia de hoy, por ejemplo hoy miércoles estará activo el martes
+
+
+-validar login y concurrencia
+
+a futuros
+
+- y si es una válvula agregar ingreso de pintado, norte, sur, centro
+-opción mover dia / copiar dia 

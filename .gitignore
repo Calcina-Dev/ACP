@@ -1,0 +1,11 @@
+# Datos pesados y archivos binarios de datos operativos
+*.RData
+*.RDataTmp
+.RData
+.Rhistory
+.Rproj.user/
+rsconnect/
+.DS_Store
+Thumbs.db
+*.bak
+*backup*
