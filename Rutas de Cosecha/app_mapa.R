@@ -2259,7 +2259,11 @@ ui <- fluidPage(
       # Fila Superior: Título a la izquierda y Perfil de Usuario en la Esquina Derecha
       div(class = "ios-header-top-row",
           div(class = "ios-header-title-box",
-              h1(class = "ios-title", "🗺 Ruta Semanal de Proyección y Cosecha"),
+              h1(class = "ios-title", style = "display: flex; align-items: center; gap: 10px;",
+                 tags$img(src = logo_cerro_prieto_src, alt = "CP", 
+                          style = "height: 30px; width: 30px; object-fit: contain; border-radius: 6px; vertical-align: middle; flex-shrink: 0; box-shadow: 0 1px 4px rgba(0,0,0,0.06);"),
+                 tags$span("Ruta Semanal de Proyección y Cosecha")
+              ),
               p(class = "ios-subtitle", "Cálculo Automático desde Hoja 'Cálculo' (Proyección) y Distribución de Kilos Cosechados por ha")
           ),
           div(class = "ios-header-user-corner",
@@ -3648,68 +3652,150 @@ ui <- fluidPage(
           let bboxCX = (bMinX + bMaxX) / 2;
           let bboxCY = (bMinY + bMaxY) / 2;
           
-          // Detección automática de orientación: si el recorte es vertical o cuadrado, usar Dashboard Lateral
-          const aspect = bboxH / Math.max(bboxW, 1);
-          // Ancho base Ultra-HD 4K y cálculo adaptativo de altura según el aspecto del módulo
-          const outW = 3400;
-          const mapW = outW - 72; // 3328 px
-          const paddingFactor = 1.04;
-          const scaleW = mapW / (bboxW * paddingFactor);
-          const mapContentH = Math.round(bboxH * scaleW);
+          // Detección de selección de módulo para comportamiento de diseño inteligente
+          const fM = $('#filtro_modulo').val();
+          const visibleMods = [...new Set(VALVES_DATA.filter(v => filteredIds === null || filteredIds.has(v.id)).map(v => String(v.Módulo)))].sort((a,b) => Number(a) - Number(b));
           
+          let modTitle = '';
+          if (fM && fM.length) {
+            const mods = Array.isArray(fM) ? fM : [fM];
+            modTitle = mods.length === 1 ? `M ${mods[0]}` : `M ${mods.join(', ')}`;
+          } else {
+            if (visibleMods.length === 1) {
+              modTitle = `M ${visibleMods[0]}`;
+            } else if (visibleMods.length > 1 && visibleMods.length <= 4) {
+              modTitle = `M ${visibleMods.join(', ')}`;
+            } else {
+              modTitle = 'FUNDO COMPLETO';
+            }
+          }
+          const pasadaUpper = activePass === 1 ? '1ª PASADA' : '2ª PASADA';
+          const titleText = `SEM ${semNum} - ${modTitle} - ${pasadaUpper}`;
+
+          const isMod11 = (visibleMods.length === 1 && String(visibleMods[0]).trim() === '11') ||
+                          (Array.isArray(fM) && fM.length === 1 && String(fM[0]).trim() === '11') ||
+                          (String(fM).trim() === '11');
+          const isMod12 = (visibleMods.length === 1 && String(visibleMods[0]).trim() === '12') ||
+                          (Array.isArray(fM) && fM.length === 1 && String(fM[0]).trim() === '12') ||
+                          (String(fM).trim() === '12');
+
+          // Dimensiones del Cuadro de Resumen (Con tipografía amplia y legible)
+          const tableW = 1280;
+          const tableH = 660;
+
+          const paddingFactor = 1.04;
           const headerY = 32;
           const headerH = 180; // Altura ejecutiva optimizada para logo ACP y tipografía de alto impacto
           const mapX = 36;
           const mapY = headerY + headerH + 24;
-          
-          // Altura adaptativa del mapa para no dejar vacíos gigantescos en módulos alargados (ej. M4)
+
+          // Estimación inicial de escala
+          const maxMapW = 3328;
+          const scaleW = maxMapW / (bboxW * paddingFactor);
+          const mapContentH = Math.round(bboxH * scaleW);
           const mapH = Math.min(2300, Math.max(1200, mapContentH + 120));
-          const fitScale = Math.min(mapW / (bboxW * paddingFactor), (mapH - 50) / (bboxH * paddingFactor));
+
+          let fitScale = Math.min(maxMapW / (bboxW * paddingFactor), (mapH - 50) / (bboxH * paddingFactor));
+          let contentW = Math.round(bboxW * fitScale);
+
+          // Ancho adaptativo del mapa y lámina según módulo para reducir márgenes laterales vacíos
+          let mapW = maxMapW;
+          if (isMod12) {
+            // Módulo 12: Reducir el espacio en blanco de la derecha manteniendo composición perfecta
+            mapW = Math.max(2700, Math.min(2950, contentW + 140));
+          } else if (isMod11) {
+            // Módulo 11: Reducir márgenes laterales ajustando el ancho a las válvulas reales (~65px de margen a cada lado)
+            mapW = Math.max(2540, Math.min(3328, Math.round(contentW + 130)));
+          } else {
+            // Demás casos (ej. M 1, 2, 3 o Módulo 1):
+            // Reducir márgenes laterales ajustando el ancho del marco a las válvulas reales
+            mapW = Math.max(2500, Math.min(3328, contentW + 140));
+          }
+
+          const outW = mapW + 72;
+
+          // Ajuste fino final de fitScale y centrado con mapW definitivo
+          fitScale = Math.min(mapW / (bboxW * paddingFactor), (mapH - 50) / (bboxH * paddingFactor));
           const mapPanX = mapX + mapW / 2 - bboxCX * fitScale;
           const mapPanY = mapY + mapH / 2 - bboxCY * fitScale;
-          
-          // Dimensiones del Cuadro de Resumen (Con tipografía amplia y legible)
-          const tableW = 1280;
-          const tableH = 660;
-          
-          // Criterio inteligente: ¿cabe en la esquina superior izquierda dentro del mapa (ej. Módulo 12)?
-          const candTL_X = mapX + 36;
-          const candTL_Y = mapY + 36;
-          let candTL_Free = true;
-          
-          for (let i = 0; i < VALVES_DATA.length; i++) {
-            const v = VALVES_DATA[i];
-            if (hasFilter && !filteredIds.has(v.id)) continue;
-            const vx1 = v.x * fitScale + mapPanX;
-            const vy1 = v.y * fitScale + mapPanY;
-            const vx2 = (v.x + v.w) * fitScale + mapPanX;
-            const vy2 = (v.y + v.h) * fitScale + mapPanY;
-            
-            // Verificación de colisión con margen de seguridad (25px)
-            if (!(vx2 < candTL_X - 25 || vx1 > candTL_X + tableW + 25 || vy2 < candTL_Y - 25 || vy1 > candTL_Y + tableH + 25)) {
-              candTL_Free = false;
-              break;
+
+          // Ubicación inteligente del Cuadro de Resumen
+          let tableX, tableY, outH;
+
+          if (isMod11) {
+            // CASO MÓDULO 11:
+            // Ubicar el cuadro resumen metido en la zona libre a la derecha:
+            // - Esquina derecha alineada con la columna de la válvula 4 o 2 (M11-T1-V4 / M11-T1-V2)
+            // - Nivel horizontal alineado con la válvula 42 (M11-T17-V42)
+            let v4Right = null;
+            let v42Top = null;
+
+            for (let i = 0; i < VALVES_DATA.length; i++) {
+              const v = VALVES_DATA[i];
+              // Filtrar estrictamente solo válvulas pertenecientes al Módulo 11
+              if (String(v.Módulo).trim() !== '11') continue;
+              const cod = String(v.codigo || '');
+              if (cod === 'M11-T1-V4' || cod === 'M11-T1-V2' || cod.endsWith('-T1-V4') || cod.endsWith('-T1-V2')) {
+                const rx = (v.x + v.w) * fitScale + mapPanX;
+                if (v4Right === null || rx > v4Right) v4Right = rx;
+              }
+              if (cod === 'M11-T17-V42' || cod.endsWith('-T17-V42')) {
+                v42Top = v.y * fitScale + mapPanY;
+              }
+            }
+
+            // Fallback seguro usando las coordenadas conocidas de M11 si no se hallaran por código
+            if (v4Right === null) v4Right = 5848.0 * fitScale + mapPanX;
+            if (v42Top === null) v42Top = 3515.1 * fitScale + mapPanY;
+
+            tableX = Math.round(v4Right - tableW);
+            tableY = Math.round(v42Top);
+
+            // Asegurar que quede dentro del canvas visible con márgenes seguros
+            tableX = Math.max(mapX + 24, Math.min(mapX + mapW - tableW - 24, tableX));
+            tableY = Math.max(mapY + 24, Math.min(mapY + mapH - tableH - 24, tableY));
+            outH = Math.max(mapY + mapH + 36, tableY + tableH + 36);
+          } else {
+            // Criterio inteligente: ¿cabe en la esquina superior izquierda dentro del mapa (ej. Módulo 12)?
+            const candTL_X = mapX + 36;
+            const candTL_Y = mapY + 36;
+            let candTL_Free = true;
+
+            for (let i = 0; i < VALVES_DATA.length; i++) {
+              const v = VALVES_DATA[i];
+              if (hasFilter && !filteredIds.has(v.id)) continue;
+              const vx1 = v.x * fitScale + mapPanX;
+              const vy1 = v.y * fitScale + mapPanY;
+              const vx2 = (v.x + v.w) * fitScale + mapPanX;
+              const vy2 = (v.y + v.h) * fitScale + mapPanY;
+
+              // Verificación de colisión con margen de seguridad (25px)
+              if (!(vx2 < candTL_X - 25 || vx1 > candTL_X + tableW + 25 || vy2 < candTL_Y - 25 || vy1 > candTL_Y + tableH + 25)) {
+                candTL_Free = false;
+                break;
+              }
+            }
+
+            if (candTL_Free) {
+              // Caso Módulo 12: Hay espacio libre arriba a la izquierda
+              tableX = candTL_X;
+              tableY = candTL_Y;
+              outH = mapY + mapH + 36;
+            } else {
+              // Caso M 1, 2, 3 o Módulo 1: Ubicar debajo del plano
+              // Alinear el inicio del cuadro resumen exactamente donde inicia la válvula 13 (columna izquierda de válvulas)
+              const valvesLeftScreen = bMinX * fitScale + mapPanX;
+              tableX = Math.max(mapX + 36, Math.min(mapX + mapW - tableW - 36, Math.round(valvesLeftScreen)));
+              tableY = mapY + mapH + 24;
+              outH = tableY + tableH + 36;
             }
           }
-          
-          let tableX, tableY, outH;
-          if (candTL_Free) {
-            // Caso 1: Hay espacio libre arriba a la izquierda (ej. Módulo 12)
-            tableX = candTL_X;
-            tableY = candTL_Y;
-            outH = mapY + mapH + 36;
-          } else {
-            // Caso 2: Esquina ocupada -> Ubicar en la esquina inferior izquierda debajo del plano
-            tableX = mapX + 36;
-            tableY = mapY + mapH + 24;
-            outH = tableY + tableH + 36;
-          }
-          
+
           const outCanvas = document.createElement('canvas');
           outCanvas.width = outW;
           outCanvas.height = outH;
           const octx = outCanvas.getContext('2d');
-          
+
           function drawRoundRect(c, x, y, width, height, radius) {
             c.beginPath();
             c.moveTo(x + radius, y);
@@ -3723,11 +3809,11 @@ ui <- fluidPage(
             c.quadraticCurveTo(x, y, x + radius, y);
             c.closePath();
           }
-          
+
           // Fondo general de la lámina
           octx.fillStyle = '#F8FAFC';
           octx.fillRect(0, 0, outW, outH);
-          
+
           // -------------------------------------------------------------
           // 1. ENCABEZADO EJECUTIVO
           // -------------------------------------------------------------
@@ -3738,17 +3824,20 @@ ui <- fluidPage(
           drawRoundRect(octx, 36, headerY, outW - 72, headerH, 16);
           octx.fill();
           octx.stroke();
-          
-          // Renderizado del Logo ACP en el Encabezado Ejecutivo
-          const logoH = 104;
-          const logoW = Math.round(logoH * 2.05); // ~213 px (aspect ratio 416x203)
+
+          // Renderizado del Logo ACP en el Encabezado Ejecutivo (Ajuste dinámico según relación de aspecto real)
+          const logoH = 118;
+          const logoAspect = (typeof acpLogoImg !== 'undefined' && acpLogoImg && acpLogoImg.naturalWidth && acpLogoImg.naturalHeight) 
+                             ? (acpLogoImg.naturalWidth / acpLogoImg.naturalHeight) 
+                             : 1.0;
+          const logoW = Math.round(logoH * logoAspect);
           const logoX = 64;
           const logoY = headerY + Math.round((headerH - logoH) / 2);
           let textX = 64;
-          
+
           if (typeof acpLogoImg !== 'undefined' && acpLogoImg && acpLogoImg.complete && acpLogoImg.naturalWidth > 0) {
             octx.drawImage(acpLogoImg, logoX, logoY, logoW, logoH);
-            
+
             // Línea divisoria vertical sutil entre logo y textos
             const divX = logoX + logoW + 28;
             octx.strokeStyle = '#CBD5E1';
@@ -3757,39 +3846,20 @@ ui <- fluidPage(
             octx.moveTo(divX, headerY + 24);
             octx.lineTo(divX, headerY + headerH - 24);
             octx.stroke();
-            
+
             textX = divX + 28;
           }
 
           octx.textAlign = 'left';
           octx.textBaseline = 'top';
-          
+
           octx.fillStyle = '#64748B';
           octx.font = 'bold 18px Inter, -apple-system, sans-serif';
           octx.fillText('AGRÍCOLA CERRO PRIETO • CAMPAÑA 2026', textX, headerY + 22);
-          
+
           octx.fillStyle = '#0F172A';
           octx.font = 'bold 36px Inter, -apple-system, sans-serif';
           octx.fillText('PROGRAMA Y RUTA DE COSECHA DE ARÁNDANO', textX, headerY + 52);
-          
-          // Título Ejecutivo Normalizado: SEM X - M Y - PASADA Z
-          let modTitle = '';
-          const fM = $('#filtro_modulo').val();
-          if (fM && fM.length) {
-            const mods = Array.isArray(fM) ? fM : [fM];
-            modTitle = mods.length === 1 ? `M ${mods[0]}` : `M ${mods.join(', ')}`;
-          } else {
-            const visibleMods = [...new Set(VALVES_DATA.filter(v => filteredIds === null || filteredIds.has(v.id)).map(v => String(v.Módulo)))].sort((a,b) => Number(a) - Number(b));
-            if (visibleMods.length === 1) {
-              modTitle = `M ${visibleMods[0]}`;
-            } else if (visibleMods.length > 1 && visibleMods.length <= 4) {
-              modTitle = `M ${visibleMods.join(', ')}`;
-            } else {
-              modTitle = 'FUNDO COMPLETO';
-            }
-          }
-          const pasadaUpper = activePass === 1 ? '1ª PASADA' : '2ª PASADA';
-          const titleText = `SEM ${semNum} - ${modTitle} - ${pasadaUpper}`;
 
           let filtroInfo = [];
           const fG = $('#filtro_grupo').val();
@@ -4167,8 +4237,6 @@ ui <- fluidPage(
           octx.fillStyle = '#D97706';
           octx.font = 'bold 32px Inter, -apple-system, sans-serif';
           octx.fillText(`${Math.round(totalKgSemana).toLocaleString()} kg`, colX_Kg, footTextY);
-          octx.restore();
-          
           octx.restore(); // Fin contenedor tabla
           
           // -------------------------------------------------------------
