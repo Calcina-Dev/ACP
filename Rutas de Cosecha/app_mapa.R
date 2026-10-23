@@ -2848,6 +2848,7 @@ ui <- fluidPage(
         cellFractions: {},
         hasExactPcts: false,
         align: 'start',
+        ranges: [],
         kg: emptyCounts(),
         totalKg: 0
       };
@@ -2902,68 +2903,100 @@ ui <- fluidPage(
       return 'start';
     }
 
-    function syncCellsFromCounts(slot, align = null) {
-      if (!slot) return;
-      if (!slot.cells) slot.cells = Array(10).fill('');
-      const targetAlign = align || slot.align || detectSlotAlign(slot) || 'start';
-      slot.align = targetAlign;
-      slot.cells.fill('');
-      if (!slot.cellFractions) slot.cellFractions = {};
+    function buildRangesFromSlot(slot) {
+      if (!slot) return [];
+      const counts = slot.counts || {};
       
-      let totalPct = 0;
-      const activeDays = [];
-      for (let d of DAY_KEYS) {
-        const p = Math.max(0, Number(slot.counts && slot.counts[d]) || 0);
-        if (p > 0) {
-          activeDays.push({ day: d, pct: p });
-          totalPct += p;
+      const orderedDays = [];
+      const seen = new Set();
+      if (slot.cells && Array.isArray(slot.cells)) {
+        for (let c = 0; c < 10; c++) {
+          const d = slot.cells[c];
+          if (d && (Number(counts[d]) || 0) > 0 && !seen.has(d)) {
+            seen.add(d);
+            orderedDays.push(d);
+          }
         }
       }
-      totalPct = Math.min(100, Math.round(totalPct * 100) / 100);
+      for (let d of DAY_KEYS) {
+        if ((Number(counts[d]) || 0) > 0 && !seen.has(d)) {
+          seen.add(d);
+          orderedDays.push(d);
+        }
+      }
+      if (orderedDays.length === 0) return [];
       
-      if (totalPct <= 0 || activeDays.length === 0) {
-        slot.cellFractions = {};
+      let totalPct = 0;
+      for (let d of orderedDays) totalPct += (Number(counts[d]) || 0);
+      totalPct = Math.min(100, Math.max(0, Math.round(totalPct * 100) / 100));
+      if (totalPct <= 0) return [];
+      
+      const align = slot.align || detectSlotAlign(slot) || 'start';
+      let startOffset = 0;
+      if (align === 'end') startOffset = 100 - totalPct;
+      else if (align === 'center') startOffset = (100 - totalPct) / 2;
+      
+      let curOffset = startOffset;
+      const ranges = [];
+      for (let d of orderedDays) {
+        const p = Number(counts[d]) || 0;
+        if (p <= 0) continue;
+        const endOffset = Math.min(100, curOffset + p);
+        ranges.push({ day: d, start: curOffset, end: endOffset, pct: p });
+        curOffset = endOffset;
+      }
+      return ranges;
+    }
+
+    function getSlotRanges(slot) {
+      if (slot && slot.ranges && Array.isArray(slot.ranges) && slot.ranges.length > 0) {
+        let valid = true;
+        for (let r of slot.ranges) {
+          const cnt = Number(slot.counts && slot.counts[r.day]) || 0;
+          if (cnt <= 0 || !r.pct || r.pct <= 0) { valid = false; break; }
+        }
+        if (valid) return slot.ranges;
+      }
+      return buildRangesFromSlot(slot);
+    }
+
+    function syncCellsFromRanges(slot) {
+      if (!slot) return;
+      if (!slot.cells) slot.cells = Array(10).fill('');
+      slot.cells.fill('');
+      slot.cellFractions = {};
+      
+      const ranges = slot.ranges || [];
+      if (ranges.length === 0) {
         slot.hasExactPcts = false;
         return;
       }
       
-      let startOffsetPct = 0;
-      if (targetAlign === 'end') {
-        startOffsetPct = 100 - totalPct;
-      } else if (targetAlign === 'center') {
-        startOffsetPct = (100 - totalPct) / 2;
-      }
-      
-      let curOffset = startOffsetPct;
-      const dayRanges = [];
-      for (let item of activeDays) {
-        const endOffset = Math.min(100, curOffset + item.pct);
-        dayRanges.push({ day: item.day, start: curOffset, end: endOffset, pct: item.pct });
-        curOffset = endOffset;
-      }
-      
-      slot.cellFractions = {};
       for (let c = 0; c < 10; c++) {
         const cellStart = c * 10;
         const cellEnd = (c + 1) * 10;
         
         let maxOverlap = 0;
         let dominantDay = '';
+        let totalCellOverlap = 0;
         
-        for (let r of dayRanges) {
-          const overlapStart = Math.max(cellStart, r.start);
-          const overlapEnd = Math.min(cellEnd, r.end);
-          const overlap = Math.max(0, overlapEnd - overlapStart);
-          if (overlap > maxOverlap) {
-            maxOverlap = overlap;
-            dominantDay = r.day;
+        for (let r of ranges) {
+          const oStart = Math.max(cellStart, r.start);
+          const oEnd = Math.min(cellEnd, r.end);
+          const overlap = Math.max(0, oEnd - oStart);
+          if (overlap > 0.001) {
+            totalCellOverlap += overlap;
+            if (overlap > maxOverlap) {
+              maxOverlap = overlap;
+              dominantDay = r.day;
+            }
           }
         }
         
         if (dominantDay && maxOverlap > 0) {
           slot.cells[c] = dominantDay;
-          const frac = Math.round((maxOverlap / 10) * 100) / 100;
-          if (frac < 0.99) {
+          if (totalCellOverlap < 9.95) {
+            const frac = Math.round((totalCellOverlap / 10) * 100) / 100;
             slot.cellFractions[c] = frac;
           }
         } else {
@@ -2971,7 +3004,123 @@ ui <- fluidPage(
         }
       }
       
-      slot.hasExactPcts = activeDays.some(item => (item.pct % 10) !== 0);
+      slot.hasExactPcts = Object.values(slot.counts || {}).some(p => (Number(p) || 0) % 10 !== 0);
+    }
+
+    function updateSlotDay(slot, targetDay, targetPct, direction = null) {
+      if (!slot) return;
+      if (!slot.counts) slot.counts = emptyCounts();
+      if (!slot.cells) slot.cells = Array(10).fill('');
+      if (!slot.cellFractions) slot.cellFractions = {};
+      
+      const dir = direction || slot.align || 'start';
+      slot.align = dir;
+      
+      // 1. Rangos de los DEMÁS días (se respeta 100% su posición original)
+      const currentRanges = getSlotRanges(slot);
+      const otherRanges = currentRanges.filter(r => r.day !== targetDay && (Number(slot.counts[r.day]) || 0) > 0 && r.pct > 0);
+      
+      let otherTotal = 0;
+      for (let r of otherRanges) otherTotal += r.pct;
+      otherTotal = Math.round(otherTotal * 100) / 100;
+      
+      const maxAvailable = Math.max(0, Math.round((100 - otherTotal) * 100) / 100);
+      const pctToAssign = Math.min(Math.max(0, targetPct), maxAvailable);
+      const roundPct = Math.round(pctToAssign * 100) / 100;
+      
+      slot.counts[targetDay] = roundPct;
+      
+      if (roundPct <= 0) {
+        slot.ranges = otherRanges;
+        syncCellsFromRanges(slot);
+        return;
+      }
+      
+      // 2. Localizar intervalos LIBRES en la válvula
+      otherRanges.sort((a, b) => a.start - b.start);
+      const freeIntervals = [];
+      let cursor = 0;
+      for (let r of otherRanges) {
+        if (r.start > cursor + 0.01) {
+          freeIntervals.push({ start: cursor, end: r.start, len: r.start - cursor });
+        }
+        cursor = Math.max(cursor, r.end);
+      }
+      if (cursor < 100 - 0.01) {
+        freeIntervals.push({ start: cursor, end: 100, len: 100 - cursor });
+      }
+      
+      if (freeIntervals.length === 0) {
+        slot.ranges = otherRanges;
+        syncCellsFromRanges(slot);
+        return;
+      }
+      
+      // 3. Asignar el nuevo porcentaje en el espacio libre respetando la dirección
+      const newSegments = [];
+      if (dir === 'end') {
+        // Desde abajo / derecha hacia arriba
+        let remaining = roundPct;
+        for (let i = freeIntervals.length - 1; i >= 0 && remaining > 0.001; i--) {
+          const fi = freeIntervals[i];
+          const take = Math.min(remaining, fi.len);
+          const s = fi.end - take;
+          const e = fi.end;
+          newSegments.push({ day: targetDay, start: s, end: e, pct: take });
+          remaining -= take;
+        }
+      } else if (dir === 'center') {
+        if (freeIntervals.length === 1) {
+          const fi = freeIntervals[0];
+          const offset = (fi.len - roundPct) / 2;
+          const s = fi.start + Math.max(0, offset);
+          const e = s + roundPct;
+          newSegments.push({ day: targetDay, start: s, end: e, pct: roundPct });
+        } else {
+          let remaining = roundPct;
+          for (let i = 0; i < freeIntervals.length && remaining > 0.001; i++) {
+            const fi = freeIntervals[i];
+            const take = Math.min(remaining, fi.len);
+            newSegments.push({ day: targetDay, start: fi.start, end: fi.start + take, pct: take });
+            remaining -= take;
+          }
+        }
+      } else {
+        // 'start' (Arriba / Izquierda): Llenar desde el inicio del espacio libre disponible
+        let remaining = roundPct;
+        for (let i = 0; i < freeIntervals.length && remaining > 0.001; i++) {
+          const fi = freeIntervals[i];
+          const take = Math.min(remaining, fi.len);
+          newSegments.push({ day: targetDay, start: fi.start, end: fi.start + take, pct: take });
+          remaining -= take;
+        }
+      }
+      
+      slot.ranges = otherRanges.concat(newSegments);
+      slot.ranges.sort((a, b) => a.start - b.start);
+      syncCellsFromRanges(slot);
+    }
+
+    function syncCellsFromCounts(slot, align = null) {
+      if (!slot) return;
+      if (align) slot.align = align;
+      if (slot.ranges && slot.ranges.length > 0) {
+        let valid = true;
+        let rSum = 0;
+        for (let r of slot.ranges) {
+          const cnt = Number(slot.counts && slot.counts[r.day]) || 0;
+          if (cnt <= 0 || !r.pct || r.pct <= 0) { valid = false; break; }
+          rSum += r.pct;
+        }
+        let cSum = 0;
+        for (let d of DAY_KEYS) cSum += (Number(slot.counts && slot.counts[d]) || 0);
+        if (valid && Math.abs(rSum - cSum) < 0.1) {
+          syncCellsFromRanges(slot);
+          return;
+        }
+      }
+      slot.ranges = buildRangesFromSlot(slot);
+      syncCellsFromRanges(slot);
     }
     
     function recomputeValveSlotCounts(v, key) {
@@ -3011,57 +3160,28 @@ ui <- fluidPage(
     }
 
     function renderValveFills(c2d, v, slot, horiz) {
-      if (!slot || !slot.counts) return;
+      if (!slot) return;
+      const ranges = getSlotRanges(slot);
+      if (!ranges || ranges.length === 0) return;
       
-      const orderedDays = [];
-      const seen = new Set();
-      if (slot.cells) {
-        for (let c = 0; c < 10; c++) {
-          const d = slot.cells[c];
-          if (d && (slot.counts[d] || 0) > 0 && !seen.has(d)) {
-            seen.add(d);
-            orderedDays.push(d);
-          }
-        }
-      }
-      for (let d of DAY_KEYS) {
-        if ((slot.counts[d] || 0) > 0 && !seen.has(d)) {
-          seen.add(d);
-          orderedDays.push(d);
-        }
-      }
-      if (orderedDays.length === 0) return;
-      
-      let totalPct = 0;
-      for (let d of orderedDays) totalPct += (slot.counts[d] || 0);
-      totalPct = Math.min(100, Math.max(0, totalPct));
-      
-      const align = slot.align || 'start';
-      let startOffsetPct = 0;
-      if (align === 'end') {
-        startOffsetPct = 100 - totalPct;
-      } else if (align === 'center') {
-        startOffsetPct = (100 - totalPct) / 2;
-      }
-      
-      let currentOffsetPct = startOffsetPct;
-      for (let d of orderedDays) {
-        const pct = Math.max(0, Number(slot.counts[d]) || 0);
-        if (pct <= 0) continue;
-        const drawPct = Math.min(pct, 100 - currentOffsetPct);
-        if (drawPct <= 0) break;
+      for (let r of ranges) {
+        if (!r.pct || r.pct <= 0.001) continue;
+        const color = DAY_COLORS[r.day] || '#007AFF';
+        c2d.fillStyle = color;
+        const s = Math.max(0, Math.min(100, r.start));
+        const e = Math.max(0, Math.min(100, r.end));
+        const len = e - s;
+        if (len <= 0) continue;
         
-        c2d.fillStyle = DAY_COLORS[d] || '#007AFF';
         if (horiz) {
-          const y = v.y + (currentOffsetPct / 100) * v.h;
-          const h = (drawPct / 100) * v.h;
+          const y = v.y + (s / 100) * v.h;
+          const h = (len / 100) * v.h;
           c2d.fillRect(v.x, y, v.w, h);
         } else {
-          const x = v.x + (currentOffsetPct / 100) * v.w;
-          const w = (drawPct / 100) * v.w;
+          const x = v.x + (s / 100) * v.w;
+          const w = (len / 100) * v.w;
           c2d.fillRect(x, v.y, w, v.h);
         }
-        currentOffsetPct += drawPct;
       }
     }
     
@@ -4145,6 +4265,7 @@ ui <- fluidPage(
           cells: v.slots[key].cells.slice(),
           counts: Object.assign({}, v.slots[key].counts),
           cellFractions: Object.assign({}, v.slots[key].cellFractions || {}),
+          ranges: (v.slots[key].ranges || []).map(r => Object.assign({}, r)),
           hasExactPcts: !!v.slots[key].hasExactPcts,
           align: v.slots[key].align || 'start'
         }))
@@ -4169,6 +4290,7 @@ ui <- fluidPage(
           v.slots[snap.key].cells = item.cells.slice();
           if (item.counts) v.slots[snap.key].counts = Object.assign({}, item.counts);
           v.slots[snap.key].cellFractions = Object.assign({}, item.cellFractions || {});
+          v.slots[snap.key].ranges = (item.ranges || []).map(r => Object.assign({}, r));
           v.slots[snap.key].hasExactPcts = !!item.hasExactPcts;
           v.slots[snap.key].align = item.align || 'start';
           recomputeValveSlotCounts(v, snap.key);
@@ -4412,8 +4534,7 @@ ui <- fluidPage(
             return false;
           }
           saveSnapshotForUndo();
-          slot.counts[targetDay] = 0;
-          syncCellsFromCounts(slot);
+          updateSlotDay(slot, targetDay, 0);
           recomputeValveSlotCounts(v, key);
           changed = true;
           requestRender();
@@ -4441,8 +4562,8 @@ ui <- fluidPage(
         
         saveSnapshotForUndo();
         const step = Math.min(10, curPct);
-        slot.counts[targetDay] = Math.round((curPct - step) * 100) / 100;
-        syncCellsFromCounts(slot);
+        const newPct = Math.round((curPct - step) * 100) / 100;
+        updateSlotDay(slot, targetDay, newPct);
         recomputeValveSlotCounts(v, key);
         changed = true;
         marcarCambiosPendientes(true);
@@ -4488,8 +4609,7 @@ ui <- fluidPage(
         
         saveSnapshotForUndo();
         // Asignar el 100% de la diferencia disponible al día activo
-        slot.counts[dayVal] = maxAvailablePct;
-        syncCellsFromCounts(slot);
+        updateSlotDay(slot, dayVal, maxAvailablePct, slot.align || 'start');
         recomputeValveSlotCounts(v, key);
         changed = true;
         
@@ -4516,8 +4636,8 @@ ui <- fluidPage(
         
         saveSnapshotForUndo();
         const step = Math.min(10, remainingForDay);
-        slot.counts[dayVal] = Math.round((curDayPct + step) * 100) / 100;
-        syncCellsFromCounts(slot);
+        const newDayPct = Math.round((curDayPct + step) * 100) / 100;
+        updateSlotDay(slot, dayVal, newDayPct, slot.align || 'start');
         recomputeValveSlotCounts(v, key);
         changed = true;
         
@@ -4888,15 +5008,15 @@ ui <- fluidPage(
       if (bar) {
         bar.innerHTML = '';
         
-        const tempCounts = Object.assign({}, slot.counts);
-        tempCounts[dayVal] = curPct;
         const tempSlot = {
-          counts: tempCounts,
+          counts: Object.assign({}, slot.counts),
+          ranges: (slot.ranges || []).map(r => Object.assign({}, r)),
           cells: Array(10).fill(''),
           cellFractions: {},
           align: modalPaintDirection
         };
-        syncCellsFromCounts(tempSlot, modalPaintDirection);
+        updateSlotDay(tempSlot, dayVal, curPct, modalPaintDirection);
+        const tempRanges = getSlotRanges(tempSlot);
         
         // Renderizar los 10 cuadros físicos
         for (let i = 0; i < 10; i++) {
@@ -4912,36 +5032,78 @@ ui <- fluidPage(
           cellDiv.style.fontWeight = '700';
           cellDiv.style.boxSizing = 'border-box';
           
-          const d = tempSlot.cells[i];
-          const frac = (tempSlot.cellFractions && tempSlot.cellFractions[i] !== undefined) ? tempSlot.cellFractions[i] : 1.0;
+          const cellStart = i * 10;
+          const cellEnd = (i + 1) * 10;
           
-          if (!d) {
+          // Encontrar todos los rangos que intersectan este cuadro
+          const cellSegs = [];
+          for (let r of tempRanges) {
+            const oStart = Math.max(cellStart, r.start);
+            const oEnd = Math.min(cellEnd, r.end);
+            if (oEnd > oStart + 0.001) {
+              cellSegs.push({
+                day: r.day,
+                start: (oStart - cellStart) * 10,
+                end: (oEnd - cellStart) * 10,
+                color: DAY_COLORS[r.day] || '#007AFF',
+                pct: oEnd - oStart
+              });
+            }
+          }
+          cellSegs.sort((a, b) => a.start - b.start);
+          
+          // Rellenar espacios libres dentro del cuadro con blanco (#FFFFFF)
+          const fullSegs = [];
+          let curPos = 0;
+          for (let s of cellSegs) {
+            if (s.start > curPos + 0.01) {
+              fullSegs.push({ start: curPos, end: s.start, color: '#FFFFFF', isFree: true, pct: s.start - curPos });
+            }
+            fullSegs.push(s);
+            curPos = Math.max(curPos, s.end);
+          }
+          if (curPos < 100 - 0.01) {
+            fullSegs.push({ start: curPos, end: 100, color: '#FFFFFF', isFree: true, pct: 100 - curPos });
+          }
+          
+          if (fullSegs.length === 0 || (fullSegs.length === 1 && fullSegs[0].isFree)) {
             cellDiv.style.background = '#FFFFFF';
             cellDiv.style.color = '#C7C7CC';
             cellDiv.textContent = `${i + 1}`;
             cellDiv.title = `Cuadro ${i + 1}: Libre`;
+          } else if (fullSegs.length === 1 && !fullSegs[0].isFree) {
+            const s = fullSegs[0];
+            cellDiv.style.background = s.color;
+            cellDiv.style.color = '#FFFFFF';
+            cellDiv.textContent = DAY_NAMES[s.day] ? DAY_NAMES[s.day].substring(0, 3) : '';
+            if (s.day !== dayVal) cellDiv.style.opacity = '0.85';
+            cellDiv.title = `Cuadro ${i + 1}: ${DAY_NAMES[s.day]} (100%)`;
           } else {
-            const cColor = DAY_COLORS[d] || '#007AFF';
-            const isCurrent = (d === dayVal);
-            if (frac < 0.99) {
-              const pctFill = Math.round(frac * 100);
-              if (modalPaintDirection === 'end') {
-                cellDiv.style.background = `linear-gradient(to right, #FFFFFF ${100 - pctFill}%, ${cColor} ${100 - pctFill}%)`;
-              } else if (modalPaintDirection === 'center') {
-                const halfSpace = (100 - pctFill) / 2;
-                cellDiv.style.background = `linear-gradient(to right, #FFFFFF ${halfSpace}%, ${cColor} ${halfSpace}%, ${cColor} ${100 - halfSpace}%, #FFFFFF ${100 - halfSpace}%)`;
-              } else {
-                cellDiv.style.background = `linear-gradient(to right, ${cColor} ${pctFill}%, #FFFFFF ${pctFill}%)`;
-              }
-              cellDiv.style.color = '#1C1C1E';
-              cellDiv.textContent = `${(frac * 10).toFixed(1)}%`;
-            } else {
-              cellDiv.style.background = cColor;
-              cellDiv.style.color = '#FFFFFF';
-              cellDiv.textContent = DAY_NAMES[d] ? DAY_NAMES[d].substring(0, 3) : '';
+            // Múltiples segmentos o segmento parcial en el cuadro
+            const stops = [];
+            for (let s of fullSegs) {
+              stops.push(`${s.color} ${s.start.toFixed(1)}%`);
+              stops.push(`${s.color} ${s.end.toFixed(1)}%`);
             }
-            if (!isCurrent) cellDiv.style.opacity = '0.75';
-            cellDiv.title = `Cuadro ${i + 1}: ${DAY_NAMES[d]} (${(frac * 10).toFixed(1)}%)`;
+            cellDiv.style.background = `linear-gradient(to right, ${stops.join(', ')})`;
+            
+            // Texto y tooltip informativo
+            const curDaySeg = cellSegs.find(s => s.day === dayVal);
+            if (curDaySeg) {
+              cellDiv.style.color = '#1C1C1E';
+              cellDiv.textContent = `${curDaySeg.pct.toFixed(1)}%`;
+            } else if (cellSegs.length > 0) {
+              cellDiv.style.color = '#1C1C1E';
+              cellDiv.textContent = `${cellSegs[0].pct.toFixed(1)}%`;
+            } else {
+              cellDiv.style.color = '#C7C7CC';
+              cellDiv.textContent = `${i + 1}`;
+            }
+            
+            const titles = cellSegs.map(s => `${DAY_NAMES[s.day] || s.day} (${s.pct.toFixed(1)}%)`);
+            const freeSeg = fullSegs.find(s => s.isFree);
+            if (freeSeg) titles.push(`Libre (${freeSeg.pct.toFixed(1)}%)`);
+            cellDiv.title = `Cuadro ${i + 1}: ${titles.join(', ')}`;
           }
           bar.appendChild(cellDiv);
         }
@@ -4991,8 +5153,7 @@ ui <- fluidPage(
       pct = Math.round(pct * 100) / 100;
       
       slot.align = modalPaintDirection;
-      slot.counts[dayVal] = pct;
-      syncCellsFromCounts(slot, modalPaintDirection);
+      updateSlotDay(slot, dayVal, pct, modalPaintDirection);
       recomputeValveSlotCounts(v, key);
       updateUndoButton();
       requestRender();
