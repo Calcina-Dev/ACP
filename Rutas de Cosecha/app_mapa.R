@@ -3013,19 +3013,24 @@ ui <- fluidPage(
       if (!slot.cells) slot.cells = Array(10).fill('');
       if (!slot.cellFractions) slot.cellFractions = {};
       
-      const dir = direction || slot.align || 'start';
-      slot.align = dir;
-      
       // 1. Rangos de los DEMÁS días (se respeta 100% su posición original)
+      // OJO: leer currentRanges ANTES de cambiar slot.align para no alterar la orientación previa de los demás días
       const currentRanges = getSlotRanges(slot);
       const otherRanges = currentRanges.filter(r => r.day !== targetDay && (Number(slot.counts[r.day]) || 0) > 0 && r.pct > 0);
+      
+      const dir = direction || slot.align || 'start';
+      slot.align = dir;
       
       let otherTotal = 0;
       for (let r of otherRanges) otherTotal += r.pct;
       otherTotal = Math.round(otherTotal * 100) / 100;
       
       const maxAvailable = Math.max(0, Math.round((100 - otherTotal) * 100) / 100);
-      const pctToAssign = Math.min(Math.max(0, targetPct), maxAvailable);
+      let pctToAssign = Math.min(Math.max(0, targetPct), maxAvailable);
+      // Evitar franjas blancas por redondeo decimal de hectáreas (snap al 100% libre si la diferencia es mínima)
+      if (Math.abs(pctToAssign - maxAvailable) < 0.15) {
+        pctToAssign = maxAvailable;
+      }
       const roundPct = Math.round(pctToAssign * 100) / 100;
       
       slot.counts[targetDay] = roundPct;
@@ -3058,7 +3063,10 @@ ui <- fluidPage(
       
       // 3. Asignar el nuevo porcentaje en el espacio libre respetando la dirección
       const newSegments = [];
-      if (dir === 'end') {
+      if (Math.abs(roundPct - maxAvailable) < 0.01 && freeIntervals.length === 1) {
+        // Asignación completa del espacio libre restante: ocupa exactamente todo el intervalo libre sin desfases ni líneas blancas
+        newSegments.push({ day: targetDay, start: freeIntervals[0].start, end: freeIntervals[0].end, pct: freeIntervals[0].len });
+      } else if (dir === 'end') {
         // Desde abajo / derecha hacia arriba
         let remaining = roundPct;
         for (let i = freeIntervals.length - 1; i >= 0 && remaining > 0.001; i--) {
@@ -3211,17 +3219,19 @@ ui <- fluidPage(
       }
     }
     
-    function handleDayKgCommit(diaNombre, valStr, el) {
+    function handleDayKgCommit(diaNombre, valStr, el, force = false) {
       if (activeMode === 'CosechaOficial') return;
       const rawVal = (valStr || '').replace(/[^0-9.]/g, '');
       const kgNum = Math.round(parseFloat(rawVal) || 0);
       
       const prevVal = el && el.dataset.lastVal !== undefined ? Math.round(parseFloat(el.dataset.lastVal) || 0) : null;
-      if (prevVal !== null && kgNum === prevVal) {
+      if (!force && prevVal !== null && kgNum === prevVal) {
         return;
       }
       if (el) el.dataset.lastVal = String(kgNum);
       
+      // Sincronizar inmediatamente trazos/áreas del canvas con Shiny antes de solicitar prorrateo
+      syncStateToShiny(true);
       marcarCambiosPendientes(true);
       if (window.Shiny && window.Shiny.setInputValue) {
         Shiny.setInputValue('ingresar_kg_dia', {
@@ -3239,7 +3249,7 @@ ui <- fluidPage(
         e.preventDefault();
         e.stopPropagation();
         e.target.dataset.committedByEnter = '1';
-        handleDayKgCommit(diaNombre, e.target.value, e.target);
+        handleDayKgCommit(diaNombre, e.target.value, e.target, true);
         e.target.blur();
       }
     }
@@ -3249,7 +3259,7 @@ ui <- fluidPage(
         el.dataset.committedByEnter = '0';
         return;
       }
-      handleDayKgCommit(diaNombre, el.value, el);
+      handleDayKgCommit(diaNombre, el.value, el, false);
     }
     
     function toggleToolsMenu(e) {
@@ -5013,7 +5023,7 @@ ui <- fluidPage(
           ranges: (slot.ranges || []).map(r => Object.assign({}, r)),
           cells: Array(10).fill(''),
           cellFractions: {},
-          align: modalPaintDirection
+          align: slot.align || 'start'
         };
         updateSlotDay(tempSlot, dayVal, curPct, modalPaintDirection);
         const tempRanges = getSlotRanges(tempSlot);
@@ -5150,9 +5160,19 @@ ui <- fluidPage(
         pct = (parseFloat(inpHa.value) / totalHa) * 100;
       }
       pct = Math.min(Math.max(0, pct), maxPct);
+      if (Math.abs(pct - maxPct) < 0.15) {
+        pct = maxPct;
+      }
       pct = Math.round(pct * 100) / 100;
       
-      slot.align = modalPaintDirection;
+      const oldPct = Number(slot.counts[dayVal]) || 0;
+      if (!slot.kg) slot.kg = emptyCounts();
+      if (oldPct > 0 && (slot.kg[dayVal] || 0) > 0 && pct < oldPct) {
+        slot.kg[dayVal] = Math.round((slot.kg[dayVal] * pct) / oldPct);
+      } else if (pct === 0) {
+        slot.kg[dayVal] = 0;
+      }
+      
       updateSlotDay(slot, dayVal, pct, modalPaintDirection);
       recomputeValveSlotCounts(v, key);
       updateUndoButton();
@@ -6465,8 +6485,14 @@ server <- function(input, output, session) {
     # Calcular hectáreas pintadas totales en la semana por turno en modo Proyección
     ha_prog_turno <- df_prog %>%
       filter(Tipo_Registro == "Proyeccion") %>%
+      select(-any_of(c("Área", "Área.x", "Área.y", "Módulo", "Turno", "Variedad"))) %>%
       left_join(df_valvulas %>% select(id, Módulo, Turno, Variedad, Área), by = "id") %>%
-      mutate(Ha_Valv = Área * ((Lunes + Martes + Miércoles + Jueves + Viernes + Sábado) / 100)) %>%
+      mutate(
+        Área    = coalesce(as.numeric(Área), 0),
+        Ha_Valv = Área * ((coalesce(as.numeric(Lunes), 0) + coalesce(as.numeric(Martes), 0) + 
+                          coalesce(as.numeric(Miércoles), 0) + coalesce(as.numeric(Jueves), 0) + 
+                          coalesce(as.numeric(Viernes), 0) + coalesce(as.numeric(Sábado), 0)) / 100)
+      ) %>%
       group_by(Módulo, Turno, Variedad) %>%
       summarise(Ha_Pintada_Semana = sum(Ha_Valv, na.rm = TRUE), .groups = "drop")
     
@@ -6500,17 +6526,19 @@ server <- function(input, output, session) {
       select(Módulo, Turno, Variedad, Kg_Por_Ha)
     
     df_prog %>%
+      select(-any_of(c("Área", "Área.x", "Área.y", "Módulo", "Turno", "Variedad"))) %>%
       left_join(df_valvulas %>% select(id, Módulo, Turno, Variedad, Área), by = "id") %>%
+      mutate(Área = coalesce(as.numeric(Área), 0)) %>%
       left_join(tasas_turno, by = c("Módulo", "Turno", "Variedad")) %>%
       mutate(
-        Kg_Lunes     = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (Lunes / 100) * Kg_Por_Ha, 2), Kg_Lunes),
-        Kg_Martes    = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (Martes / 100) * Kg_Por_Ha, 2), Kg_Martes),
-        Kg_Miércoles = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (Miércoles / 100) * Kg_Por_Ha, 2), Kg_Miércoles),
-        Kg_Jueves    = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (Jueves / 100) * Kg_Por_Ha, 2), Kg_Jueves),
-        Kg_Viernes   = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (Viernes / 100) * Kg_Por_Ha, 2), Kg_Viernes),
-        Kg_Sábado    = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (Sábado / 100) * Kg_Por_Ha, 2), Kg_Sábado)
+        Kg_Lunes     = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (coalesce(as.numeric(Lunes), 0) / 100) * Kg_Por_Ha, 2), Kg_Lunes),
+        Kg_Martes    = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (coalesce(as.numeric(Martes), 0) / 100) * Kg_Por_Ha, 2), Kg_Martes),
+        Kg_Miércoles = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (coalesce(as.numeric(Miércoles), 0) / 100) * Kg_Por_Ha, 2), Kg_Miércoles),
+        Kg_Jueves    = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (coalesce(as.numeric(Jueves), 0) / 100) * Kg_Por_Ha, 2), Kg_Jueves),
+        Kg_Viernes   = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (coalesce(as.numeric(Viernes), 0) / 100) * Kg_Por_Ha, 2), Kg_Viernes),
+        Kg_Sábado    = ifelse(Tipo_Registro == "Proyeccion" & !is.na(Kg_Por_Ha), round(Área * (coalesce(as.numeric(Sábado), 0) / 100) * Kg_Por_Ha, 2), Kg_Sábado)
       ) %>%
-      select(names(df_prog))
+      select(any_of(names(df_prog)))
   }
   
   # Función que prorratea los Kilos de Cosecha Campo entre las válvulas pintadas del filtro activo proporcional a su área cosechada
@@ -6533,7 +6561,9 @@ server <- function(input, output, session) {
       if (length(idx_filtro) == 0) next
       
       sub_prog <- df_prog[idx_filtro, ] %>%
-        left_join(df_valvulas %>% select(id, Área), by = "id")
+        select(-any_of(c("Área", "Área.x", "Área.y"))) %>%
+        left_join(df_valvulas %>% select(id, Área), by = "id") %>%
+        mutate(Área = coalesce(as.numeric(Área), 0))
       
       for (d in dias) {
         if (!is.null(kgs_dias) && is.null(kgs_dias[[d]])) next
@@ -6698,6 +6728,7 @@ server <- function(input, output, session) {
       filter(Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha")) %>%
       mutate(Tipo_Registro = as.character(ifelse(Tipo_Registro == "Cosecha", "CosechaCampo", Tipo_Registro))) %>%
       filter((Lunes + Martes + Miércoles + Jueves + Viernes + Sábado) > 0) %>%
+      select(-any_of(c("Área", "Área.x", "Área.y", "codigo", "Grupo", "Sector", "Módulo", "Turno", "Variedad"))) %>%
       left_join(df_valvulas %>% select(id, codigo, Grupo, Sector, Módulo, Turno, Variedad, Área), by = "id") %>%
       mutate(
         Campaña             = "2026",
@@ -6935,20 +6966,50 @@ server <- function(input, output, session) {
     base$cells_str <- coalesce(as.character(base$cells_str), "")
     
     # Conservar Kg previos de cada válvula (si una celda fue borrada a 0%, poner su Kg en 0;
-    # las nuevas válvulas pintadas en Cosecha Campo inician en 0 kg sin robar kilos de otras válvulas)
+    # si el área disminuyó, reducir Kg proporcionalmente; las nuevas válvulas pintadas inician en 0 kg)
     base <- base %>%
       left_join(
-        prev_state %>% select(Tipo_Registro, Num_Pasada, id, Kg_Lunes, Kg_Martes, Kg_Miércoles, Kg_Jueves, Kg_Viernes, Kg_Sábado),
+        prev_state %>% select(
+          Tipo_Registro, Num_Pasada, id,
+          Prev_Lun = Lunes, Prev_Mar = Martes, Prev_Mie = Miércoles,
+          Prev_Jue = Jueves, Prev_Vie = Viernes, Prev_Sab = Sábado,
+          Kg_Lunes, Kg_Martes, Kg_Miércoles, Kg_Jueves, Kg_Viernes, Kg_Sábado
+        ),
         by = c("Tipo_Registro", "Num_Pasada", "id")
       ) %>%
       mutate(
-        Kg_Lunes     = ifelse(Lunes > 0, coalesce(Kg_Lunes, 0), 0),
-        Kg_Martes    = ifelse(Martes > 0, coalesce(Kg_Martes, 0), 0),
-        Kg_Miércoles = ifelse(Miércoles > 0, coalesce(Kg_Miércoles, 0), 0),
-        Kg_Jueves    = ifelse(Jueves > 0, coalesce(Kg_Jueves, 0), 0),
-        Kg_Viernes   = ifelse(Viernes > 0, coalesce(Kg_Viernes, 0), 0),
-        Kg_Sábado    = ifelse(Sábado > 0, coalesce(Kg_Sábado, 0), 0)
-      )
+        Kg_Lunes = case_when(
+          Lunes <= 0 ~ 0,
+          !is.na(Prev_Lun) & Prev_Lun > 0 & Lunes < Prev_Lun ~ round(coalesce(Kg_Lunes, 0) * (Lunes / Prev_Lun), 2),
+          TRUE ~ coalesce(Kg_Lunes, 0)
+        ),
+        Kg_Martes = case_when(
+          Martes <= 0 ~ 0,
+          !is.na(Prev_Mar) & Prev_Mar > 0 & Martes < Prev_Mar ~ round(coalesce(Kg_Martes, 0) * (Martes / Prev_Mar), 2),
+          TRUE ~ coalesce(Kg_Martes, 0)
+        ),
+        Kg_Miércoles = case_when(
+          Miércoles <= 0 ~ 0,
+          !is.na(Prev_Mie) & Prev_Mie > 0 & Miércoles < Prev_Mie ~ round(coalesce(Kg_Miércoles, 0) * (Miércoles / Prev_Mie), 2),
+          TRUE ~ coalesce(Kg_Miércoles, 0)
+        ),
+        Kg_Jueves = case_when(
+          Jueves <= 0 ~ 0,
+          !is.na(Prev_Jue) & Prev_Jue > 0 & Jueves < Prev_Jue ~ round(coalesce(Kg_Jueves, 0) * (Jueves / Prev_Jue), 2),
+          TRUE ~ coalesce(Kg_Jueves, 0)
+        ),
+        Kg_Viernes = case_when(
+          Viernes <= 0 ~ 0,
+          !is.na(Prev_Vie) & Prev_Vie > 0 & Viernes < Prev_Vie ~ round(coalesce(Kg_Viernes, 0) * (Viernes / Prev_Vie), 2),
+          TRUE ~ coalesce(Kg_Viernes, 0)
+        ),
+        Kg_Sábado = case_when(
+          Sábado <= 0 ~ 0,
+          !is.na(Prev_Sab) & Prev_Sab > 0 & Sábado < Prev_Sab ~ round(coalesce(Kg_Sábado, 0) * (Sábado / Prev_Sab), 2),
+          TRUE ~ coalesce(Kg_Sábado, 0)
+        )
+      ) %>%
+      select(-starts_with("Prev_"))
     
     # Cosecha Oficial es inmutable desde el mapa (solo lectura, proveniente de balanza packing).
     # La preservamos intacta desde el estado previo para que el canvas de dibujo nunca la sobreescriba a cero.
@@ -6957,7 +7018,11 @@ server <- function(input, output, session) {
     base_editables <- base %>%
       filter(Tipo_Registro %in% c("Proyeccion", "CosechaCampo"))
     
-    base_completa <- bind_rows(base_editables, oficial_prev)
+    # Asegurar que base_completa tenga exactamente las mismas columnas limpias sin residuos de Área
+    base_completa <- bind_rows(
+      base_editables,
+      oficial_prev %>% select(any_of(names(base_editables)))
+    )
     # En Proyección y Cosecha Campo el trazado en canvas define el avance/hectáreas,
     # mientras que los kilos se asignan o prorratean al ingresar el valor por día y dar Enter.
     programacion_semana(base_completa)
@@ -6984,8 +7049,12 @@ server <- function(input, output, session) {
     
     sub_dia <- df_prog %>%
       filter(Tipo_Registro == m_act, Num_Pasada == p_act, id %in% ids_filtro) %>%
+      select(-any_of(c("Área", "Área.x", "Área.y"))) %>%
       left_join(df_valvulas %>% select(id, Área), by = "id") %>%
-      mutate(Ha_Dia = Área * (.data[[dia_col]] / 100))
+      mutate(
+        Área   = coalesce(as.numeric(Área), 0),
+        Ha_Dia = Área * (coalesce(as.numeric(.data[[dia_col]]), 0) / 100)
+      )
     
     tot_ha_dia <- sum(sub_dia$Ha_Dia, na.rm = TRUE)
     if (tot_ha_dia <= 0 && kg_val > 0) {
@@ -7032,7 +7101,7 @@ server <- function(input, output, session) {
     p_act   <- if (!is.null(info_kg$pasada)) as.numeric(info_kg$pasada) else pasada_activa()
     
     # Si estamos en Cosecha Campo o Proyección y el usuario modificó algún input diario antes de dar Guardar,
-    # prorratear únicamente los días cuyo valor cambió y exclusivamente dentro del filtro activo
+    # prorratear únicamente los días cuyo valor cambió (o donde haya válvulas pintadas con 0 kg) dentro del filtro activo
     if (m_act %in% c("CosechaCampo", "Proyeccion") && !is.null(info_kg) && !is.null(info_kg$kgs)) {
       ids_filtro <- catalogo_filtrado()$id
       sub_f <- df_prog %>%
@@ -7041,9 +7110,13 @@ server <- function(input, output, session) {
       kgs_cambiados <- list()
       for (d in c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")) {
         if (!is.null(info_kg$kgs[[d]])) {
-          val_in  <- max(0, suppressWarnings(as.numeric(info_kg$kgs[[d]])), na.rm = TRUE)
-          val_act <- sum(sub_f[[paste0("Kg_", d)]], na.rm = TRUE)
-          if (abs(val_in - round(val_act)) >= 1) {
+          val_in   <- max(0, suppressWarnings(as.numeric(info_kg$kgs[[d]])), na.rm = TRUE)
+          col_pct  <- d
+          col_kg   <- paste0("Kg_", d)
+          val_act  <- sum(sub_f[[col_kg]], na.rm = TRUE)
+          hay_valvs_sin_kg <- sum(coalesce(as.numeric(sub_f[[col_pct]]), 0) > 0 & coalesce(as.numeric(sub_f[[col_kg]]), 0) == 0) > 0
+          
+          if (abs(val_in - round(val_act)) >= 1 || (val_in > 0 && hay_valvs_sin_kg)) {
             kgs_cambiados[[d]] <- val_in
           }
         }
@@ -7454,7 +7527,9 @@ server <- function(input, output, session) {
     p_act <- pasada_activa()
     
     ep_p <- programacion_semana() %>%
-      filter(Tipo_Registro == m_act, Num_Pasada == p_act)
+      filter(Tipo_Registro == m_act, Num_Pasada == p_act) %>%
+      select(id, Lunes, Martes, Miércoles, Jueves, Viernes, Sábado,
+             Kg_Lunes, Kg_Martes, Kg_Miércoles, Kg_Jueves, Kg_Viernes, Kg_Sábado)
     
     ep_all <- programacion_semana() %>%
       filter(Tipo_Registro == m_act) %>%
@@ -7466,6 +7541,9 @@ server <- function(input, output, session) {
       )
     
     cat_f %>%
+      select(-any_of(c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado",
+                       "Kg_Lunes", "Kg_Martes", "Kg_Miércoles", "Kg_Jueves", "Kg_Viernes", "Kg_Sábado",
+                       "Pct_Ambas", "Kg_Ambas"))) %>%
       left_join(ep_p, by = "id") %>%
       left_join(ep_all, by = "id") %>%
       mutate(

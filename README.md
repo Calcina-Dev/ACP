@@ -15,3 +15,11 @@ Plataforma web interactiva desarrollada en **R Shiny** para la gestión visual d
   - Persistencia multi-usuario de rutas mediante Webhook en **Google Sheets (Google Apps Script)**.
   - Sincronización inmutable con cosechas oficiales de balanza de packing.
 - **Despliegue**: Publicado en [shinyapps.io](https://acp-proyecciones.shinyapps.io/ruta_cosecha/).
+
+### 📊 [Seguimiento de Proyectos](./Seguimiento%20de%20Proyectos)
+Plataforma ejecutiva en **R Shiny** con diseño inspirado en **macOS y Apple iOS**:
+- **Carga Multi-Formato**: Procesa exportaciones de Linear / Jira y cronogramas tradicionales de Excel Gantt.
+- **Cronograma Gantt Interactivo**: Visualización temporal con Plotly, línea de hoy y mapeo de dependencias bloqueantes.
+- **Métricas Gerenciales & Carga**: Donut de estados, distribución por módulo y carga de trabajo por colaborador.
+- **Matriz Operativa DT**: Tabla interactiva con insignias (*badges*) de estado y exportación directa a Excel.
+
