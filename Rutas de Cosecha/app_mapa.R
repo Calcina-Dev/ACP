@@ -2911,8 +2911,44 @@ ui <- fluidPage(
       return 'start';
     }
 
+    function buildRangesFromCells(slot) {
+      if (!slot || !slot.cells) return [];
+      const ranges = [];
+      let curRange = null;
+      for (let c = 0; c < 10; c++) {
+        const day = slot.cells[c];
+        const frac = (slot.cellFractions && slot.cellFractions[c] !== undefined) ? slot.cellFractions[c] : 1.0;
+        if (day && frac > 0.001) {
+          const cStart = c * 10;
+          const cEnd = Math.round((cStart + frac * 10) * 100) / 100;
+          if (curRange && curRange.day === day && Math.abs(curRange.end - cStart) < 0.01) {
+            curRange.end = cEnd;
+            curRange.pct = Math.round((curRange.end - curRange.start) * 100) / 100;
+          } else {
+            if (curRange) ranges.push(curRange);
+            curRange = {
+              day: day,
+              start: cStart,
+              end: cEnd,
+              pct: Math.round((cEnd - cStart) * 100) / 100
+            };
+          }
+        } else {
+          if (curRange) {
+            ranges.push(curRange);
+            curRange = null;
+          }
+        }
+      }
+      if (curRange) ranges.push(curRange);
+      return ranges;
+    }
+
     function buildRangesFromSlot(slot) {
       if (!slot) return [];
+      if (slot.cells && Array.isArray(slot.cells) && slot.cells.some(c => c !== '')) {
+        return buildRangesFromCells(slot);
+      }
       const counts = slot.counts || {};
       
       const orderedDays = [];
@@ -4561,6 +4597,7 @@ ui <- fluidPage(
       let changed = false;
       
       // -----------------------------------------------------------------------
+      // -----------------------------------------------------------------------
       // MODO BORRADOR (🧹 Borrar cuadros o válvula completa del DÍA ACTIVO únicamente)
       // -----------------------------------------------------------------------
       if (paintTool === 'eraser' || paintTool === 'eraser100' || activeDay === 'borrar') {
@@ -4576,7 +4613,19 @@ ui <- fluidPage(
             return false;
           }
           saveSnapshotForUndo();
-          updateSlotDay(slot, targetDay, 0);
+          for (let i = 0; i < 10; i++) {
+            if (cells[i] === targetDay) {
+              cells[i] = '';
+              if (slot.cellFractions && slot.cellFractions[i] !== undefined) {
+                delete slot.cellFractions[i];
+              }
+            }
+          }
+          slot.ranges = buildRangesFromCells(slot);
+          for (let d of DAY_KEYS) slot.counts[d] = 0;
+          for (let r of slot.ranges) {
+            slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
+          }
           recomputeValveSlotCounts(v, key);
           changed = true;
           requestRender();
@@ -4595,23 +4644,32 @@ ui <- fluidPage(
         }
         
         const c = cellIndexAt(v, wx, wy);
-        if (cells[c] !== '' && cells[c] !== targetDay) {
+        if (cells[c] === '') {
+          return false;
+        }
+        if (cells[c] !== targetDay) {
           if (!strokeChanged) {
-            showMapToast(`🔒 Cuadro pertenece a ${DAY_NAMES[cells[c]]}. Solo puedes borrar cuadros de ${DAY_NAMES[targetDay]} (día activo).`);
+            showMapToast(`🔒 Cuadro ${c + 1} pertenece a ${DAY_NAMES[cells[c]]}. Solo puedes borrar cuadros de ${DAY_NAMES[targetDay]} (día activo).`);
           }
           return false;
         }
         
         saveSnapshotForUndo();
-        const step = Math.min(10, curPct);
-        const newPct = Math.round((curPct - step) * 100) / 100;
-        updateSlotDay(slot, targetDay, newPct);
+        cells[c] = '';
+        if (slot.cellFractions && slot.cellFractions[c] !== undefined) {
+          delete slot.cellFractions[c];
+        }
+        slot.ranges = buildRangesFromCells(slot);
+        for (let d of DAY_KEYS) slot.counts[d] = 0;
+        for (let r of slot.ranges) {
+          slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
+        }
         recomputeValveSlotCounts(v, key);
         changed = true;
         marcarCambiosPendientes(true);
         requestRender();
         syncStateToShiny(true);
-        showMapToast(`- ${step}% de ${DAY_NAMES[targetDay]} en V-${v.codigo} (queda ${slot.counts[targetDay]}%).`);
+        showMapToast(`- 10% en cuadro ${c + 1} de ${DAY_NAMES[targetDay]} en V-${v.codigo} (queda ${slot.counts[targetDay]}%).`);
         return true;
       }
       
@@ -4650,8 +4708,20 @@ ui <- fluidPage(
         }
         
         saveSnapshotForUndo();
-        // Asignar el 100% de la diferencia disponible al día activo
-        updateSlotDay(slot, dayVal, maxAvailablePct, slot.align || 'start');
+        // Asignar todos los cuadros libres al día activo
+        for (let i = 0; i < 10; i++) {
+          if (cells[i] === '' || cells[i] === dayVal) {
+            cells[i] = dayVal;
+            if (slot.cellFractions && slot.cellFractions[i] !== undefined) {
+              delete slot.cellFractions[i];
+            }
+          }
+        }
+        slot.ranges = buildRangesFromCells(slot);
+        for (let d of DAY_KEYS) slot.counts[d] = 0;
+        for (let r of slot.ranges) {
+          slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
+        }
         recomputeValveSlotCounts(v, key);
         changed = true;
         
@@ -4660,32 +4730,46 @@ ui <- fluidPage(
         const haAsig = ((totalAsig / 100) * totalHa).toFixed(2);
         showMapToast(`⚡ V-${v.codigo}: ${totalAsig}% (${haAsig} ha) asignado a ${DAY_NAMES[dayVal]}. Total: 100%.`);
       } else if (paintTool === 'cells') {
-        const curDayPct = Number(slot.counts[dayVal]) || 0;
-        const remainingForDay = Math.max(0, Math.round((maxAvailablePct - curDayPct) * 100) / 100);
-        if (remainingForDay <= 0) {
-          showMapToast(`🔒 Válvula ${v.codigo} ya no tiene más espacio libre disponible.`);
+        const c = cellIndexAt(v, wx, wy);
+        
+        // Si el cuadro ya está pintado con el día activo, no hacer nada (evita re-pintado continuo al arrastrar)
+        if (cells[c] === dayVal) {
           return false;
         }
         
-        const c = cellIndexAt(v, wx, wy);
-        if (cells[c] !== '' && cells[c] !== dayVal) {
-          const otherD = cells[c];
-          if ((slot.cellFractions && slot.cellFractions[c]) === undefined) {
-            showMapToast(`🔒 Cuadro pertenece a ${DAY_NAMES[otherD]}. Haz clic en el espacio libre para pintar ${DAY_NAMES[dayVal]}.`);
-            return false;
+        // Si el cuadro pertenece a otro día
+        if (cells[c] !== '') {
+          if (!strokeChanged) {
+            showMapToast(`🔒 Cuadro ${c + 1} pertenece a ${DAY_NAMES[cells[c]]}. Haz clic en un espacio libre para pintar ${DAY_NAMES[dayVal]}.`);
           }
+          return false;
+        }
+        
+        const curDayPct = Number(slot.counts[dayVal]) || 0;
+        const remainingForDay = Math.max(0, Math.round((maxAvailablePct - curDayPct) * 100) / 100);
+        if (remainingForDay <= 0) {
+          if (!strokeChanged) {
+            showMapToast(`🔒 Válvula ${v.codigo} ya no tiene más espacio libre disponible.`);
+          }
+          return false;
         }
         
         saveSnapshotForUndo();
-        const step = Math.min(10, remainingForDay);
-        const newDayPct = Math.round((curDayPct + step) * 100) / 100;
-        updateSlotDay(slot, dayVal, newDayPct, slot.align || 'start');
+        cells[c] = dayVal;
+        if (slot.cellFractions && slot.cellFractions[c] !== undefined) {
+          delete slot.cellFractions[c];
+        }
+        slot.ranges = buildRangesFromCells(slot);
+        for (let d of DAY_KEYS) slot.counts[d] = 0;
+        for (let r of slot.ranges) {
+          slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
+        }
         recomputeValveSlotCounts(v, key);
         changed = true;
         
         const totalHa = parseFloat(v.Área) || 0;
         const haAsig = ((slot.counts[dayVal] / 100) * totalHa).toFixed(2);
-        showMapToast(`+${step}% a ${DAY_NAMES[dayVal]} en V-${v.codigo} (Total: ${slot.counts[dayVal]}% / ${haAsig} ha).`);
+        showMapToast(`+10% en cuadro ${c + 1} (${DAY_NAMES[dayVal]}) de V-${v.codigo} (Total: ${slot.counts[dayVal]}% / ${haAsig} ha).`);
       }
       
       if (changed) {
@@ -6573,7 +6657,8 @@ server <- function(input, output, session) {
       select(any_of(names(df_prog)))
   }
   
-  # Función que prorratea los Kilos de Cosecha Campo entre las válvulas pintadas del filtro activo proporcional a su área cosechada
+  # Función que prorratea los Kilos de Cosecha Campo entre las válvulas pintadas del filtro activo proporcional a su área cosechada,
+  # incluyendo tanto 1ª como 2ª pasada simultáneamente.
   recalcular_kg_cosecha_campo <- function(df_prog, kgs_dias = NULL, modo = "CosechaCampo", pasada = NULL, ids_alcance = NULL) {
     dias <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
     pasadas_proc <- if (!is.null(pasada)) pasada else c(1, 2)
@@ -6584,39 +6669,43 @@ server <- function(input, output, session) {
       df_prog[[col_kg]] <- coalesce(as.numeric(df_prog[[col_kg]]), 0)
     }
     
-    for (p in pasadas_proc) {
-      idx_filtro <- which(
-        df_prog$Tipo_Registro == modo &
-        df_prog$Num_Pasada == p &
-        (if (!is.null(ids_alcance)) df_prog$id %in% ids_alcance else TRUE)
-      )
-      if (length(idx_filtro) == 0) next
+    idx_filtro <- which(
+      df_prog$Tipo_Registro == modo &
+      df_prog$Num_Pasada %in% pasadas_proc &
+      (if (!is.null(ids_alcance)) df_prog$id %in% ids_alcance else TRUE)
+    )
+    if (length(idx_filtro) == 0) return(df_prog)
+    
+    sub_prog <- df_prog[idx_filtro, ] %>%
+      select(-any_of(c("Área", "Área.x", "Área.y"))) %>%
+      left_join(df_valvulas %>% select(id, Área), by = "id") %>%
+      mutate(Área = coalesce(as.numeric(Área), 0))
+    
+    for (d in dias) {
+      if (!is.null(kgs_dias) && is.null(kgs_dias[[d]])) next
       
-      sub_prog <- df_prog[idx_filtro, ] %>%
-        select(-any_of(c("Área", "Área.x", "Área.y"))) %>%
-        left_join(df_valvulas %>% select(id, Área), by = "id") %>%
-        mutate(Área = coalesce(as.numeric(Área), 0))
+      col_pct <- d
+      col_kg  <- paste0("Kg_", d)
       
-      for (d in dias) {
-        if (!is.null(kgs_dias) && is.null(kgs_dias[[d]])) next
-        
-        col_pct <- d
-        col_kg  <- paste0("Kg_", d)
-        
-        ha_valv_dia <- sub_prog$Área * (coalesce(as.numeric(sub_prog[[col_pct]]), 0) / 100)
-        tot_ha_dia  <- sum(ha_valv_dia, na.rm = TRUE)
-        
-        tot_kg_dia <- if (!is.null(kgs_dias) && !is.null(kgs_dias[[d]])) {
-          max(0, suppressWarnings(as.numeric(kgs_dias[[d]])), na.rm = TRUE)
-        } else {
-          sum(sub_prog[[col_kg]], na.rm = TRUE)
+      ha_valv_dia <- sub_prog$Área * (coalesce(as.numeric(sub_prog[[col_pct]]), 0) / 100)
+      tot_ha_dia  <- sum(ha_valv_dia, na.rm = TRUE)
+      
+      tot_kg_dia <- if (!is.null(kgs_dias) && !is.null(kgs_dias[[d]])) {
+        max(0, suppressWarnings(as.numeric(kgs_dias[[d]])), na.rm = TRUE)
+      } else {
+        sum(sub_prog[[col_kg]], na.rm = TRUE)
+      }
+      
+      if (tot_ha_dia > 0 && tot_kg_dia > 0) {
+        kg_asignados <- round(tot_kg_dia * (ha_valv_dia / tot_ha_dia), 2)
+        diff_cents <- round(tot_kg_dia - sum(kg_asignados, na.rm = TRUE), 2)
+        if (abs(diff_cents) > 0 && abs(diff_cents) < 1) {
+          max_idx <- which.max(ha_valv_dia)
+          kg_asignados[max_idx] <- kg_asignados[max_idx] + diff_cents
         }
-        
-        if (tot_ha_dia > 0 && tot_kg_dia > 0) {
-          df_prog[[col_kg]][idx_filtro] <- round(tot_kg_dia * (ha_valv_dia / tot_ha_dia), 2)
-        } else if (tot_ha_dia == 0 || tot_kg_dia == 0) {
-          df_prog[[col_kg]][idx_filtro] <- 0
-        }
+        df_prog[[col_kg]][idx_filtro] <- kg_asignados
+      } else if (tot_ha_dia == 0 || tot_kg_dia == 0) {
+        df_prog[[col_kg]][idx_filtro] <- 0
       }
     }
     
@@ -6730,19 +6819,19 @@ server <- function(input, output, session) {
     session$sendCustomMessage("limpiar_cambios_pendientes", list())
   }, ignoreInit = FALSE)
   
-  persistir_semana_actual <- function(df_prog_semana, modo = NULL, pasada = NULL, mostrar_notif = FALSE, sincronizar_sheets = FALSE) {
+  persistir_semana_actual <- function(df_prog_semana, modo = NULL, pasada = NULL, mostrar_notif = FALSE, sincronizar_sheets = FALSE, ids_scope = NULL) {
     sem_num <- as.numeric(isolate(semana_activa_rv()))
     if (is.na(sem_num)) sem_num <- suppressWarnings(as.numeric(isolate(input$sel_semana)))
     if (is.na(sem_num)) return(FALSE)
     
     m_act <- if (!is.null(modo)) modo else modo_activo()
-    p_act <- if (!is.null(pasada)) as.numeric(pasada) else pasada_activa()
+    p_acts <- if (!is.null(pasada)) as.numeric(pasada) else pasada_activa()
     
     usr <- usuario_autenticado_rv()
     es_admin <- if (!is.null(usr)) usr$rol == "Administrador" else TRUE
     modulos_usr <- if (!is.null(usr) && !es_admin) usr$modulos[[1]] else 1:14
     
-    ids_alcance <- isolate(catalogo_filtrado()$id)
+    ids_alcance <- if (!is.null(ids_scope)) ids_scope else isolate(catalogo_filtrado()$id)
     if (!es_admin) {
       ids_usuario <- df_valvulas %>% filter(suppressWarnings(as.numeric(Módulo)) %in% modulos_usr) %>% pull(id)
       ids_alcance <- if (length(ids_alcance) > 0 && length(ids_alcance) < nrow(df_valvulas)) {
@@ -6752,6 +6841,7 @@ server <- function(input, output, session) {
       }
       hay_filtro_activo <- TRUE
     } else {
+      ids_usuario <- df_valvulas$id
       hay_filtro_activo <- length(ids_alcance) > 0 && length(ids_alcance) < nrow(df_valvulas)
     }
     
@@ -6790,12 +6880,12 @@ server <- function(input, output, session) {
     ids_protegidos_locales <- ids_alcance
     if (sincronizar_sheets && hay_filtro_activo) {
       prev_disco <- isolate(rutas_disco_rv()) %>%
-        filter(Campaña == "2026", Semana == sem_num, Tipo_Registro == m_act, Num_Pasada == p_act) %>%
-        select(id, Lunes_p = Lunes, Martes_p = Martes, Miercoles_p = Miércoles, Jueves_p = Jueves, Viernes_p = Viernes, Sabado_p = Sábado,
+        filter(Campaña == "2026", Semana == sem_num, Tipo_Registro == m_act, Num_Pasada %in% p_acts) %>%
+        select(id, Num_Pasada, Lunes_p = Lunes, Martes_p = Martes, Miercoles_p = Miércoles, Jueves_p = Jueves, Viernes_p = Viernes, Sabado_p = Sábado,
                Kg_Lun_p = Kg_Lunes, Kg_Mar_p = Kg_Martes, Kg_Mie_p = Kg_Miércoles, Kg_Jue_p = Kg_Jueves, Kg_Vie_p = Kg_Viernes, Kg_Sab_p = Kg_Sábado)
       act_modo <- df_prog_semana %>%
-        filter(Tipo_Registro == m_act, Num_Pasada == p_act) %>%
-        left_join(prev_disco, by = "id") %>%
+        filter(Tipo_Registro == m_act, Num_Pasada %in% p_acts) %>%
+        left_join(prev_disco, by = c("id", "Num_Pasada")) %>%
         mutate(across(ends_with("_p"), ~ coalesce(as.numeric(.), 0))) %>%
         filter(
           abs(Lunes - Lunes_p) > 0.01 | abs(Martes - Martes_p) > 0.01 | abs(Miércoles - Miercoles_p) > 0.01 |
@@ -6808,12 +6898,21 @@ server <- function(input, output, session) {
       # modificó en esta sesión (act_modo$id) para no pisar las que su compañero del mismo sector guardó.
       filtro_es_especifico <- length(ids_alcance) < length(ids_usuario)
       ids_protegidos_locales <- if (filtro_es_especifico) {
-        unique(c(ids_alcance, act_modo$id))
+        unique(c(ids_alcance, intersect(act_modo$id, ids_usuario)))
       } else {
-        if (length(act_modo$id) > 0) act_modo$id else ids_alcance
+        if (length(act_modo$id) > 0) intersect(act_modo$id, ids_usuario) else ids_alcance
       }
       ids_protegidos_locales <- intersect(ids_protegidos_locales, ids_usuario)
-      ids_scope_envio <- ids_protegidos_locales
+      
+      # ALCANCE DEL ENVÍO AL WEBHOOK DE GOOGLE SHEETS:
+      # Si el usuario tiene un filtro específico activo (ej. Módulo 13), el paquete de envío
+      # debe ser EXCLUSIVAMENTE las válvulas de dicho filtro (ids_alcance).
+      # NUNCA se deben enviar ni sobreescribir válvulas de otros módulos fuera del filtro activo.
+      ids_scope_envio <- if (filtro_es_especifico) {
+        ids_alcance
+      } else {
+        ids_protegidos_locales
+      }
     }
     
     # MERGE MULTI-USUARIO: Si vamos a sincronizar con Google Sheets y el usuario tiene un filtro activo
@@ -6827,16 +6926,16 @@ server <- function(input, output, session) {
         if (hay_filtro_activo) {
           # Conservar de Google Sheets: (a) otros modos/pasadas, y (b) en el mismo modo/pasada, las válvulas que este usuario NO tocó
           remoto_conservar <- df_remoto %>%
-            filter(!(Tipo_Registro == m_act & Num_Pasada == p_act & id %in% ids_protegidos_locales))
+            filter(!(Tipo_Registro == m_act & Num_Pasada %in% p_acts & id %in% ids_protegidos_locales))
           local_alcance <- df_guardar_sem %>%
-            filter(Tipo_Registro == m_act, Num_Pasada == p_act, id %in% ids_protegidos_locales)
+            filter(Tipo_Registro == m_act, Num_Pasada %in% p_acts, id %in% ids_protegidos_locales)
           df_guardar_sem <- bind_rows(remoto_conservar, local_alcance)
         } else {
           # Sin filtro activo: conservar otros modos/pasadas de Google Sheets y actualizar este modo/pasada completo
           remoto_otros <- df_remoto %>%
-            filter(!(Tipo_Registro == m_act & Num_Pasada == p_act))
+            filter(!(Tipo_Registro == m_act & Num_Pasada %in% p_acts))
           local_modo <- df_guardar_sem %>%
-            filter(Tipo_Registro == m_act, Num_Pasada == p_act)
+            filter(Tipo_Registro == m_act, Num_Pasada %in% p_acts)
           df_guardar_sem <- bind_rows(remoto_otros, local_modo)
         }
       }
@@ -6857,106 +6956,111 @@ server <- function(input, output, session) {
     
     # Sincronización con Google Sheets Webhook (sincroniza inserciones, modificaciones y eliminaciones)
     if (sincronizar_sheets) {
-      rutas_modo <- if (nrow(df_guardar_sem) > 0) {
-        df_guardar_sem %>% filter(Tipo_Registro == m_act, Num_Pasada == p_act)
-      } else {
-        tibble()
-      }
-      
       modo_label_sheet <- if (m_act == "Proyeccion") "Proyección" else "Cosecha Campo"
       
       construir_rutas_json <- function(df_r) {
-      lista_rutas_json <- vector("list", nrow(df_r))
-      if (nrow(df_r) > 0) {
-        for (i in seq_len(nrow(df_r))) {
-          rm <- df_r[i, ]
-          lista_rutas_json[[i]] <- list(
-            id          = coalesce(as.character(rm$id), ""),
-            grupo       = coalesce(as.character(rm$Grupo), ""),
-            sector      = coalesce(as.character(rm$Sector), ""),
-            modulo      = coalesce(as.character(rm$Módulo), ""),
-            turno       = coalesce(as.character(rm$Turno), ""),
-            codigo      = coalesce(as.character(rm$codigo), ""),
-            variedad    = coalesce(as.character(rm$Variedad), ""),
-            area_fisica = coalesce(as.numeric(rm$Área), 0),
-            pct_lun     = coalesce(as.numeric(rm$Lunes), 0),
-            ha_lun      = coalesce(as.numeric(rm$Ha_Lunes), 0),
-            kg_lun      = coalesce(as.numeric(rm$Kg_Lunes), 0),
-            pct_mar     = coalesce(as.numeric(rm$Martes), 0),
-            ha_mar      = coalesce(as.numeric(rm$Ha_Martes), 0),
-            kg_mar      = coalesce(as.numeric(rm$Kg_Martes), 0),
-            pct_mie     = coalesce(as.numeric(rm$Miércoles), 0),
-            ha_mie      = coalesce(as.numeric(rm$Ha_Miércoles), 0),
-            kg_mie      = coalesce(as.numeric(rm$Kg_Miércoles), 0),
-            pct_jue     = coalesce(as.numeric(rm$Jueves), 0),
-            ha_jue      = coalesce(as.numeric(rm$Ha_Jueves), 0),
-            kg_jue      = coalesce(as.numeric(rm$Kg_Jueves), 0),
-            pct_vie     = coalesce(as.numeric(rm$Viernes), 0),
-            ha_vie      = coalesce(as.numeric(rm$Ha_Viernes), 0),
-            kg_vie      = coalesce(as.numeric(rm$Kg_Viernes), 0),
-            pct_sab     = coalesce(as.numeric(rm$Sábado), 0),
-            ha_sab      = coalesce(as.numeric(rm$Ha_Sábado), 0),
-            kg_sab      = coalesce(as.numeric(rm$Kg_Sábado), 0),
-            pct_total   = coalesce(as.numeric(rm$Lunes + rm$Martes + rm$Miércoles + rm$Jueves + rm$Viernes + rm$Sábado), 0),
-            ha_total    = coalesce(as.numeric(rm$Ha_Total_Prog), 0),
-            kg_total    = coalesce(as.numeric(rm$Kg_Total_Prog), 0)
-          )
-        }
-      }
-      lista_rutas_json
-      }
-      
-      # Estado combinado (compatibilidad con la versión antigua del script de Google)
-      lista_rutas_json <- construir_rutas_json(rutas_modo)
-      
-      # ENVÍO PARCIAL: cuando hay filtro/permisos, el webhook recibe además SOLO las válvulas de este usuario
-      # (rutas_usuario) y el alcance que puede reemplazar (alcance_codigos). Así Google Sheets conserva intactas
-      # (con su evaluador, versión y hora originales) las filas de otros usuarios y el historial solo registra lo propio.
-      es_parcial <- !is.null(ids_scope_envio)
-      rutas_usuario_df <- rutas_modo
-      if (es_parcial && nrow(rutas_modo) > 0) {
-        rutas_usuario_df <- rutas_modo %>% filter(id %in% ids_scope_envio)
-      }
-      n_envio <- if (es_parcial) nrow(rutas_usuario_df) else nrow(rutas_modo)
-      
-      payload <- list(
-        campana   = "2026",
-        semana    = sem_num,
-        modo      = modo_label_sheet,
-        pasada    = p_act,
-        evaluador = if (!is.null(usr)) usr$nombre else Sys.getenv("USERNAME", "Evaluador"),
-        rutas     = lista_rutas_json
-      )
-      if (es_parcial) {
-        payload$parcial         <- TRUE
-        payload$alcance_codigos <- as.list(unique(as.character(df_valvulas$codigo[df_valvulas$id %in% ids_scope_envio])))
-        payload$rutas_usuario   <- construir_rutas_json(rutas_usuario_df)
-      }
-      
-      tryCatch({
-        res <- httr::POST(
-          url_webhook_sheets,
-          body = jsonlite::toJSON(payload, auto_unbox = TRUE),
-          httr::content_type_json(),
-          httr::timeout(35)
-        )
-        if (httr::status_code(res) == 200) {
-          resp_txt <- httr::content(res, as = "text", encoding = "UTF-8")
-          resp_json <- tryCatch(jsonlite::fromJSON(resp_txt), error = function(e) NULL)
-          v_tag <- if (!is.null(resp_json$version)) resp_json$version else "OK"
-          if (n_envio > 0) {
-            showNotification(sprintf("☁️ Google Sheets actualizado (%s - %s - %d válvulas%s).", modo_label_sheet, v_tag, n_envio, if (es_parcial) " propias" else ""), type = "message", duration = 4)
-          } else {
-            showNotification(sprintf("☁️ Google Sheets actualizado: ruta eliminada (%s - %dª Pasada).", modo_label_sheet, p_act), type = "message", duration = 4)
+        lista_rutas_json <- vector("list", nrow(df_r))
+        if (nrow(df_r) > 0) {
+          for (i in seq_len(nrow(df_r))) {
+            rm <- df_r[i, ]
+            lista_rutas_json[[i]] <- list(
+              id          = coalesce(as.character(rm$id), ""),
+              grupo       = coalesce(as.character(rm$Grupo), ""),
+              sector      = coalesce(as.character(rm$Sector), ""),
+              modulo      = coalesce(as.character(rm$Módulo), ""),
+              turno       = coalesce(as.character(rm$Turno), ""),
+              codigo      = coalesce(as.character(rm$codigo), ""),
+              variedad    = coalesce(as.character(rm$Variedad), ""),
+              area_fisica = coalesce(as.numeric(rm$Área), 0),
+              pct_lun     = coalesce(as.numeric(rm$Lunes), 0),
+              ha_lun      = coalesce(as.numeric(rm$Ha_Lunes), 0),
+              kg_lun      = coalesce(as.numeric(rm$Kg_Lunes), 0),
+              pct_mar     = coalesce(as.numeric(rm$Martes), 0),
+              ha_mar      = coalesce(as.numeric(rm$Ha_Martes), 0),
+              kg_mar      = coalesce(as.numeric(rm$Kg_Martes), 0),
+              pct_mie     = coalesce(as.numeric(rm$Miércoles), 0),
+              ha_mie      = coalesce(as.numeric(rm$Ha_Miércoles), 0),
+              kg_mie      = coalesce(as.numeric(rm$Kg_Miércoles), 0),
+              pct_jue     = coalesce(as.numeric(rm$Jueves), 0),
+              ha_jue      = coalesce(as.numeric(rm$Ha_Jueves), 0),
+              kg_jue      = coalesce(as.numeric(rm$Kg_Jueves), 0),
+              pct_vie     = coalesce(as.numeric(rm$Viernes), 0),
+              ha_vie      = coalesce(as.numeric(rm$Ha_Viernes), 0),
+              kg_vie      = coalesce(as.numeric(rm$Kg_Viernes), 0),
+              pct_sab     = coalesce(as.numeric(rm$Sábado), 0),
+              ha_sab      = coalesce(as.numeric(rm$Ha_Sábado), 0),
+              kg_sab      = coalesce(as.numeric(rm$Kg_Sábado), 0),
+              pct_total   = coalesce(as.numeric(rm$Lunes + rm$Martes + rm$Miércoles + rm$Jueves + rm$Viernes + rm$Sábado), 0),
+              ha_total    = coalesce(as.numeric(rm$Ha_Total_Prog), 0),
+              kg_total    = coalesce(as.numeric(rm$Kg_Total_Prog), 0)
+            )
           }
+        }
+        lista_rutas_json
+      }
+      
+      es_parcial <- !is.null(ids_scope_envio)
+      
+      for (p_act in p_acts) {
+        rutas_modo <- if (nrow(df_guardar_sem) > 0) {
+          df_guardar_sem %>% filter(Tipo_Registro == m_act, Num_Pasada == p_act)
         } else {
-          showNotification(sprintf("⚠️ Error Sheets (HTTP %d)", httr::status_code(res)), type = "warning", duration = 4)
+          tibble()
         }
-      }, error = function(e) {
-        if (mostrar_notif) {
-          showNotification("⚠️ No se pudo conectar con Google Sheets (se guardó en disco local).", type = "warning", duration = 4)
+        
+        lista_rutas_json <- construir_rutas_json(rutas_modo)
+        
+        rutas_usuario_df <- rutas_modo
+        if (es_parcial && nrow(rutas_modo) > 0) {
+          rutas_usuario_df <- rutas_modo %>% filter(id %in% ids_scope_envio)
         }
-      })
+        n_envio <- if (es_parcial) nrow(rutas_usuario_df) else nrow(rutas_modo)
+        
+        if (es_parcial && n_envio == 0 && (!hay_filtro_activo || length(ids_scope_envio) == 0)) {
+          next
+        }
+        
+        payload <- list(
+          campana   = "2026",
+          semana    = sem_num,
+          modo      = modo_label_sheet,
+          pasada    = p_act,
+          evaluador = if (!is.null(usr)) usr$nombre else Sys.getenv("USERNAME", "Evaluador"),
+          rutas     = lista_rutas_json
+        )
+        if (es_parcial) {
+          payload$parcial         <- TRUE
+          payload$alcance_codigos <- as.list(unique(as.character(df_valvulas$codigo[df_valvulas$id %in% ids_scope_envio])))
+          payload$rutas_usuario   <- construir_rutas_json(rutas_usuario_df)
+        }
+        
+        tryCatch({
+          res <- httr::POST(
+            url_webhook_sheets,
+            body = jsonlite::toJSON(payload, auto_unbox = TRUE),
+            httr::content_type_json(),
+            httr::timeout(35)
+          )
+          if (httr::status_code(res) == 200) {
+            resp_txt <- httr::content(res, as = "text", encoding = "UTF-8")
+            resp_json <- tryCatch(jsonlite::fromJSON(resp_txt), error = function(e) NULL)
+            v_tag <- if (!is.null(resp_json$version)) resp_json$version else "OK"
+            if (mostrar_notif) {
+              if (n_envio > 0) {
+                showNotification(sprintf("☁️ Google Sheets actualizado (%s - Pasada %d - %s - %d válvulas%s).", modo_label_sheet, p_act, v_tag, n_envio, if (es_parcial) " propias" else ""), type = "message", duration = 4)
+              } else {
+                showNotification(sprintf("☁️ Google Sheets actualizado (%s - Pasada %d).", modo_label_sheet, p_act), type = "message", duration = 4)
+              }
+            }
+          } else {
+            showNotification(sprintf("⚠️ Error Sheets (HTTP %d)", httr::status_code(res)), type = "warning", duration = 4)
+          }
+        }, error = function(e) {
+          if (mostrar_notif) {
+            showNotification("⚠️ No se pudo conectar con Google Sheets (se guardó en disco local).", type = "warning", duration = 4)
+          }
+        })
+      }
     }
     
     ok
@@ -7075,12 +7179,11 @@ server <- function(input, output, session) {
       showNotification("🔒 En Cosecha Oficial los kilos son oficiales de balanza y no se pueden modificar.", type = "warning", duration = 4)
       return()
     }
-    p_act      <- pasada_activa()
     df_prog    <- programacion_semana()
     ids_filtro <- catalogo_filtrado()$id
     
     sub_dia <- df_prog %>%
-      filter(Tipo_Registro == m_act, Num_Pasada == p_act, id %in% ids_filtro) %>%
+      filter(Tipo_Registro == m_act, Num_Pasada %in% c(1, 2), id %in% ids_filtro) %>%
       select(-any_of(c("Área", "Área.x", "Área.y"))) %>%
       left_join(df_valvulas %>% select(id, Área), by = "id") %>%
       mutate(
@@ -7091,8 +7194,8 @@ server <- function(input, output, session) {
     tot_ha_dia <- sum(sub_dia$Ha_Dia, na.rm = TRUE)
     if (tot_ha_dia <= 0 && kg_val > 0) {
       showNotification(
-        sprintf("⚠️ Primero pinta al menos una válvula en %s dentro del filtro actual (%s - %dª Pasada) para repartir los kilos.",
-                dia_col, if (m_act == "Proyeccion") "Proyección" else "Cosecha Campo", p_act),
+        sprintf("⚠️ Primero pinta al menos una válvula en %s dentro del filtro actual (%s) para repartir los kilos.",
+                dia_col, if (m_act == "Proyeccion") "Proyección" else "Cosecha Campo"),
         type = "warning", duration = 4
       )
       return()
@@ -7102,15 +7205,19 @@ server <- function(input, output, session) {
     kgs_lista[[dia_col]] <- kg_val
     
     if (m_act %in% c("CosechaCampo", "Proyeccion")) {
-      df_prog <- recalcular_kg_cosecha_campo(df_prog, kgs_dias = kgs_lista, modo = m_act, pasada = p_act, ids_alcance = ids_filtro)
+      df_prog <- recalcular_kg_cosecha_campo(df_prog, kgs_dias = kgs_lista, modo = m_act, pasada = c(1, 2), ids_alcance = ids_filtro)
     }
     
     programacion_semana(df_prog)
-    cambios_pendientes_rv(TRUE)
     
-    n_valvs_pintadas <- sum(sub_dia$Ha_Dia > 0, na.rm = TRUE)
+    # Persistir inmediatamente en disco y Google Sheets para que los evaluadores no pierdan su avance
+    persistir_semana_actual(df_prog, modo = m_act, pasada = c(1, 2), mostrar_notif = FALSE, sincronizar_sheets = TRUE, ids_scope = ids_filtro)
+    cambios_pendientes_rv(FALSE)
+    session$sendCustomMessage("limpiar_cambios_pendientes", list())
+    
+    n_valvs_pintadas <- length(unique(sub_dia$id[sub_dia$Ha_Dia > 0]))
     showNotification(
-      sprintf("✓ %s kg prorrateados en %s entre %d válvula(s) del filtro activo (%s ha).",
+      sprintf("✓ %s kg prorrateados en %s (1ª y 2ª pasada) entre %d válvula(s) (%s ha) y guardados.",
               format(round(kg_val), big.mark = ","), dia_col, n_valvs_pintadas, round(tot_ha_dia, 2)),
       type = "message", duration = 3
     )
@@ -7130,14 +7237,14 @@ server <- function(input, output, session) {
     } else {
       modo_activo()
     }
-    p_act   <- if (!is.null(info_kg$pasada)) as.numeric(info_kg$pasada) else pasada_activa()
+    
+    ids_filtro <- if (!is.null(catalogo_filtrado())) catalogo_filtrado()$id else NULL
     
     # Si estamos en Cosecha Campo o Proyección y el usuario modificó algún input diario antes de dar Guardar,
     # prorratear únicamente los días cuyo valor cambió (o donde haya válvulas pintadas con 0 kg) dentro del filtro activo
     if (m_act %in% c("CosechaCampo", "Proyeccion") && !is.null(info_kg) && !is.null(info_kg$kgs)) {
-      ids_filtro <- catalogo_filtrado()$id
       sub_f <- df_prog %>%
-        filter(Tipo_Registro == m_act, Num_Pasada == p_act, id %in% ids_filtro)
+        filter(Tipo_Registro == m_act, Num_Pasada %in% c(1, 2), id %in% ids_filtro)
       
       kgs_cambiados <- list()
       for (d in c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")) {
@@ -7154,12 +7261,12 @@ server <- function(input, output, session) {
         }
       }
       if (length(kgs_cambiados) > 0) {
-        df_prog <- recalcular_kg_cosecha_campo(df_prog, kgs_dias = kgs_cambiados, modo = m_act, pasada = p_act, ids_alcance = ids_filtro)
+        df_prog <- recalcular_kg_cosecha_campo(df_prog, kgs_dias = kgs_cambiados, modo = m_act, pasada = c(1, 2), ids_alcance = ids_filtro)
         programacion_semana(df_prog)
       }
     }
     
-    persistir_semana_actual(df_prog, modo = m_act, pasada = p_act, mostrar_notif = TRUE, sincronizar_sheets = TRUE)
+    persistir_semana_actual(df_prog, modo = m_act, pasada = c(1, 2), mostrar_notif = TRUE, sincronizar_sheets = TRUE, ids_scope = ids_filtro)
     cambios_pendientes_rv(FALSE)
     session$sendCustomMessage("limpiar_cambios_pendientes", list())
     session$sendCustomMessage("ocultar_loader", list())
@@ -7596,14 +7703,20 @@ server <- function(input, output, session) {
   
   # Sincronizar los inputs de Kilos en las 6 tarjetas de día y las etiquetas de válvulas en Canvas
   observe({
-    vf <- valvulas_pasada_activa()
+    cat_f <- catalogo_filtrado()
+    m_act <- modo_activo()
+    ids_filtro <- cat_f$id
+    
+    prog_f <- programacion_semana() %>%
+      filter(Tipo_Registro == m_act, id %in% ids_filtro)
+    
     day_totals <- list(
-      Lunes     = sum(vf$Kg_Lunes, na.rm = TRUE),
-      Martes    = sum(vf$Kg_Martes, na.rm = TRUE),
-      Miércoles = sum(vf$Kg_Miércoles, na.rm = TRUE),
-      Jueves    = sum(vf$Kg_Jueves, na.rm = TRUE),
-      Viernes   = sum(vf$Kg_Viernes, na.rm = TRUE),
-      Sábado    = sum(vf$Kg_Sábado, na.rm = TRUE)
+      Lunes     = sum(prog_f$Kg_Lunes, na.rm = TRUE),
+      Martes    = sum(prog_f$Kg_Martes, na.rm = TRUE),
+      Miércoles = sum(prog_f$Kg_Miércoles, na.rm = TRUE),
+      Jueves    = sum(prog_f$Kg_Jueves, na.rm = TRUE),
+      Viernes   = sum(prog_f$Kg_Viernes, na.rm = TRUE),
+      Sábado    = sum(prog_f$Kg_Sábado, na.rm = TRUE)
     )
     
     filas_kg <- programacion_semana() %>%

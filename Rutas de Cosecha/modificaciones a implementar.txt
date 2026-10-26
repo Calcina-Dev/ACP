@@ -19,11 +19,12 @@ completados
 
 - para los modulos 1,2,3 el pintado debe ser horizontal
 -El dia activo será el dia anterior al dia de hoy, por ejemplo hoy miércoles estará activo el martes
-
+- Pintado libre al 10%: se puede pintar por cualquier cuadro (izquierda, centro, derecha) para registrar el sentido de ingreso del evaluador
+- Prorrateo de kilos ingresados por día incluyendo la 2ª pasada (distribución proporcional al área cosechada de ambas pasadas)
+- Guardado automático de la información al prorratear kilos (persistencia inmediata en disco y Google Sheets para no perder avances)
 
 -validar login y concurrencia
 
 a futuros
 
-- y si es una válvula agregar ingreso de pintado, norte, sur, centro
 -opción mover dia / copiar dia 
