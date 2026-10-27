@@ -21,16 +21,25 @@ cat("========================================================\n\n")
 
 # 2. Archivos esenciales empaquetados para la nube
 # Incluye la data maestra como respaldo sólido, que además se actualiza dinámicamente desde Google Drive
+dir_despliegue <- if (dir.exists("D:/ACP/Rutas de Cosecha")) {
+  "D:/ACP/Rutas de Cosecha"
+} else if (dir.exists("D:/modulo_mapa_valvulas")) {
+  "D:/modulo_mapa_valvulas"
+} else {
+  getwd()
+}
+
 archivos_despliegue <- c(
   "app_mapa.R",
   "datos_maestros_cosecha_2026.RData",
+  "rutas_cosecha_mapa.rds",
   "logo_cerro_prieto_b64.R",
   "valvulas_normalizadas.rds",
   "www"
 )
 
 # Filtrar solo los que existen actualmente
-archivos_existentes <- archivos_despliegue[file.exists(file.path("D:/modulo_mapa_valvulas", archivos_despliegue)) | 
+archivos_existentes <- archivos_despliegue[file.exists(file.path(dir_despliegue, archivos_despliegue)) | 
                                            file.exists(archivos_despliegue)]
 
 cat("Archivos incluidos en el despliegue:\n")
@@ -39,7 +48,7 @@ cat("\nSubiendo paquete a shinyapps.io...\n")
 
 # 3. Ejecución del despliegue
 rsconnect::deployApp(
-  appDir        = "D:/modulo_mapa_valvulas",
+  appDir        = dir_despliegue,
   appPrimaryDoc = "app_mapa.R",
   appName       = "ruta_cosecha",
   appTitle      = "Ruta de Cosecha - Mapa 2D",

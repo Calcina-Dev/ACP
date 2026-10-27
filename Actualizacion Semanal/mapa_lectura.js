@@ -50,13 +50,111 @@ function buildHarvestMap(valvulas) {
 }
 
 const DAY_DAYS = [
-  { key: "Pct_Lunes",     kgKey: "Kg_Lunes",     name: "Lunes",     color: "#EF4444" },
-  { key: "Pct_Martes",    kgKey: "Kg_Martes",    name: "Martes",    color: "#0EA5E9" },
-  { key: "Pct_Miercoles", kgKey: "Kg_Miercoles", name: "Miércoles", color: "#F97316" },
-  { key: "Pct_Jueves",    kgKey: "Kg_Jueves",    name: "Jueves",    color: "#EAB308" },
-  { key: "Pct_Viernes",   kgKey: "Kg_Viernes",   name: "Viernes",   color: "#22C55E" },
-  { key: "Pct_Sabado",    kgKey: "Kg_Sabado",    name: "Sábado",    color: "#A855F7" }
+  { key: "Pct_Lunes",     kgKey: "Kg_Lunes",     cellKey: "lunes",     name: "Lunes",     color: "#EF4444" },
+  { key: "Pct_Martes",    kgKey: "Kg_Martes",    cellKey: "martes",    name: "Martes",    color: "#0EA5E9" },
+  { key: "Pct_Miercoles", kgKey: "Kg_Miercoles", cellKey: "miercoles", name: "Miércoles", color: "#F97316" },
+  { key: "Pct_Jueves",    kgKey: "Kg_Jueves",    cellKey: "jueves",    name: "Jueves",    color: "#EAB308" },
+  { key: "Pct_Viernes",   kgKey: "Kg_Viernes",   cellKey: "viernes",   name: "Viernes",   color: "#22C55E" },
+  { key: "Pct_Sabado",    kgKey: "Kg_Sabado",    cellKey: "sabado",    name: "Sábado",    color: "#A855F7" }
 ];
+const COLOR_BY_CELL_DAY = {};
+DAY_DAYS.forEach(d => { COLOR_BY_CELL_DAY[d.cellKey] = d.color; });
+
+function buildReadonlyRanges(hData) {
+  if (!hData) return [];
+  const counts = {};
+  let totalCount = 0;
+  for (let d = 0; d < DAY_DAYS.length; d++) {
+    const def = DAY_DAYS[d];
+    const pct = Math.max(0, Math.min(100, Number(hData[def.key]) || 0));
+    counts[def.cellKey] = pct;
+    totalCount += pct;
+  }
+  if (totalCount <= 0 && Number(hData.Pct_Total) <= 0 && Number(hData.Kg_Total) <= 0) return [];
+
+  if (hData.cells_str && typeof hData.cells_str === "string" && hData.cells_str.replace(/,/g, "").trim().length > 0) {
+    const parts = hData.cells_str.split(",");
+    const cells = [];
+    const cellDays = {};
+    for (let i = 0; i < 10; i++) {
+      const ck = (parts[i] || "").trim().toLowerCase();
+      cells.push(ck);
+      if (ck && COLOR_BY_CELL_DAY[ck]) {
+        cellDays[ck] = (cellDays[ck] || 0) + 10;
+      }
+    }
+    let allMatch = true;
+    for (let d = 0; d < DAY_DAYS.length; d++) {
+      const ck = DAY_DAYS[d].cellKey;
+      if (Math.abs((cellDays[ck] || 0) - (counts[ck] || 0)) >= 0.5) {
+        allMatch = false;
+        break;
+      }
+    }
+    if (allMatch) {
+      const res = [];
+      for (let i = 0; i < 10; i++) {
+        const ck = cells[i];
+        if (!ck || !COLOR_BY_CELL_DAY[ck]) continue;
+        const cStart = i * 10, cEnd = (i + 1) * 10;
+        if (res.length > 0 && res[res.length - 1].day === ck && Math.abs(res[res.length - 1].end - cStart) < 0.05) {
+          res[res.length - 1].end = cEnd;
+        } else {
+          res.push({ day: ck, color: COLOR_BY_CELL_DAY[ck], start: cStart, end: cEnd });
+        }
+      }
+      return res;
+    }
+
+    // Porcentajes decimales manuales con posición definida en cells_str
+    const groups = [];
+    for (let i = 0; i < 10; i++) {
+      const ck = cells[i];
+      if (!ck || !COLOR_BY_CELL_DAY[ck]) continue;
+      if (groups.length > 0 && groups[groups.length - 1].day === ck && groups[groups.length - 1].lastIdx === i - 1) {
+        groups[groups.length - 1].lastIdx = i;
+        groups[groups.length - 1].cellCount++;
+      } else {
+        groups.push({ day: ck, firstIdx: i, lastIdx: i, cellCount: 1 });
+      }
+    }
+    const dayCellTotals = {};
+    for (let g of groups) dayCellTotals[g.day] = (dayCellTotals[g.day] || 0) + g.cellCount;
+
+    const placed = [];
+    for (let g of groups) {
+      const dayPct = counts[g.day] || 0;
+      if (dayPct <= 0) continue;
+      const share = dayCellTotals[g.day] > 0 ? (g.cellCount / dayCellTotals[g.day]) : 1;
+      const gPct = Math.round(dayPct * share * 100) / 100;
+      if (gPct <= 0) continue;
+      const gStart = g.firstIdx * 10;
+      const gEnd = (g.lastIdx + 1) * 10;
+      let start = gStart;
+      if (g.lastIdx === 9 && g.firstIdx > 0) {
+        start = Math.max(0, 100 - gPct);
+      } else if (g.firstIdx === 0 && g.lastIdx < 9) {
+        start = 0;
+      } else if (g.firstIdx > 0 && g.lastIdx < 9) {
+        const gMid = (gStart + gEnd) / 2;
+        start = Math.max(0, Math.min(100 - gPct, Math.round((gMid - gPct / 2) * 100) / 100));
+      }
+      placed.push({ day: g.day, color: COLOR_BY_CELL_DAY[g.day], start: start, end: Math.min(100, start + gPct) });
+    }
+    if (placed.length > 0) return placed;
+  }
+
+  const fallback = [];
+  let cur = 0;
+  for (let d = 0; d < DAY_DAYS.length; d++) {
+    const def = DAY_DAYS[d];
+    const pct = counts[def.cellKey] || 0;
+    if (pct <= 0) continue;
+    fallback.push({ day: def.cellKey, color: def.color, start: cur, end: Math.min(100, cur + pct) });
+    cur += pct;
+  }
+  return fallback;
+}
 
 let canvas, ctx, wrapper, tooltip;
 let scale = 1, panX = 0, panY = 0;
@@ -219,24 +317,23 @@ function render() {
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(v.x, v.y, v.w, v.h);
     
-    // Relleno por día cosechado
+    // Relleno por día cosechado (respetando posición física de cells_str)
     if (hData && (Number(hData.Pct_Total) > 0 || Number(hData.Kg_Total) > 0)) {
-      let currentOffset = 0;
-      for (let d = 0; d < DAY_DAYS.length; d++) {
-        const dayDef = DAY_DAYS[d];
-        const pct = Number(hData[dayDef.key]) || 0;
+      const segs = buildReadonlyRanges(hData);
+      for (let s = 0; s < segs.length; s++) {
+        const seg = segs[s];
+        const pct = seg.end - seg.start;
         if (pct <= 0) continue;
-        ctx.fillStyle = dayDef.color;
+        ctx.fillStyle = seg.color;
         if (horiz) {
-          const y = v.y + (currentOffset / 100) * v.h;
+          const y = v.y + (seg.start / 100) * v.h;
           const hSeg = (pct / 100) * v.h;
           ctx.fillRect(v.x, y, v.w, hSeg);
         } else {
-          const x = v.x + (currentOffset / 100) * v.w;
+          const x = v.x + (seg.start / 100) * v.w;
           const wSeg = (pct / 100) * v.w;
           ctx.fillRect(x, v.y, wSeg, v.h);
         }
-        currentOffset += pct;
       }
     }
     
@@ -310,7 +407,7 @@ function render() {
         
         const kgVal = (hData && hData.Kg_Total) ? Math.round(hData.Kg_Total) : 0;
         const textHa = (v.Área !== undefined && v.Área !== null ? v.Área : '') + ' ha' +
-                       (kgVal > 0 ? ' • ' + kgVal.toLocaleString() + ' kg' : '');
+                       (kgVal > 0 ? ' • ' + kgVal.toLocaleString('en-US') + ' kg' : '');
         let fSizeHa = Math.min(12, Math.max(6.2, Math.round(fSizeCode * 0.62)));
         ctx.font = '700 ' + fSizeHa + 'px Inter, -apple-system, sans-serif';
         let haW = ctx.measureText(textHa).width;
@@ -334,6 +431,23 @@ function render() {
         ctx.strokeText(v.codigo, cx, v.y + v.h * midY);
         ctx.fillText(v.codigo, cx, v.y + v.h * midY);
       }
+      ctx.restore();
+    } else if (scale > 0.35 && v.w >= 3 && v.w < 18) {
+      ctx.save();
+      ctx.translate(v.x + v.w / 2, v.y + v.h / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const vStr = ((v.Variedad ? v.Variedad + ' ' : '') + (v.Área !== undefined ? v.Área + ' ha' : '')).trim();
+      let fSizeVert = Math.min(v.w * 0.76, 11);
+      ctx.font = 'bold ' + fSizeVert + 'px Inter, -apple-system, sans-serif';
+      const vw = ctx.measureText(vStr).width;
+      if (vw > v.h * 0.90) {
+        fSizeVert = Math.max(3.5, fSizeVert * ((v.h * 0.90) / vw));
+        ctx.font = 'bold ' + fSizeVert + 'px Inter, -apple-system, sans-serif';
+      }
+      ctx.fillStyle = '#000000';
+      ctx.fillText(vStr, 0, 0);
       ctx.restore();
     }
   }
@@ -442,7 +556,7 @@ function initMapaCanvas() {
               if (p > 0 || k > 0) {
                 daysHtml += '<div style="display:flex; justify-content:space-between; gap:10px; margin-top:2px;">' +
                   '<span style="color:' + d.color + '; font-weight:700;">● ' + d.name + ':</span>' +
-                  '<span>' + p + '% (' + k.toLocaleString() + ' kg)</span></div>';
+                  '<span>' + p + '% (' + k.toLocaleString('en-US') + ' kg)</span></div>';
               }
             });
           } else {
@@ -451,9 +565,9 @@ function initMapaCanvas() {
           
           tooltip.innerHTML = '<div style="font-weight:700; font-size:13px; margin-bottom:2px; border-bottom:1px solid rgba(255,255,255,0.2); padding-bottom:3px;">' +
             v.codigo + ' <span style="font-weight:400; font-size:11.5px; opacity:0.85;">(' + (v.Variedad || '') + ')</span></div>' +
-            '<div style="font-size:11px; opacity:0.85; margin-bottom:4px;">Módulo ' + v.Módulo + ' • Turno ' + v.Turno + ' • Área: <b>' + v.Área + ' ha</b></div>' +
-            (kgTot > 0 ? '<div style="display:flex; justify-content:space-between; gap:14px; margin-bottom:4px;"><span>Total Cosechado:</span><b style="color:#38BDF8;">' + kgTot.toLocaleString() + ' kg</b></div>' +
-                         '<div style="display:flex; justify-content:space-between; gap:14px; margin-bottom:6px;"><span>Rendimiento:</span><b style="color:#4ADE80;">' + rendVal.toLocaleString() + ' kg/ha</b></div>' : '') +
+            '<div style="font-size:11px; opacity:0.85; margin-bottom:4px;">Módulo ' + (v.Módulo_Sub || v.Módulo) + ' • Turno ' + v.Turno + ' • Área: <b>' + v.Área + ' ha</b></div>' +
+            (kgTot > 0 ? '<div style="display:flex; justify-content:space-between; gap:14px; margin-bottom:4px;"><span>Total Cosechado:</span><b style="color:#38BDF8;">' + kgTot.toLocaleString('en-US') + ' kg</b></div>' +
+                         '<div style="display:flex; justify-content:space-between; gap:14px; margin-bottom:6px;"><span>Rendimiento:</span><b style="color:#4ADE80;">' + rendVal.toLocaleString('en-US') + ' kg/ha</b></div>' : '') +
             '<div style="border-top:1px solid rgba(255,255,255,0.15); padding-top:4px;">' + daysHtml + '</div>';
           tooltip.style.display = 'block';
           tooltip.style.left = Math.min(rect.width - 240, mx + 14) + 'px';
@@ -542,13 +656,13 @@ if (window.Shiny) {
     
     const k = data.kpis || {};
     const haEl = document.getElementById('mapa_kpi_ha');
-    if (haEl) haEl.textContent = (k.ha_cosechada || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' ha';
+    if (haEl) haEl.textContent = (k.ha_cosechada || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' ha';
     
     const kgEl = document.getElementById('mapa_kpi_kg');
-    if (kgEl) kgEl.textContent = Math.round(k.kg_total || 0).toLocaleString() + ' kg';
+    if (kgEl) kgEl.textContent = Math.round(k.kg_total || 0).toLocaleString('en-US') + ' kg';
     
     const rendEl = document.getElementById('mapa_kpi_rend');
-    if (rendEl) rendEl.textContent = Math.round(k.rend_promedio || 0).toLocaleString() + ' kg/ha';
+    if (rendEl) rendEl.textContent = Math.round(k.rend_promedio || 0).toLocaleString('en-US') + ' kg/ha';
     
     const dias = k.dias || {};
     const mapBadges = [
@@ -562,7 +676,7 @@ if (window.Shiny) {
     mapBadges.forEach(b => {
       const el = document.getElementById(b.id);
       if (el) {
-        const kgD = (b.data && b.data.kg) ? Math.round(b.data.kg).toLocaleString() : '0';
+        const kgD = (b.data && b.data.kg) ? Math.round(b.data.kg).toLocaleString('en-US') : '0';
         const haD = (b.data && b.data.ha) ? b.data.ha.toFixed(2) : '0.00';
         el.textContent = '● ' + b.name + ': ' + kgD + ' kg (' + haD + ' ha)';
       }

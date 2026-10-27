@@ -90,7 +90,7 @@ particiones_multivariedad_default <- tibble::tribble(
   "M10-T16-V48", "ROCIO", 0.60, 4,
   "M10-T16-V48", "MADEIRA", 0.30, 5,
   "M14-T17-V65", "SEKOYA POP", 0.40, 1,
-  "M14-T17-V65", "IMPERIAL", 1.16, 2,
+  "M14-T17-V65", "IMPERIAL", 0.72, 2,
   "M14-T17-V65", "MILAGROS", 0.04, 3,
   "M14-T17-V65", "IMPERIAL", 0.44, 4
 )
@@ -332,10 +332,20 @@ generar_cells_str_vec <- function(p_lun, p_mar, p_mie, p_jue, p_vie, p_sab) {
       next
     }
     counts <- round(row_p / 10)
-    diff <- 10 - sum(counts)
-    if (diff != 0) {
-      max_idx <- which.max(row_p)
-      counts[max_idx] <- max(0, counts[max_idx] + diff)
+    # Solo ajustar por redondeo si la suma total es aproximadamente 100% (para completar exactamente 10 celdas)
+    if (tot >= 99.5) {
+      diff <- 10 - sum(counts)
+      if (diff != 0) {
+        max_idx <- which.max(row_p)
+        counts[max_idx] <- max(0, counts[max_idx] + diff)
+      }
+    } else {
+      # Si es menor a 100%, asegurar que no exceda 10 celdas
+      if (sum(counts) > 10) {
+        diff <- sum(counts) - 10
+        max_idx <- which.max(row_p)
+        counts[max_idx] <- max(0, counts[max_idx] - diff)
+      }
     }
     cells <- rep(dias, times = pmax(0, counts))
     if (length(cells) > 10) cells <- cells[1:10]
@@ -845,7 +855,8 @@ obtener_rutas_google_sheets <- function(sem_num = NULL) {
       Kg_Miércoles   = get_num("kg.*mie", 0),
       Kg_Jueves      = get_num("kg.*jue", 0),
       Kg_Viernes     = get_num("kg.*vie", 0),
-      Kg_Sábado      = get_num("kg.*sab", 0)
+      Kg_Sábado      = get_num("kg.*sab", 0),
+      Cells_Str_Sheet = get_chr("^cells.*str$", "")
     ) %>%
       filter(!is.na(Semana), nzchar(Codigo_Valvula)) %>%
       mutate(
@@ -904,7 +915,7 @@ obtener_rutas_google_sheets <- function(sem_num = NULL) {
         Ha_Sábado           = round(Área * (Sábado / 100), 2),
         Ha_Total_Prog       = round(Ha_Lunes + Ha_Martes + Ha_Miércoles + Ha_Jueves + Ha_Viernes + Ha_Sábado, 2),
         Kg_Total_Prog       = round(Kg_Lunes + Kg_Martes + Kg_Miércoles + Kg_Jueves + Kg_Viernes + Kg_Sábado, 2),
-        cells_str           = generar_cells_str_vec(Lunes, Martes, Miércoles, Jueves, Viernes, Sábado),
+        cells_str           = coalesce(as.character(Cells_Str_Sheet), ""),
         Fecha_Actualizacion = Sys.time()
       ) %>%
       select(
@@ -2855,7 +2866,7 @@ ui <- fluidPage(
         counts: emptyCounts(),
         cellFractions: {},
         hasExactPcts: false,
-        align: 'start',
+        align: null,
         ranges: [],
         kg: emptyCounts(),
         totalKg: 0
@@ -2895,20 +2906,36 @@ ui <- fluidPage(
       return v.slots[slotKey(activeMode, otherP)];
     }
     
-    function detectSlotAlign(slot) {
-      if (slot && slot.align) return slot.align;
-      if (!slot || !slot.cells) return 'start';
+    function detectAlignFromCells(cells, cellFractions = null) {
+      if (!cells || !Array.isArray(cells)) return null;
       let firstIdx = -1, lastIdx = -1;
       for (let i = 0; i < 10; i++) {
-        if (slot.cells[i]) {
+        if (cells[i]) {
           if (firstIdx === -1) firstIdx = i;
           lastIdx = i;
         }
       }
-      if (firstIdx === -1) return 'start';
+      if (firstIdx === -1) return null;
       if (lastIdx === 9 && firstIdx > 0) return 'end';
       if (firstIdx > 0 && lastIdx < 9) return 'center';
+      if (firstIdx === 0 && lastIdx === 9 && cellFractions) {
+        const f0 = (cellFractions[0] !== undefined) ? Number(cellFractions[0]) : 1.0;
+        const f9 = (cellFractions[9] !== undefined) ? Number(cellFractions[9]) : 1.0;
+        if (f0 < 0.99 && f9 >= 0.99) return 'end';
+        if (f0 < 0.99 && f9 < 0.99) return 'center';
+      }
       return 'start';
+    }
+
+    function detectSlotAlign(slot, preferCells = false) {
+      if (!slot) return 'start';
+      if (preferCells && slot.cells) {
+        const fromCells = detectAlignFromCells(slot.cells, slot.cellFractions);
+        if (fromCells) return fromCells;
+      }
+      if (slot.align) return slot.align;
+      const fromCells = detectAlignFromCells(slot.cells, slot.cellFractions);
+      return fromCells || 'start';
     }
 
     function buildRangesFromCells(slot) {
@@ -2919,9 +2946,29 @@ ui <- fluidPage(
         const day = slot.cells[c];
         const frac = (slot.cellFractions && slot.cellFractions[c] !== undefined) ? slot.cellFractions[c] : 1.0;
         if (day && frac > 0.001) {
-          const cStart = c * 10;
-          const cEnd = Math.round((cStart + frac * 10) * 100) / 100;
-          if (curRange && curRange.day === day && Math.abs(curRange.end - cStart) < 0.01) {
+          let cStart = c * 10;
+          let cEnd = Math.round((cStart + frac * 10) * 100) / 100;
+          if (frac < 0.999) {
+            const prevSame = (c > 0 && slot.cells[c - 1] === day);
+            const nextSame = (c < 9 && slot.cells[c + 1] === day);
+            if (!prevSame && nextSame) {
+              // Borde inicial de un bloque que continúa a la derecha: pegar al extremo derecho de la celda c
+              cEnd = (c + 1) * 10;
+              cStart = Math.round((cEnd - frac * 10) * 100) / 100;
+            } else if (!prevSame && !nextSame) {
+              // Celda única aislada con fracción parcial
+              const al = slot.align || detectAlignFromCells(slot.cells, slot.cellFractions) || 'start';
+              if (c === 9 || (c > 0 && al === 'end')) {
+                cEnd = (c + 1) * 10;
+                cStart = Math.round((cEnd - frac * 10) * 100) / 100;
+              } else if (c > 0 && c < 9 && al === 'center') {
+                const mid = c * 10 + 5;
+                cStart = Math.round((mid - (frac * 10) / 2) * 100) / 100;
+                cEnd = Math.round((mid + (frac * 10) / 2) * 100) / 100;
+              }
+            }
+          }
+          if (curRange && curRange.day === day && Math.abs(curRange.end - cStart) < 0.05) {
             curRange.end = cEnd;
             curRange.pct = Math.round((curRange.end - curRange.start) * 100) / 100;
           } else {
@@ -2946,10 +2993,104 @@ ui <- fluidPage(
 
     function buildRangesFromSlot(slot) {
       if (!slot) return [];
-      if (slot.cells && Array.isArray(slot.cells) && slot.cells.some(c => c !== '')) {
-        return buildRangesFromCells(slot);
-      }
       const counts = slot.counts || {};
+      let countSum = 0;
+      for (let d of DAY_KEYS) countSum += (Number(counts[d]) || 0);
+      
+      const hasCells = slot.cells && Array.isArray(slot.cells) && slot.cells.some(c => c !== '');
+      if (hasCells) {
+        let cellSum = 0;
+        for (let c = 0; c < 10; c++) {
+          if (slot.cells[c]) {
+            const frac = (slot.cellFractions && slot.cellFractions[c] !== undefined) ? slot.cellFractions[c] : 1.0;
+            cellSum += frac * 10;
+          }
+        }
+        if (countSum <= 0 || Math.abs(cellSum - countSum) < 0.5) {
+          return buildRangesFromCells(slot);
+        }
+        
+        // Cuando hay celdas definidas en cells_str pero counts tiene decimales por ingreso manual de Ha (ej. 28.5% en 3 celdas),
+        // posicionar cada segmento contiguo respetando las celdas físicas donde fue pintado (derecha, centro o izquierda).
+        const totalCellsByDay = {};
+        for (let c = 0; c < 10; c++) {
+          const d = slot.cells[c];
+          if (d && (Number(counts[d]) || 0) > 0) {
+            totalCellsByDay[d] = (totalCellsByDay[d] || 0) + 1;
+          }
+        }
+        
+        const groups = [];
+        let curGroup = null;
+        for (let c = 0; c < 10; c++) {
+          const d = slot.cells[c];
+          if (d && (Number(counts[d]) || 0) > 0) {
+            if (!curGroup) {
+              curGroup = { firstIdx: c, lastIdx: c, runs: [{ day: d, count: 1 }] };
+            } else {
+              curGroup.lastIdx = c;
+              const lastRun = curGroup.runs[curGroup.runs.length - 1];
+              if (lastRun.day === d) lastRun.count++;
+              else curGroup.runs.push({ day: d, count: 1 });
+            }
+          } else {
+            if (curGroup) {
+              groups.push(curGroup);
+              curGroup = null;
+            }
+          }
+        }
+        if (curGroup) groups.push(curGroup);
+        
+        if (groups.length > 0) {
+          const ranges = [];
+          for (let g of groups) {
+            let groupPct = 0;
+            const segRuns = [];
+            for (let run of g.runs) {
+              const totCells = totalCellsByDay[run.day] || run.count;
+              const runPct = Math.round(((Number(counts[run.day]) || 0) * (run.count / totCells)) * 100) / 100;
+              if (runPct > 0) {
+                segRuns.push({ day: run.day, pct: runPct });
+                groupPct += runPct;
+              }
+            }
+            groupPct = Math.min(100, Math.max(0, Math.round(groupPct * 100) / 100));
+            if (groupPct <= 0) continue;
+            
+            let gStart = 0;
+            if (g.lastIdx === 9 && g.firstIdx > 0) {
+              gStart = Math.max(0, 100 - groupPct);
+            } else if (g.firstIdx === 0 && g.lastIdx < 9) {
+              gStart = 0;
+            } else if (g.firstIdx > 0 && g.lastIdx < 9) {
+              const spanStart = g.firstIdx * 10;
+              const spanEnd = (g.lastIdx + 1) * 10;
+              const mid = (spanStart + spanEnd) / 2;
+              gStart = Math.max(0, Math.min(100 - groupPct, mid - groupPct / 2));
+            } else {
+              const al = slot.align || detectAlignFromCells(slot.cells, slot.cellFractions) || 'start';
+              if (al === 'end') gStart = Math.max(0, 100 - groupPct);
+              else if (al === 'center') gStart = Math.max(0, (100 - groupPct) / 2);
+              else gStart = 0;
+            }
+            gStart = Math.round(gStart * 100) / 100;
+            
+            let curOffset = gStart;
+            for (let sr of segRuns) {
+              const endOffset = Math.min(100, Math.round((curOffset + sr.pct) * 100) / 100);
+              ranges.push({
+                day: sr.day,
+                start: curOffset,
+                end: endOffset,
+                pct: Math.round((endOffset - curOffset) * 100) / 100
+              });
+              curOffset = endOffset;
+            }
+          }
+          if (ranges.length > 0) return ranges;
+        }
+      }
       
       const orderedDays = [];
       const seen = new Set();
@@ -2975,7 +3116,7 @@ ui <- fluidPage(
       totalPct = Math.min(100, Math.max(0, Math.round(totalPct * 100) / 100));
       if (totalPct <= 0) return [];
       
-      const align = slot.align || detectSlotAlign(slot) || 'start';
+      const align = detectSlotAlign(slot, true);
       let startOffset = 0;
       if (align === 'end') startOffset = 100 - totalPct;
       else if (align === 'center') startOffset = (100 - totalPct) / 2;
@@ -3045,6 +3186,33 @@ ui <- fluidPage(
           }
         } else {
           slot.cells[c] = '';
+        }
+      }
+      
+      // Si el total pintado es >90% y <99.5% (no llega al 100%), dejar libre la celda del extremo opuesto
+      // en slot.cells para que cells_str en Google Sheets refleje inequívocamente la orientación (derecha/centro/izquierda)
+      let totalRangePct = 0;
+      let minRangeStart = 100;
+      let maxRangeEnd = 0;
+      for (let r of ranges) {
+        if (r.pct > 0) {
+          totalRangePct += r.pct;
+          if (r.start < minRangeStart) minRangeStart = r.start;
+          if (r.end > maxRangeEnd) maxRangeEnd = r.end;
+        }
+      }
+      if (totalRangePct > 90 && totalRangePct < 99.5 && slot.cells.every(c => c !== '')) {
+        if (minRangeStart > 0.5 && maxRangeEnd >= 99.5) {
+          slot.cells[0] = '';
+          delete slot.cellFractions[0];
+        } else if (minRangeStart <= 0.5 && maxRangeEnd < 99.5) {
+          slot.cells[9] = '';
+          delete slot.cellFractions[9];
+        } else if (minRangeStart > 0.5 && maxRangeEnd < 99.5) {
+          slot.cells[0] = '';
+          slot.cells[9] = '';
+          delete slot.cellFractions[0];
+          delete slot.cellFractions[9];
         }
       }
       
@@ -3598,14 +3766,25 @@ ui <- fluidPage(
             sabado:    'input_kg_sabado'
           };
           
+          function fmtMiles(val) {
+            const num = Math.round(Number(val) || 0);
+            return num.toString().replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+          }
+          function fmtHa(val) {
+            const parts = (Number(val) || 0).toFixed(2).split('.');
+            parts[0] = parts[0].replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+            return parts.join('.');
+          }
+
           const dayStats = {
-            lunes:     { name: 'Lunes',     icon: '🔴', color: DAY_COLORS.lunes,     ha: 0, kg: 0, valvs: 0 },
-            martes:    { name: 'Martes',    icon: '🔵', color: DAY_COLORS.martes,    ha: 0, kg: 0, valvs: 0 },
-            miercoles: { name: 'Miércoles', icon: '🟠', color: DAY_COLORS.miercoles, ha: 0, kg: 0, valvs: 0 },
-            jueves:    { name: 'Jueves',    icon: '🟡', color: DAY_COLORS.jueves,    ha: 0, kg: 0, valvs: 0 },
-            viernes:   { name: 'Viernes',   icon: '🟢', color: DAY_COLORS.viernes,   ha: 0, kg: 0, valvs: 0 },
-            sabado:    { name: 'Sábado',    icon: '🟣', color: DAY_COLORS.sabado,    ha: 0, kg: 0, valvs: 0 }
+            lunes:     { name: 'Lunes',     icon: '🔴', color: DAY_COLORS.lunes,     ha: 0, kg: 0, valvs: 0, vars: new Set(), haByVar: {}, kgByVar: {} },
+            martes:    { name: 'Martes',    icon: '🔵', color: DAY_COLORS.martes,    ha: 0, kg: 0, valvs: 0, vars: new Set(), haByVar: {}, kgByVar: {} },
+            miercoles: { name: 'Miércoles', icon: '🟠', color: DAY_COLORS.miercoles, ha: 0, kg: 0, valvs: 0, vars: new Set(), haByVar: {}, kgByVar: {} },
+            jueves:    { name: 'Jueves',    icon: '🟡', color: DAY_COLORS.jueves,    ha: 0, kg: 0, valvs: 0, vars: new Set(), haByVar: {}, kgByVar: {} },
+            viernes:   { name: 'Viernes',   icon: '🟢', color: DAY_COLORS.viernes,   ha: 0, kg: 0, valvs: 0, vars: new Set(), haByVar: {}, kgByVar: {} },
+            sabado:    { name: 'Sábado',    icon: '🟣', color: DAY_COLORS.sabado,    ha: 0, kg: 0, valvs: 0, vars: new Set(), haByVar: {}, kgByVar: {} }
           };
+          const varStatsMap = {};
           
           let totalHaSemana = 0;
           let totalKgSemana = 0;
@@ -3624,7 +3803,15 @@ ui <- fluidPage(
             
             if (isFiltered) {
               totalValvulasVisibles++;
-              totalAreaFisica += (Number(v.Área) || 0);
+              const vArea = Number(v.Área) || 0;
+              totalAreaFisica += vArea;
+              
+              const vVar = (v.Variedad && String(v.Variedad).trim()) ? String(v.Variedad).trim().toUpperCase() : 'SIN VARIEDAD';
+              if (!varStatsMap[vVar]) {
+                varStatsMap[vVar] = { name: vVar, areaFisica: 0, ha: 0, kg: 0, valvs: 0, color: v.color_base || '#CBD5E1' };
+              }
+              varStatsMap[vVar].areaFisica += vArea;
+              varStatsMap[vVar].valvs++;
               
               minX = Math.min(minX, v.x);
               minY = Math.min(minY, v.y);
@@ -3638,11 +3825,16 @@ ui <- fluidPage(
               for (let d of DAY_KEYS) {
                 const cnt = slot.counts[d] || 0;
                 if (cnt > 0) {
-                  const ha = (Number(v.Área) || 0) * (cnt / 100);
+                  const ha = vArea * (cnt / 100);
                   const kg = (slot.kg && slot.kg[d]) ? slot.kg[d] : 0;
                   dayStats[d].ha += ha;
                   dayStats[d].kg += kg;
                   dayStats[d].valvs++;
+                  if (vVar && vVar !== 'SIN VARIEDAD') dayStats[d].vars.add(vVar);
+                  dayStats[d].haByVar[vVar] = (dayStats[d].haByVar[vVar] || 0) + ha;
+                  dayStats[d].kgByVar[vVar] = (dayStats[d].kgByVar[vVar] || 0) + kg;
+                  varStatsMap[vVar].ha += ha;
+                  varStatsMap[vVar].kg += kg;
                   totalHaSemana += ha;
                   totalKgSemana += kg;
                   vHasPainted = true;
@@ -3666,11 +3858,23 @@ ui <- fluidPage(
               const inVal = parseFloat((inputEl.value || '').replace(/[^0-9.]/g, '')) || 0;
               if (inVal > 0 && dayStats[d].kg === 0) {
                 dayStats[d].kg = inVal;
+                if (dayStats[d].ha > 0) {
+                  Object.keys(dayStats[d].haByVar).forEach(vKey => {
+                    const propKg = inVal * (dayStats[d].haByVar[vKey] / dayStats[d].ha);
+                    dayStats[d].kgByVar[vKey] = (dayStats[d].kgByVar[vKey] || 0) + propKg;
+                    if (varStatsMap[vKey]) {
+                      varStatsMap[vKey].kg += propKg;
+                    }
+                  });
+                }
               }
             }
           });
           
           totalKgSemana = DAY_KEYS.reduce((acc, d) => acc + (dayStats[d].kg || 0), 0);
+          const varList = Object.values(varStatsMap).sort((a, b) => b.areaFisica - a.areaFisica);
+          const activeVars = varList.filter(v => v.ha > 0.0001 || v.kg > 0.1);
+          const tableVars = activeVars.length > 0 ? activeVars : varList;
           
           let bMinX = minX, bMinY = minY, bMaxX = maxX, bMaxY = maxY;
           if (filteredIds === null && hasAnyPainted) {
@@ -3715,10 +3919,6 @@ ui <- fluidPage(
                           (Array.isArray(fM) && fM.length === 1 && String(fM[0]).trim() === '12') ||
                           (String(fM).trim() === '12');
 
-          // Dimensiones del Cuadro de Resumen (Con tipografía amplia y legible)
-          const tableW = 1280;
-          const tableH = 660;
-
           const paddingFactor = 1.04;
           const headerY = 32;
           const headerH = 180; // Altura ejecutiva optimizada para logo ACP y tipografía de alto impacto
@@ -3737,16 +3937,20 @@ ui <- fluidPage(
           // Ancho adaptativo del mapa y lámina según módulo para reducir márgenes laterales vacíos
           let mapW = maxMapW;
           if (isMod12) {
-            // Módulo 12: Reducir el espacio en blanco de la derecha manteniendo composición perfecta
             mapW = Math.max(2700, Math.min(2950, contentW + 140));
           } else if (isMod11) {
-            // Módulo 11: Reducir márgenes laterales ajustando el ancho a las válvulas reales (~65px de margen a cada lado)
             mapW = Math.max(2540, Math.min(3328, Math.round(contentW + 130)));
           } else {
-            // Demás casos (ej. M 1, 2, 3 o Módulo 1):
-            // Reducir márgenes laterales ajustando el ancho del marco a las válvulas reales
-            mapW = Math.max(2500, Math.min(3328, contentW + 140));
+            mapW = Math.max(2640, Math.min(3328, contentW + 140));
           }
+
+          // Dimensiones del Cuadro Único de Resumen con columnas por variedad
+          const nTableVars = tableVars.length;
+          const dayColW_init = nTableVars <= 3 ? 255 : 230;
+          const totColW_init = nTableVars <= 3 ? 345 : 310;
+          const perVarW_init = nTableVars <= 1 ? 480 : (nTableVars === 2 ? 410 : (nTableVars === 3 ? 355 : 320));
+          const tableW = Math.min(mapW - 48, Math.max(1060, dayColW_init + nTableVars * perVarW_init + totColW_init));
+          const tableH = 660;
 
           const outW = mapW + 72;
 
@@ -3755,20 +3959,15 @@ ui <- fluidPage(
           const mapPanX = mapX + mapW / 2 - bboxCX * fitScale;
           const mapPanY = mapY + mapH / 2 - bboxCY * fitScale;
 
-          // Ubicación inteligente del Cuadro de Resumen
+          // Ubicación inteligente del Único Cuadro de Resumen General
           let tableX, tableY, outH;
 
           if (isMod11) {
-            // CASO MÓDULO 11:
-            // Ubicar el cuadro resumen metido en la zona libre a la derecha:
-            // - Esquina derecha alineada con la columna de la válvula 4 o 2 (M11-T1-V4 / M11-T1-V2)
-            // - Nivel horizontal alineado con la válvula 42 (M11-T17-V42)
             let v4Right = null;
             let v42Top = null;
 
             for (let i = 0; i < VALVES_DATA.length; i++) {
               const v = VALVES_DATA[i];
-              // Filtrar estrictamente solo válvulas pertenecientes al Módulo 11
               if (String(v.Módulo).trim() !== '11') continue;
               const cod = String(v.codigo || '');
               if (cod === 'M11-T1-V4' || cod === 'M11-T1-V2' || cod.endsWith('-T1-V4') || cod.endsWith('-T1-V2')) {
@@ -3780,19 +3979,39 @@ ui <- fluidPage(
               }
             }
 
-            // Fallback seguro usando las coordenadas conocidas de M11 si no se hallaran por código
             if (v4Right === null) v4Right = 5848.0 * fitScale + mapPanX;
             if (v42Top === null) v42Top = 3515.1 * fitScale + mapPanY;
 
             tableX = Math.round(v4Right - tableW);
             tableY = Math.round(v42Top);
 
-            // Asegurar que quede dentro del canvas visible con márgenes seguros
             tableX = Math.max(mapX + 24, Math.min(mapX + mapW - tableW - 24, tableX));
             tableY = Math.max(mapY + 24, Math.min(mapY + mapH - tableH - 24, tableY));
-            outH = Math.max(mapY + mapH + 36, tableY + tableH + 36);
+
+            // Verificar si con el ancho de variedades colisiona con válvulas de M11
+            let m11Free = true;
+            for (let i = 0; i < VALVES_DATA.length; i++) {
+              const v = VALVES_DATA[i];
+              if (hasFilter && !filteredIds.has(v.id)) continue;
+              const vx1 = v.x * fitScale + mapPanX;
+              const vy1 = v.y * fitScale + mapPanY;
+              const vx2 = (v.x + v.w) * fitScale + mapPanX;
+              const vy2 = (v.y + v.h) * fitScale + mapPanY;
+              if (!(vx2 < tableX - 15 || vx1 > tableX + tableW + 15 || vy2 < tableY - 15 || vy1 > tableY + tableH + 15)) {
+                m11Free = false;
+                break;
+              }
+            }
+
+            if (m11Free) {
+              outH = mapY + mapH + 36;
+            } else {
+              const valvesLeftScreen = bMinX * fitScale + mapPanX;
+              tableX = Math.max(mapX + 24, Math.min(mapX + mapW - tableW - 24, Math.round(valvesLeftScreen)));
+              tableY = mapY + mapH + 24;
+              outH = tableY + tableH + 36;
+            }
           } else {
-            // Criterio inteligente: ¿cabe en la esquina superior izquierda dentro del mapa (ej. Módulo 12)?
             const candTL_X = mapX + 36;
             const candTL_Y = mapY + 36;
             let candTL_Free = true;
@@ -3805,7 +4024,6 @@ ui <- fluidPage(
               const vx2 = (v.x + v.w) * fitScale + mapPanX;
               const vy2 = (v.y + v.h) * fitScale + mapPanY;
 
-              // Verificación de colisión con margen de seguridad (25px)
               if (!(vx2 < candTL_X - 25 || vx1 > candTL_X + tableW + 25 || vy2 < candTL_Y - 25 || vy1 > candTL_Y + tableH + 25)) {
                 candTL_Free = false;
                 break;
@@ -3813,15 +4031,12 @@ ui <- fluidPage(
             }
 
             if (candTL_Free) {
-              // Caso Módulo 12: Hay espacio libre arriba a la izquierda
               tableX = candTL_X;
               tableY = candTL_Y;
               outH = mapY + mapH + 36;
             } else {
-              // Caso M 1, 2, 3 o Módulo 1: Ubicar debajo del plano
-              // Alinear el inicio del cuadro resumen exactamente donde inicia la válvula 13 (columna izquierda de válvulas)
               const valvesLeftScreen = bMinX * fitScale + mapPanX;
-              tableX = Math.max(mapX + 36, Math.min(mapX + mapW - tableW - 36, Math.round(valvesLeftScreen)));
+              tableX = Math.max(mapX + 24, Math.min(mapX + mapW - tableW - 24, Math.round(valvesLeftScreen)));
               tableY = mapY + mapH + 24;
               outH = tableY + tableH + 36;
             }
@@ -3861,7 +4076,7 @@ ui <- fluidPage(
           octx.fill();
           octx.stroke();
 
-          // Renderizado del Logo ACP en el Encabezado Ejecutivo (Ajuste dinámico según relación de aspecto real)
+          // Renderizado del Logo ACP en el Encabezado Ejecutivo
           const logoH = 118;
           const logoAspect = (typeof acpLogoImg !== 'undefined' && acpLogoImg && acpLogoImg.naturalWidth && acpLogoImg.naturalHeight) 
                              ? (acpLogoImg.naturalWidth / acpLogoImg.naturalHeight) 
@@ -3874,7 +4089,6 @@ ui <- fluidPage(
           if (typeof acpLogoImg !== 'undefined' && acpLogoImg && acpLogoImg.complete && acpLogoImg.naturalWidth > 0) {
             octx.drawImage(acpLogoImg, logoX, logoY, logoW, logoH);
 
-            // Línea divisoria vertical sutil entre logo y textos
             const divX = logoX + logoW + 28;
             octx.strokeStyle = '#CBD5E1';
             octx.lineWidth = 2.5;
@@ -3905,7 +4119,11 @@ ui <- fluidPage(
           if (fG && fG.length) filtroInfo.push('Grupos: ' + (Array.isArray(fG) ? fG.join(', ') : fG));
           if (fT && fT.length) filtroInfo.push('Turnos: ' + (Array.isArray(fT) ? fT.join(', ') : fT));
           if (fVal && fVal.length) filtroInfo.push('Válvulas: ' + (Array.isArray(fVal) ? fVal.join(', ') : fVal));
-          if (fV && fV.length) filtroInfo.push('Variedades: ' + (Array.isArray(fV) ? fV.join(', ') : fV));
+          if (fV && fV.length) {
+            filtroInfo.push('Variedades: ' + (Array.isArray(fV) ? fV.join(', ') : fV));
+          } else if (varList.length > 0 && varList.length <= 5) {
+            filtroInfo.push('Variedades: ' + varList.map(v => v.name).join(', '));
+          }
           const txtExtra = filtroInfo.length > 0 ? (' • ' + filtroInfo.join(' • ')) : '';
 
           octx.fillStyle = '#0F172A';
@@ -3939,7 +4157,7 @@ ui <- fluidPage(
           const nowStr = new Date().toLocaleString('es-PE', { dateStyle: 'short', timeStyle: 'short' });
           octx.fillStyle = '#1E293B';
           octx.font = 'bold 22px Inter, -apple-system, sans-serif';
-          octx.fillText(`Exportado: ${nowStr} • ${totalValvulasVisibles} válvulas (${totalAreaFisica.toFixed(2)} ha física)`, outW - 64, headerY + 128);
+          octx.fillText(`Exportado: ${nowStr} • ${fmtMiles(totalValvulasVisibles)} válvulas (${fmtHa(totalAreaFisica)} ha física)`, outW - 64, headerY + 128);
           octx.restore();
           
           // -------------------------------------------------------------
@@ -3968,7 +4186,6 @@ ui <- fluidPage(
             const v = VALVES_DATA[i];
             const isFiltered = (filteredIds === null || filteredIds.has(v.id));
             
-            // Si hay filtro activo, OMITIR totalmente las válvulas de otros módulos (fondo limpio sin fantasmas)
             if (hasFilter && !isFiltered) continue;
             
             if ((v.x + v.w) * fitScale + mapPanX < mapX - 100 || v.x * fitScale + mapPanX > mapX + mapW + 100 ||
@@ -3986,12 +4203,6 @@ ui <- fluidPage(
             let hasOtherPass = false;
             for (let d of DAY_KEYS) {
               if ((otherSlot.counts && otherSlot.counts[d] || 0) > 0) { hasOtherPass = true; break; }
-            }
-            
-            let firstDay = cells[0];
-            let isUniform = true;
-            for (let k = 1; k < 10; k++) {
-              if (cells[k] !== firstDay) { isUniform = false; break; }
             }
             
             const horiz = isHorizontalValve(v);
@@ -4063,7 +4274,7 @@ ui <- fluidPage(
             }
             
             // -----------------------------------------------------------
-            // 4. TIPOGRAFÍA VECTORIAL DE ALTO CONTRASTE (NEGRO PURO SIN CONTORNO)
+            // 4. TIPOGRAFÍA VECTORIAL DE ALTO CONTRASTE (CÓDIGO + VARIEDAD + ÁREA)
             // -----------------------------------------------------------
             if (v.w >= 12) {
               octx.save();
@@ -4072,18 +4283,20 @@ ui <- fluidPage(
               
               const cx = isTriangle ? (v.x + v.w * 0.68) : (v.x + v.w * (isSlopedTop ? 0.60 : 0.50));
               const maxTextW = v.w * (isTriangle ? 0.62 : 0.94);
-              const ry1 = isTriangle ? 0.58 : (isSlopedTop ? 0.42 : 0.36);
-              const ry2 = isTriangle ? 0.82 : (isSlopedTop ? 0.74 : 0.68);
+              const ry1 = isTriangle ? 0.56 : (isSlopedTop ? (v.pts[0][1] < 0.80 ? 0.40 : 0.35) : 0.25);
+              const ry2 = isTriangle ? 0.72 : (isSlopedTop ? (v.pts[0][1] < 0.80 ? 0.62 : 0.58) : 0.53);
+              const ry3 = isTriangle ? 0.88 : (isSlopedTop ? (v.pts[0][1] < 0.80 ? 0.84 : 0.82) : 0.80);
               
               // Tamaño NORMALIZADO uniforme para todas las válvulas del módulo
-              // Basado en altura estándar (~100 unidades) para evitar saltos bruscos entre válvulas
-              const normCodePx = Math.max(20, Math.min(34, Math.floor(100 * fitScale * 0.20)));
-              const normAreaPx = Math.max(16, Math.min(27, Math.floor(normCodePx * 0.80)));
+              const normCodePx = Math.max(19, Math.min(32, Math.floor(100 * fitScale * 0.19)));
+              const normVarPx  = Math.max(13, Math.min(22, Math.floor(normCodePx * 0.68)));
+              const normAreaPx = Math.max(15, Math.min(25, Math.floor(normCodePx * 0.78)));
               
               let fSizeCode = normCodePx / fitScale;
+              let fSizeVar  = normVarPx / fitScale;
               let fSizeHa   = normAreaPx / fitScale;
               
-              // A. Código de Válvula (En formato T - V, sin prefijo M, negro puro, sin contorno)
+              // A. Código de Válvula (En formato T - V)
               let codeLabel = v.codigo || '';
               if (v.Turno && v.Válvula) {
                 codeLabel = 'T' + v.Turno + '-V' + v.Válvula;
@@ -4093,33 +4306,69 @@ ui <- fluidPage(
               octx.font = 'bold ' + fSizeCode + 'px Inter, -apple-system, sans-serif';
               let codeW = octx.measureText(codeLabel).width;
               if (codeW > maxTextW) {
-                fSizeCode = Math.max(11 / fitScale, fSizeCode * (maxTextW / codeW));
+                fSizeCode = Math.max(9 / fitScale, fSizeCode * (maxTextW / codeW));
                 octx.font = 'bold ' + fSizeCode + 'px Inter, -apple-system, sans-serif';
               }
-              if (fSizeCode > v.h * 0.38) {
-                fSizeCode = v.h * 0.38;
+              if (fSizeCode > v.h * 0.30) {
+                fSizeCode = v.h * 0.30;
                 octx.font = 'bold ' + fSizeCode + 'px Inter, -apple-system, sans-serif';
               }
               const y1 = v.y + v.h * ry1;
               octx.fillStyle = '#000000';
               octx.fillText(codeLabel, cx, y1);
               
-              // B. Área Física (En negro puro, sin contorno, normalizado, solo ha, sin kilos)
+              // B. Variedad
+              const varStr = (v.Variedad !== undefined && v.Variedad !== null) ? String(v.Variedad).trim() : '';
+              if (varStr) {
+                octx.font = 'bold ' + fSizeVar + 'px Inter, -apple-system, sans-serif';
+                let varW = octx.measureText(varStr).width;
+                if (varW > maxTextW) {
+                  fSizeVar = Math.max(7.5 / fitScale, fSizeVar * (maxTextW / varW));
+                  octx.font = 'bold ' + fSizeVar + 'px Inter, -apple-system, sans-serif';
+                }
+                if (fSizeVar > v.h * 0.24) {
+                  fSizeVar = v.h * 0.24;
+                  octx.font = 'bold ' + fSizeVar + 'px Inter, -apple-system, sans-serif';
+                }
+                const y2 = v.y + v.h * ry2;
+                octx.fillStyle = '#000000';
+                octx.fillText(varStr, cx, y2);
+              }
+              
+              // C. Área Física
               const textHa = (v.Área !== undefined && v.Área !== null ? v.Área : '') + ' ha';
               octx.font = 'bold ' + fSizeHa + 'px Inter, -apple-system, sans-serif';
               let haW = octx.measureText(textHa).width;
               if (haW > maxTextW) {
-                fSizeHa = Math.max(9 / fitScale, fSizeHa * (maxTextW / haW));
+                fSizeHa = Math.max(8 / fitScale, fSizeHa * (maxTextW / haW));
                 octx.font = 'bold ' + fSizeHa + 'px Inter, -apple-system, sans-serif';
               }
-              if (fSizeHa > v.h * 0.34) {
-                fSizeHa = v.h * 0.34;
+              if (fSizeHa > v.h * 0.26) {
+                fSizeHa = v.h * 0.26;
                 octx.font = 'bold ' + fSizeHa + 'px Inter, -apple-system, sans-serif';
               }
-              const y2 = v.y + v.h * ry2;
+              const y3 = v.y + v.h * ry3;
               octx.fillStyle = '#000000';
-              octx.fillText(textHa, cx, y2);
+              octx.fillText(textHa, cx, y3);
               
+              octx.restore();
+            } else if (v.w >= 3) {
+              // Sub-válvulas angostas (ej. Milagros 0.04 ha en M14-T17-V65): texto vertical rotado
+              octx.save();
+              octx.translate(v.x + v.w / 2, v.y + v.h / 2);
+              octx.rotate(-Math.PI / 2);
+              octx.textAlign = 'center';
+              octx.textBaseline = 'middle';
+              const vStr = ((v.Variedad ? v.Variedad + ' ' : '') + (v.Área !== undefined ? v.Área + ' ha' : '')).trim();
+              let fSizeVert = Math.min(v.w * 0.78, 14 / fitScale);
+              octx.font = 'bold ' + fSizeVert + 'px Inter, -apple-system, sans-serif';
+              const vw = octx.measureText(vStr).width;
+              if (vw > v.h * 0.90) {
+                fSizeVert = Math.max(4 / fitScale, fSizeVert * ((v.h * 0.90) / vw));
+                octx.font = 'bold ' + fSizeVert + 'px Inter, -apple-system, sans-serif';
+              }
+              octx.fillStyle = '#000000';
+              octx.fillText(vStr, 0, 0);
               octx.restore();
             }
           }
@@ -4128,12 +4377,11 @@ ui <- fluidPage(
           octx.restore(); // fin contenedor mapa
           
           // -------------------------------------------------------------
-          // 5. RENDERIZADO DEL CUADRO DE RESUMEN (TIPOGRAFÍA GRANDE Y ELEGANTE)
+          // 5. RENDERIZADO DEL ÚNICO CUADRO DE RESUMEN (COLUMNAS POR VARIEDAD)
           // -------------------------------------------------------------
           const dayList = ['lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado'];
           const pctAvanceFiltro = totalAreaFisica > 0 ? ((totalHaSemana / totalAreaFisica) * 100).toFixed(1) : '0.0';
           
-          // Contenedor general en FONDO BLANCO con borde nítido
           octx.save();
           octx.fillStyle = '#FFFFFF';
           octx.strokeStyle = '#94A3B8';
@@ -4142,8 +4390,8 @@ ui <- fluidPage(
           octx.fill();
           octx.stroke();
           
-          // A. Barra Superior del Resumen (Fondo Blanco con línea divisoria elegante)
-          const barTopH = 78;
+          // A. Barra Superior del Resumen
+          const barTopH = 74;
           octx.fillStyle = '#FFFFFF';
           drawRoundRect(octx, tableX, tableY, tableW, barTopH, 18);
           octx.fill();
@@ -4160,17 +4408,24 @@ ui <- fluidPage(
           octx.textBaseline = 'middle';
           octx.fillStyle = '#0F172A';
           octx.font = 'bold 26px Inter, -apple-system, sans-serif';
-          octx.fillText('📊 RESUMEN GENERAL', tableX + 32, tableY + barTopH / 2);
+          octx.fillText('📊 RESUMEN GENERAL', tableX + 28, tableY + barTopH / 2);
           
-          // Avance Físico a la derecha (grande y destacado en verde)
+          // Avance Físico a la derecha
           octx.textAlign = 'right';
           octx.fillStyle = '#15803D';
-          octx.font = 'bold 28px Inter, -apple-system, sans-serif';
-          octx.fillText(`✓ ${pctAvanceFiltro}% avance físico (${totalAreaFisica.toFixed(2)} ha)`, tableX + tableW - 32, tableY + barTopH / 2);
+          octx.font = 'bold 25px Inter, -apple-system, sans-serif';
+          octx.fillText(`✓ ${pctAvanceFiltro}% avance físico (${fmtHa(totalAreaFisica)} ha)`, tableX + tableW - 28, tableY + barTopH / 2);
           
-          // B. Encabezado de Columnas de la Tabla (3 Columnas Limpias y Espaciosas)
+          // B. Geometría de Columnas: DÍA | Variedad 1 (ha | kg) | Variedad 2 (ha | kg) | ... | ÁREA | KILOS
+          const dayColW = nTableVars <= 3 ? 255 : 225;
+          const totBlockW = nTableVars <= 3 ? 345 : 305;
+          const totHaW = Math.round(totBlockW * 0.45);
+          const totKgW = totBlockW - totHaW;
+          const varsBlockW = tableW - dayColW - totBlockW;
+          const singleVarW = nTableVars > 0 ? (varsBlockW / nTableVars) : 0;
+          
           const thY = tableY + barTopH;
-          const thH = 54;
+          const thH = 74;
           octx.fillStyle = '#F8FAFC';
           octx.fillRect(tableX, thY, tableW, thH);
           octx.strokeStyle = '#94A3B8';
@@ -4180,72 +4435,129 @@ ui <- fluidPage(
           octx.lineTo(tableX + tableW, thY + thH);
           octx.stroke();
           
-          const colX_Dia   = tableX + 32;
-          const colX_Ha    = tableX + Math.round(tableW * 0.58);
-          const colX_Kg    = tableX + tableW - 32;
+          // Línea divisoria horizontal para sub-encabezados (HA | KG) dentro de las variedades
+          const subThY = thY + 40;
+          if (nTableVars > 0) {
+            octx.strokeStyle = '#CBD5E1';
+            octx.lineWidth = 1.5;
+            octx.beginPath();
+            octx.moveTo(tableX + dayColW, subThY);
+            octx.lineTo(tableX + dayColW + varsBlockW, subThY);
+            octx.stroke();
+          }
           
-          octx.textBaseline = 'middle';
+          // Encabezado Columna DÍA
           octx.fillStyle = '#334155';
-          octx.font = 'bold 23px Inter, -apple-system, sans-serif';
-          
+          octx.font = 'bold 22px Inter, -apple-system, sans-serif';
           octx.textAlign = 'left';
-          octx.fillText('DÍA DE COSECHA', colX_Dia, thY + thH / 2);
+          octx.textBaseline = 'middle';
+          octx.fillText('DÍA', tableX + 28, thY + thH / 2);
           
+          // Encabezados de cada Variedad y sus subcolumnas (HA | KG)
+          const fVarHdrBase = nTableVars <= 2 ? 20 : (nTableVars === 3 ? 18 : 16);
+          tableVars.forEach((vObj, vIdx) => {
+            const vx = tableX + dayColW + vIdx * singleVarW;
+            const vHaW = singleVarW * 0.45;
+            const vKgW = singleVarW * 0.55;
+            
+            // Nombre de Variedad centrado arriba
+            octx.textAlign = 'center';
+            octx.fillStyle = '#0F172A';
+            let fHdr = fVarHdrBase;
+            octx.font = 'bold ' + fHdr + 'px Inter, -apple-system, sans-serif';
+            const maxHdrW = singleVarW - 16;
+            if (octx.measureText(vObj.name).width > maxHdrW && maxHdrW > 40) {
+              fHdr = Math.max(12, Math.floor(fHdr * (maxHdrW / octx.measureText(vObj.name).width)));
+              octx.font = 'bold ' + fHdr + 'px Inter, -apple-system, sans-serif';
+            }
+            octx.fillText(vObj.name, vx + singleVarW / 2, thY + 20);
+            
+            // Sub-encabezados: HA y KG
+            octx.fillStyle = '#64748B';
+            octx.font = 'bold 15px Inter, -apple-system, sans-serif';
+            octx.textAlign = 'right';
+            octx.fillText('ÁREA (HA)', vx + vHaW - 12, subThY + (thH - 40) / 2);
+            octx.fillText('KILOS (KG)', vx + singleVarW - 14, subThY + (thH - 40) / 2);
+          });
+          
+          // Encabezados de Totales Diarios Derecha (ÁREA | KILOS)
+          const totStartX = tableX + dayColW + varsBlockW;
+          octx.fillStyle = '#0F172A';
+          octx.font = 'bold 20px Inter, -apple-system, sans-serif';
           octx.textAlign = 'right';
-          octx.fillText('ÁREA (HA)', colX_Ha, thY + thH / 2);
-          octx.fillText('KILOS (KG)', colX_Kg, thY + thH / 2);
+          octx.fillText('ÁREA', totStartX + totHaW - 14, thY + thH / 2);
+          octx.fillText('KILOS', tableX + tableW - 24, thY + thH / 2);
           
           // C. Filas Diarias (Lunes a Sábado)
           const rowStartY = thY + thH;
-          const footH = 76;
+          const footH = 74;
           const totalRowsH = tableH - barTopH - thH - footH;
           const rowH = totalRowsH / 6;
+          const valFontPx = nTableVars <= 2 ? 23 : (nTableVars === 3 ? 21 : (nTableVars === 4 ? 19 : 17));
+          const totFontPx = nTableVars <= 3 ? 25 : 22;
           
           dayList.forEach((dKey, idx) => {
             const ry = rowStartY + idx * rowH;
             const st = dayStats[dKey];
             
-            // Fondo alternado sutil (blanco y casi blanco)
             octx.fillStyle = (idx % 2 === 0) ? '#FFFFFF' : '#F8FAFC';
             octx.fillRect(tableX, ry, tableW, rowH);
             
-            // Línea separadora
             octx.strokeStyle = '#E2E8F0';
             octx.lineWidth = 1.5;
             octx.beginPath();
-            octx.moveTo(tableX + 24, ry + rowH);
-            octx.lineTo(tableX + tableW - 24, ry + rowH);
+            octx.moveTo(tableX, ry + rowH);
+            octx.lineTo(tableX + tableW, ry + rowH);
             octx.stroke();
             
             const textY = ry + rowH / 2;
             
-            // Columna 1: Indicador y Nombre del Día (Letra grande y limpia)
+            // Columna 1: Indicador y Nombre del Día
             octx.textAlign = 'left';
             octx.fillStyle = st.color;
             octx.beginPath();
-            octx.arc(colX_Dia + 12, textY, 13, 0, Math.PI * 2);
+            octx.arc(tableX + 36, textY, 12, 0, Math.PI * 2);
             octx.fill();
             octx.strokeStyle = 'rgba(0, 0, 0, 0.25)';
             octx.lineWidth = 1.5;
             octx.stroke();
             
             octx.fillStyle = '#0F172A';
-            octx.font = 'bold 27px Inter, -apple-system, sans-serif';
-            octx.fillText(st.name.toUpperCase(), colX_Dia + 36, textY);
+            octx.font = 'bold 24px Inter, -apple-system, sans-serif';
+            octx.fillText(st.name.toUpperCase(), tableX + 58, textY);
             
-            // Columna 2: Hectáreas
+            // Columnas por cada Variedad (ha | kg)
             octx.textAlign = 'right';
-            octx.fillStyle = st.ha > 0 ? '#0F172A' : '#94A3B8';
-            octx.font = 'bold 29px Inter, -apple-system, sans-serif';
-            octx.fillText(st.ha > 0 ? `${st.ha.toFixed(2)} ha` : '0.00 ha', colX_Ha, textY);
+            tableVars.forEach((vObj, vIdx) => {
+              const vx = tableX + dayColW + vIdx * singleVarW;
+              const vHaW = singleVarW * 0.45;
+              const vHa = st.haByVar[vObj.name] || 0;
+              const vKg = st.kgByVar[vObj.name] || 0;
+              
+              // Subcolumna ha
+              octx.fillStyle = vHa > 0 ? '#0F172A' : '#CBD5E1';
+              octx.font = 'bold ' + valFontPx + 'px Inter, -apple-system, sans-serif';
+              const haStr = vHa > 0 ? `${fmtHa(vHa)} ha` : '0.00 ha';
+              octx.fillText(haStr, vx + vHaW - 12, textY);
+              
+              // Subcolumna kg
+              octx.fillStyle = vKg > 0 ? '#D97706' : '#CBD5E1';
+              octx.font = 'bold ' + valFontPx + 'px Inter, -apple-system, sans-serif';
+              const kgStr = vKg > 0 ? `${fmtMiles(vKg)} kg` : '0 kg';
+              octx.fillText(kgStr, vx + singleVarW - 14, textY);
+            });
             
-            // Columna 3: Kilos
+            // Columnas Derecha: Total Área y Total Kilos del Día
+            octx.fillStyle = st.ha > 0 ? '#0F172A' : '#94A3B8';
+            octx.font = 'bold ' + totFontPx + 'px Inter, -apple-system, sans-serif';
+            octx.fillText(st.ha > 0 ? `${fmtHa(st.ha)} ha` : '0.00 ha', totStartX + totHaW - 14, textY);
+            
             octx.fillStyle = st.kg > 0 ? '#D97706' : '#94A3B8';
-            octx.font = 'bold 29px Inter, -apple-system, sans-serif';
-            octx.fillText(st.kg > 0 ? `${Math.round(st.kg).toLocaleString()} kg` : '0 kg', colX_Kg, textY);
+            octx.font = 'bold ' + totFontPx + 'px Inter, -apple-system, sans-serif';
+            octx.fillText(st.kg > 0 ? `${fmtMiles(st.kg)} kg` : '0 kg', tableX + tableW - 24, textY);
           });
           
-          // D. Fila de Total General (Footer en Fondo Blanco con línea superior fuerte)
+          // D. Fila de Total General (Footer)
           const footY = tableY + tableH - footH;
           octx.fillStyle = '#F8FAFC';
           drawRoundRect(octx, tableX, footY, tableW, footH, 18);
@@ -4262,18 +4574,72 @@ ui <- fluidPage(
           
           octx.textAlign = 'left';
           octx.fillStyle = '#0F172A';
-          octx.font = 'bold 27px Inter, -apple-system, sans-serif';
-          octx.fillText(`TOTAL (${totalValvulasVisibles} válvulas)`, colX_Dia, footTextY);
+          octx.font = 'bold 23px Inter, -apple-system, sans-serif';
+          octx.fillText(`TOTAL (${fmtMiles(totalValvulasVisibles)} válv.)`, tableX + 28, footTextY);
           
+          // Totales Semanales por cada Variedad en el Footer
           octx.textAlign = 'right';
+          tableVars.forEach((vObj, vIdx) => {
+            const vx = tableX + dayColW + vIdx * singleVarW;
+            const vHaW = singleVarW * 0.45;
+            
+            octx.fillStyle = vObj.ha > 0 ? '#0284C7' : '#94A3B8';
+            octx.font = 'bold ' + (valFontPx + 1) + 'px Inter, -apple-system, sans-serif';
+            octx.fillText(`${fmtHa(vObj.ha)} ha`, vx + vHaW - 12, footTextY);
+            
+            octx.fillStyle = vObj.kg > 0 ? '#D97706' : '#94A3B8';
+            octx.font = 'bold ' + (valFontPx + 1) + 'px Inter, -apple-system, sans-serif';
+            octx.fillText(`${fmtMiles(vObj.kg)} kg`, vx + singleVarW - 14, footTextY);
+          });
+          
+          // Gran Total Semanal Derecha (Área | Kilos)
           octx.fillStyle = '#0284C7';
-          octx.font = 'bold 32px Inter, -apple-system, sans-serif';
-          octx.fillText(`${totalHaSemana.toFixed(2)} ha`, colX_Ha, footTextY);
+          octx.font = 'bold ' + (totFontPx + 2) + 'px Inter, -apple-system, sans-serif';
+          octx.fillText(`${fmtHa(totalHaSemana)} ha`, totStartX + totHaW - 14, footTextY);
           
           octx.fillStyle = '#D97706';
-          octx.font = 'bold 32px Inter, -apple-system, sans-serif';
-          octx.fillText(`${Math.round(totalKgSemana).toLocaleString()} kg`, colX_Kg, footTextY);
-          octx.restore(); // Fin contenedor tabla
+          octx.font = 'bold ' + (totFontPx + 2) + 'px Inter, -apple-system, sans-serif';
+          octx.fillText(`${fmtMiles(totalKgSemana)} kg`, tableX + tableW - 24, footTextY);
+          
+          // E. Líneas divisorias verticales para separar bloques de Variedad, subcolumnas (ha | kg) y Totales
+          tableVars.forEach((vObj, vIdx) => {
+            const vx = tableX + dayColW + vIdx * singleVarW;
+            const vHaW = singleVarW * 0.45;
+            
+            // Separador fuerte al inicio de cada bloque de variedad
+            octx.strokeStyle = '#94A3B8';
+            octx.lineWidth = 2;
+            octx.beginPath();
+            octx.moveTo(vx, thY);
+            octx.lineTo(vx, tableY + tableH);
+            octx.stroke();
+            
+            // Separador sutil entre ha y kg de la misma variedad
+            octx.strokeStyle = '#E2E8F0';
+            octx.lineWidth = 1.5;
+            octx.beginPath();
+            octx.moveTo(vx + vHaW, subThY);
+            octx.lineTo(vx + vHaW, tableY + tableH);
+            octx.stroke();
+          });
+          
+          // Separador fuerte antes del bloque de Totales Diarios (ÁREA | KILOS)
+          octx.strokeStyle = '#0F172A';
+          octx.lineWidth = 2.5;
+          octx.beginPath();
+          octx.moveTo(totStartX, thY);
+          octx.lineTo(totStartX, tableY + tableH);
+          octx.stroke();
+          
+          // Separador entre ÁREA total y KILOS total
+          octx.strokeStyle = '#CBD5E1';
+          octx.lineWidth = 1.5;
+          octx.beginPath();
+          octx.moveTo(totStartX + totHaW, thY);
+          octx.lineTo(totStartX + totHaW, tableY + tableH);
+          octx.stroke();
+          
+          octx.restore(); // Fin contenedor único cuadro de resumen
           
           // -------------------------------------------------------------
           // 6. DESCARGA AUTOMÁTICA DEL ARCHIVO PNG EN ALTA DEFINICIÓN
@@ -4622,6 +4988,7 @@ ui <- fluidPage(
             }
           }
           slot.ranges = buildRangesFromCells(slot);
+          slot.align = detectAlignFromCells(slot.cells, slot.cellFractions);
           for (let d of DAY_KEYS) slot.counts[d] = 0;
           for (let r of slot.ranges) {
             slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
@@ -4660,6 +5027,7 @@ ui <- fluidPage(
           delete slot.cellFractions[c];
         }
         slot.ranges = buildRangesFromCells(slot);
+        slot.align = detectAlignFromCells(slot.cells, slot.cellFractions);
         for (let d of DAY_KEYS) slot.counts[d] = 0;
         for (let r of slot.ranges) {
           slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
@@ -4718,6 +5086,7 @@ ui <- fluidPage(
           }
         }
         slot.ranges = buildRangesFromCells(slot);
+        slot.align = detectAlignFromCells(slot.cells, slot.cellFractions);
         for (let d of DAY_KEYS) slot.counts[d] = 0;
         for (let r of slot.ranges) {
           slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
@@ -4760,6 +5129,7 @@ ui <- fluidPage(
           delete slot.cellFractions[c];
         }
         slot.ranges = buildRangesFromCells(slot);
+        slot.align = detectAlignFromCells(slot.cells, slot.cellFractions);
         for (let d of DAY_KEYS) slot.counts[d] = 0;
         for (let r of slot.ranges) {
           slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
@@ -4889,7 +5259,7 @@ ui <- fluidPage(
         inpPct.value = targetPctModal > 0 ? targetPctModal.toFixed(2) : '';
       }
       
-      modalPaintDirection = slot.align || detectSlotAlign(slot) || 'start';
+      modalPaintDirection = detectSlotAlign(slot, true) || slot.align || 'start';
       
       const dirSelector = document.getElementById('area-modal-direction-selector');
       const dirLabel = document.getElementById('area-modal-dir-selected-label');
@@ -5137,9 +5507,9 @@ ui <- fluidPage(
         const tempSlot = {
           counts: Object.assign({}, slot.counts),
           ranges: (slot.ranges || []).map(r => Object.assign({}, r)),
-          cells: Array(10).fill(''),
-          cellFractions: {},
-          align: slot.align || 'start'
+          cells: (slot.cells || Array(10).fill('')).slice(),
+          cellFractions: Object.assign({}, slot.cellFractions || {}),
+          align: modalPaintDirection || detectSlotAlign(slot, true) || 'start'
         };
         updateSlotDay(tempSlot, dayVal, curPct, modalPaintDirection);
         const tempRanges = getSlotRanges(tempSlot);
@@ -5531,7 +5901,7 @@ ui <- fluidPage(
           totalPct += cnt;
           totalKg  += kgD;
           const haD = ((v.Área * cnt) / 100).toFixed(2);
-          const kgTxt = kgD > 0 ? ` • <b>${Math.round(kgD).toLocaleString()} kg</b>` : '';
+          const kgTxt = kgD > 0 ? ` • <b>${Math.round(kgD).toLocaleString('en-US')} kg</b>` : '';
           rows.push(`<span style='color: ${DAY_COLORS[d]}; font-weight: 700;'>• ${DAY_NAMES[d]}: ${cnt}% (${haD} ha)${kgTxt}</span>`);
         }
       }
@@ -5539,7 +5909,7 @@ ui <- fluidPage(
         return `<div style='margin-top:4px;'><b>${labelPasada}:</b> <span style='color:#94A3B8;'>Sin programar (0%)</span></div>`;
       }
       const totHa = ((v.Área * totalPct) / 100).toFixed(2);
-      const totKgStr = totalKg > 0 ? ` • <span style='color:#FBBF24; font-weight:700;'>${Math.round(totalKg).toLocaleString()} kg</span>` : '';
+      const totKgStr = totalKg > 0 ? ` • <span style='color:#FBBF24; font-weight:700;'>${Math.round(totalKg).toLocaleString('en-US')} kg</span>` : '';
       return `
         <div style='margin-top: 5px; padding-top: 4px; border-top: 1px solid rgba(255,255,255,0.16);'>
           <b>${labelPasada}:</b> <span style='color: #4ADE80; font-weight: 700;'>${totalPct}%</span> (${totHa} ha)${totKgStr}
@@ -5796,7 +6166,7 @@ ui <- fluidPage(
             // Línea 3: Área en ha + Kilos asignados (si > 0)
             const kgVal = activeSlot.totalKg || 0;
             const textHa = (v.Área !== undefined && v.Área !== null ? v.Área : '') + ' ha' +
-                           (kgVal > 0 ? ' • ' + Math.round(kgVal).toLocaleString() + ' kg' : '');
+                           (kgVal > 0 ? ' • ' + Math.round(kgVal).toLocaleString('en-US') + ' kg' : '');
             let fSizeHa = Math.min(12, Math.max(6.2, Math.round(fSizeCode * 0.62)));
             ctx.font = '700 ' + fSizeHa + 'px Inter, sans-serif';
             let haW = ctx.measureText(textHa).width;
@@ -5820,6 +6190,23 @@ ui <- fluidPage(
             ctx.strokeText(v.codigo, cx, v.y + v.h * midY);
             ctx.fillText(v.codigo, cx, v.y + v.h * midY);
           }
+          ctx.restore();
+        } else if (scale > 0.35 && v.w >= 3 && v.w < 18) {
+          ctx.save();
+          ctx.translate(v.x + v.w / 2, v.y + v.h / 2);
+          ctx.rotate(-Math.PI / 2);
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          const vStr = ((v.Variedad ? v.Variedad + ' ' : '') + (v.Área !== undefined ? v.Área + ' ha' : '')).trim();
+          let fSizeVert = Math.min(v.w * 0.76, 11);
+          ctx.font = 'bold ' + fSizeVert + 'px Inter, sans-serif';
+          const vw = ctx.measureText(vStr).width;
+          if (vw > v.h * 0.90) {
+            fSizeVert = Math.max(3.5, fSizeVert * ((v.h * 0.90) / vw));
+            ctx.font = 'bold ' + fSizeVert + 'px Inter, sans-serif';
+          }
+          ctx.fillStyle = '#000000';
+          ctx.fillText(vStr, 0, 0);
           ctx.restore();
         }
       }
@@ -5993,9 +6380,11 @@ ui <- fluidPage(
               sabado:    Number(r.Kg_Sábado) || 0
             };
             
+            targetSlot.align = detectSlotAlign(targetSlot, true);
             const hasCounts = Object.values(targetSlot.counts).some(p => p > 0);
             if (hasCounts) {
               syncCellsFromCounts(targetSlot);
+              targetSlot.align = detectSlotAlign(targetSlot, true);
             }
             recomputeValveSlotCounts(v, k);
           });
@@ -6086,7 +6475,21 @@ ui <- fluidPage(
             if (slot.kg) {
               slot.kg[dayKey] = 0;
             }
+            if (slot.cells) {
+              for (let i = 0; i < 10; i++) {
+                if (slot.cells[i] === dayKey) {
+                  slot.cells[i] = '';
+                  if (slot.cellFractions && slot.cellFractions[i] !== undefined) {
+                    delete slot.cellFractions[i];
+                  }
+                }
+              }
+            }
+            if (slot.ranges && Array.isArray(slot.ranges)) {
+              slot.ranges = slot.ranges.filter(r => r.day !== dayKey);
+            }
             syncCellsFromCounts(slot);
+            slot.align = detectSlotAlign(slot, true);
             recomputeValveSlotCounts(v, key);
           });
           
@@ -6752,6 +7155,28 @@ server <- function(input, output, session) {
       if (!is.null(df_sheets)) {
         semanas_sincronizadas_sesion(unique(c(isolate(semanas_sincronizadas_sesion()), sem_num)))
         if (nrow(df_sheets) > 0 && "Semana" %in% names(df_sheets)) {
+          # Si el disco local ya tiene cells_str con celdas válidas y el sheet no las tiene,
+          # conservar el cells_str local para no perder la orientación derecha/centro
+          if (nrow(df_hist) > 0 && "cells_str" %in% names(df_hist)) {
+            hist_cells <- df_hist %>%
+              filter(!is.na(cells_str), nzchar(cells_str)) %>%
+              select(id, Num_Pasada, Tipo_Registro, cells_str_disco = cells_str)
+            
+            df_sheets <- df_sheets %>%
+              left_join(hist_cells, by = c("id", "Num_Pasada", "Tipo_Registro")) %>%
+              mutate(
+                cells_str = case_when(
+                  !is.na(cells_str) & nzchar(cells_str) ~ cells_str,
+                  !is.na(cells_str_disco) & nzchar(cells_str_disco) ~ cells_str_disco,
+                  TRUE ~ ""
+                )
+              ) %>%
+              select(-any_of("cells_str_disco"))
+          }
+          df_sheets <- df_sheets %>%
+            mutate(
+              cells_str = ifelse(!is.na(cells_str) & nzchar(cells_str), cells_str, generar_cells_str_vec(Lunes, Martes, Miércoles, Jueves, Viernes, Sábado))
+            )
           df_hist <- df_sheets %>% filter(Semana == sem_num)
         } else if (es_entorno_nube) {
           df_hist <- esquema_vacio_rutas()
@@ -6882,16 +7307,22 @@ server <- function(input, output, session) {
       prev_disco <- isolate(rutas_disco_rv()) %>%
         filter(Campaña == "2026", Semana == sem_num, Tipo_Registro == m_act, Num_Pasada %in% p_acts) %>%
         select(id, Num_Pasada, Lunes_p = Lunes, Martes_p = Martes, Miercoles_p = Miércoles, Jueves_p = Jueves, Viernes_p = Viernes, Sabado_p = Sábado,
-               Kg_Lun_p = Kg_Lunes, Kg_Mar_p = Kg_Martes, Kg_Mie_p = Kg_Miércoles, Kg_Jue_p = Kg_Jueves, Kg_Vie_p = Kg_Viernes, Kg_Sab_p = Kg_Sábado)
+               Kg_Lun_p = Kg_Lunes, Kg_Mar_p = Kg_Martes, Kg_Mie_p = Kg_Miércoles, Kg_Jue_p = Kg_Jueves, Kg_Vie_p = Kg_Viernes, Kg_Sab_p = Kg_Sábado,
+               cells_str_p = cells_str)
       act_modo <- df_prog_semana %>%
         filter(Tipo_Registro == m_act, Num_Pasada %in% p_acts) %>%
         left_join(prev_disco, by = c("id", "Num_Pasada")) %>%
-        mutate(across(ends_with("_p"), ~ coalesce(as.numeric(.), 0))) %>%
+        mutate(
+          across(c(Lunes_p, Martes_p, Miercoles_p, Jueves_p, Viernes_p, Sabado_p,
+                   Kg_Lun_p, Kg_Mar_p, Kg_Mie_p, Kg_Jue_p, Kg_Vie_p, Kg_Sab_p), ~ coalesce(as.numeric(.), 0)),
+          cells_str_p = coalesce(as.character(cells_str_p), "")
+        ) %>%
         filter(
           abs(Lunes - Lunes_p) > 0.01 | abs(Martes - Martes_p) > 0.01 | abs(Miércoles - Miercoles_p) > 0.01 |
           abs(Jueves - Jueves_p) > 0.01 | abs(Viernes - Viernes_p) > 0.01 | abs(Sábado - Sabado_p) > 0.01 |
           abs(Kg_Lunes - Kg_Lun_p) > 0.01 | abs(Kg_Martes - Kg_Mar_p) > 0.01 | abs(Kg_Miércoles - Kg_Mie_p) > 0.01 |
-          abs(Kg_Jueves - Kg_Jue_p) > 0.01 | abs(Kg_Viernes - Kg_Vie_p) > 0.01 | abs(Kg_Sábado - Kg_Sab_p) > 0.01
+          abs(Kg_Jueves - Kg_Jue_p) > 0.01 | abs(Kg_Viernes - Kg_Vie_p) > 0.01 | abs(Kg_Sábado - Kg_Sab_p) > 0.01 |
+          coalesce(as.character(cells_str), "") != cells_str_p
         )
       # MERGE MULTI-USUARIO COOPERATIVO (2 o más personas en el mismo grupo/sector):
       # Si el usuario no aplicó un subfiltro específico, protegemos solo las válvulas que realmente
@@ -6923,6 +7354,27 @@ server <- function(input, output, session) {
       df_remoto <- obtener_rutas_google_sheets(sem_num)
       if (!is.null(df_remoto) && nrow(df_remoto) > 0) {
         df_remoto <- df_remoto %>% filter(Semana == sem_num)
+        # Preservar cells_str del disco si df_remoto viene con cells_str vacío
+        df_disco_actual <- rutas_disco_rv() %>% filter(Campaña == "2026", Semana == sem_num)
+        if (nrow(df_disco_actual) > 0 && "cells_str" %in% names(df_disco_actual)) {
+          disco_cells <- df_disco_actual %>%
+            filter(!is.na(cells_str), nzchar(cells_str)) %>%
+            select(id, Num_Pasada, Tipo_Registro, cells_str_disco = cells_str)
+          df_remoto <- df_remoto %>%
+            left_join(disco_cells, by = c("id", "Num_Pasada", "Tipo_Registro")) %>%
+            mutate(
+              cells_str = case_when(
+                !is.na(cells_str) & nzchar(cells_str) ~ cells_str,
+                !is.na(cells_str_disco) & nzchar(cells_str_disco) ~ cells_str_disco,
+                TRUE ~ ""
+              )
+            ) %>%
+            select(-any_of("cells_str_disco"))
+        }
+        df_remoto <- df_remoto %>%
+          mutate(
+            cells_str = ifelse(!is.na(cells_str) & nzchar(cells_str), cells_str, generar_cells_str_vec(Lunes, Martes, Miércoles, Jueves, Viernes, Sábado))
+          )
         if (hay_filtro_activo) {
           # Conservar de Google Sheets: (a) otros modos/pasadas, y (b) en el mismo modo/pasada, las válvulas que este usuario NO tocó
           remoto_conservar <- df_remoto %>%
@@ -6992,7 +7444,8 @@ server <- function(input, output, session) {
               kg_sab      = coalesce(as.numeric(rm$Kg_Sábado), 0),
               pct_total   = coalesce(as.numeric(rm$Lunes + rm$Martes + rm$Miércoles + rm$Jueves + rm$Viernes + rm$Sábado), 0),
               ha_total    = coalesce(as.numeric(rm$Ha_Total_Prog), 0),
-              kg_total    = coalesce(as.numeric(rm$Kg_Total_Prog), 0)
+              kg_total    = coalesce(as.numeric(rm$Kg_Total_Prog), 0),
+              cells_str   = coalesce(as.character(rm$cells_str), "")
             )
           }
         }
@@ -7297,6 +7750,28 @@ server <- function(input, output, session) {
       
       if (!is.null(df_sheets) && nrow(df_sheets) > 0) {
         df_sheets <- df_sheets %>% filter(Semana == sem_num)
+        
+        # Preservar cells_str guardado en disco si Google Sheets aún no tiene la columna o viene vacío
+        df_disco_actual <- rutas_disco_rv() %>% filter(Campaña == "2026", Semana == sem_num)
+        if (nrow(df_disco_actual) > 0 && "cells_str" %in% names(df_disco_actual)) {
+          disco_cells <- df_disco_actual %>%
+            filter(!is.na(cells_str), nzchar(cells_str)) %>%
+            select(id, Num_Pasada, Tipo_Registro, cells_str_disco = cells_str)
+          df_sheets <- df_sheets %>%
+            left_join(disco_cells, by = c("id", "Num_Pasada", "Tipo_Registro")) %>%
+            mutate(
+              cells_str = case_when(
+                !is.na(cells_str) & nzchar(cells_str) ~ cells_str,
+                !is.na(cells_str_disco) & nzchar(cells_str_disco) ~ cells_str_disco,
+                TRUE ~ ""
+              )
+            ) %>%
+            select(-any_of("cells_str_disco"))
+        }
+        df_sheets <- df_sheets %>%
+          mutate(
+            cells_str = ifelse(!is.na(cells_str) & nzchar(cells_str), cells_str, generar_cells_str_vec(Lunes, Martes, Miércoles, Jueves, Viernes, Sábado))
+          )
         
         # Reemplazar las rutas de esa semana en disco y memoria
         df_total <- rutas_disco_rv() %>%

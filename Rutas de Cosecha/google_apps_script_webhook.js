@@ -104,7 +104,8 @@ function doPost(e) {
         Number(r.pct_jue || 0), Number(r.ha_jue || 0), Number(r.kg_jue || 0),
         Number(r.pct_vie || 0), Number(r.ha_vie || 0), Number(r.kg_vie || 0),
         Number(r.pct_sab || 0), Number(r.ha_sab || 0), Number(r.kg_sab || 0),
-        Number(r.pct_total || 0), Number(r.ha_total || 0), Number(r.kg_total || 0)
+        Number(r.pct_total || 0), Number(r.ha_total || 0), Number(r.kg_total || 0),
+        r.cells_str || ""
       ]);
     }
     
@@ -147,7 +148,8 @@ function doPost(e) {
         0, 0, 0,
         0, 0, 0,
         0, 0, 0,
-        0, 0, 0
+        0, 0, 0,
+        ""
       ]];
       var lastRowAud = sheetAuditoria.getLastRow();
       sheetAuditoria.getRange(lastRowAud + 1, 1, 1, auditRow[0].length).setValues(auditRow);
@@ -273,7 +275,8 @@ function crearEncabezados(sheet) {
     "Pct_Jueves", "Ha_Jueves", "Kg_Jueves",
     "Pct_Viernes", "Ha_Viernes", "Kg_Viernes",
     "Pct_Sabado", "Ha_Sabado", "Kg_Sabado",
-    "Pct_Total_Sem", "Ha_Total_Sem", "Kg_Total_Sem"
+    "Pct_Total_Sem", "Ha_Total_Sem", "Kg_Total_Sem",
+    "Cells_Str"
   ];
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#F1F5F9");
