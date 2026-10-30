@@ -10,6 +10,8 @@
 
 suppressPackageStartupMessages({
   library(readxl)
+  library(readr)
+  library(stringi)
   library(dplyr)
   library(tidyr)
   library(lubridate)
@@ -244,6 +246,180 @@ df_hist_oficial_wide <- if (file.exists(ruta_hist_wide_prev)) {
 }
 cat(sprintf("   ✔ Histórico wide previo cargado: %d registros\n\n", nrow(df_hist_oficial_wide)))
 
+# ------------------------------------------------------------------------------
+# 2B. INGESTAR Y ESTANDARIZAR BASE HISTÓRICA DE CONTEO FLORAL (BOTÓN Y FLOR)
+# ------------------------------------------------------------------------------
+cat("🌸 [1.5/5] Ingestando base histórica de conteo floral (Botón y Flor)...\n")
+ruta_conteo_excel <- file.path(ruta_drive_raiz, "Data Histórica", "conteo", "historico_conteo.xlsx")
+if (!file.exists(ruta_conteo_excel)) {
+  ruta_conteo_excel <- "D:/ACP/Actualizacion data maestra/historico_conteo.xlsx"
+}
+
+df_conteo_historico <- if (file.exists(ruta_conteo_excel)) {
+  cat(sprintf("   🔄 Leyendo archivo Excel de conteo: %s\n", basename(ruta_conteo_excel)))
+  df_c_raw <- suppressMessages(read_excel(ruta_conteo_excel))
+  
+  # Mapa módulo -> sector del catastro para imputar sectores faltantes
+  mapa_sec <- df_valvulas %>% distinct(Módulo, Sector) %>% filter(!is.na(Sector))
+  
+  df_c_proc <- df_c_raw %>%
+    mutate(
+      Campaña_Original = as.character(Campaña),
+      Campaña = case_when(
+        grepl("^21", Campaña) ~ 2021,
+        grepl("^22", Campaña) ~ 2022,
+        grepl("^23", Campaña) ~ 2023,
+        grepl("^24", Campaña) ~ 2024,
+        grepl("^25", Campaña) ~ 2025,
+        grepl("^26", Campaña) ~ 2026,
+        TRUE                  ~ suppressWarnings(as.numeric(Campaña))
+      ),
+      Año      = suppressWarnings(as.numeric(Año)),
+      Semana   = suppressWarnings(as.numeric(Semana)),
+      Módulo   = limpiar_modulo_str(Modulo),
+      Turno    = suppressWarnings(as.numeric(Turno)),
+      Válvula  = suppressWarnings(as.numeric(Valvula)),
+      Variedad = limpiar_variedad(Variedad),
+      Codigo_Valv = norm_codigo_valvula(sprintf("M%s-T%s-V%s", sub("\\..*", "", as.character(Modulo)), Turno, Valvula)),
+      Grupo    = asignar_grupo_modulo(Módulo),
+      Boton    = suppressWarnings(as.numeric(coalesce(Boton, 0))),
+      Flor     = suppressWarnings(as.numeric(coalesce(Flor, 0))),
+      MuestraF = suppressWarnings(as.numeric(coalesce(MuestraF, 15))),
+      MuestraF = ifelse(is.na(MuestraF) | MuestraF <= 0, 15, MuestraF),
+      Boton_Planta = round(Boton / MuestraF, 2),
+      Flor_Planta  = round(Flor / MuestraF, 2),
+      Total_Floral = Boton + Flor,
+      Total_Floral_Planta = round((Boton + Flor) / MuestraF, 2),
+      Fundo    = toupper(trimws(as.character(coalesce(Fundo, "ACP"))))
+    ) %>%
+    filter(Fundo == "ACP")
+  
+  # Imputar Sector si está NA o no válido usando catálogo catastral
+  sec_imput <- mapa_sec$Sector[match(sub("\\..*", "", df_c_proc$Módulo), mapa_sec$Módulo)]
+  df_c_proc$Sector <- ifelse(is.na(df_c_proc$Sector) | df_c_proc$Sector %in% c("TRUE", "FALSE", "", "NA"), sec_imput, as.character(df_c_proc$Sector))
+  
+  cat(sprintf("   ✔ Conteo floral histórico procesado (Solo Fundo ACP): %d registros | Campañas: %s\n\n",
+              nrow(df_c_proc), paste(sort(unique(df_c_proc$Campaña)), collapse = ", ")))
+  df_c_proc
+} else {
+  ruta_conteo_rds <- "D:/ACP/Actualizacion Semanal/historico_conteo.rds"
+  if (file.exists(ruta_conteo_rds)) {
+    cat(sprintf("   ✔ Cargando conteo histórico desde RDS de respaldo: %s\n\n", basename(ruta_conteo_rds)))
+    readRDS(ruta_conteo_rds)
+  } else {
+    cat("   ⚠️ No se encontró archivo de conteo histórico. Se genera tibble vacío.\n\n")
+    tibble()
+  }
+}
+
+
+
+# ------------------------------------------------------------------------------
+# 2C. INGESTAR Y PROCESAR CURVAS DE MADURACIÓN DE CAMPO (DÍAS DE MADURACIÓN)
+# ------------------------------------------------------------------------------
+cat("⏱️ [1.8/5] Ingestando curvas de maduración y calculando días por módulo-variedad...\n")
+ruta_mad_csv <- file.path(ruta_drive_raiz, "Data Histórica", "Maduración", "Curvas de Maduracion Campaigns.csv")
+if (!file.exists(ruta_mad_csv)) {
+  ruta_mad_csv <- "D:/ACP/Actualizacion data maestra/Curvas de Maduracion Campaigns.csv"
+}
+
+calcular_maduracion_df <- function(ruta_csv, campana_target = 2026) {
+  if (!file.exists(ruta_csv)) return(list(curvas = tibble(), resumen = tibble()))
+  
+  df_raw <- suppressMessages(read_delim(ruta_csv, delim = ";", locale = locale(encoding = "ISO-8859-1"), show_col_types = FALSE))
+  if (nrow(df_raw) == 0) return(list(curvas = tibble(), resumen = tibble()))
+  
+  # Normalizar estado a Latin-ASCII mayúsculas
+  df_raw$state_norm <- toupper(trimws(stringi::stri_trans_general(df_raw$state, "Latin-ASCII")))
+  fases_obligatorias <- c("FLOR", "PEQUENA", "VERDE", "INICIO FASE 1", "INICIO FASE 2", "CREMA", "MADURA")
+  
+  norm_mod_local <- function(m) {
+    m_str <- as.character(m)
+    m_num <- suppressWarnings(as.numeric(m_str))
+    if (!is.na(m_num)) {
+      if (m_num == round(m_num)) as.character(as.integer(m_num)) else sprintf("%.1f", m_num)
+    } else {
+      m_str
+    }
+  }
+  
+  df_camp <- df_raw %>%
+    filter(Campaign == campana_target | as.character(Campaign) == as.character(campana_target)) %>%
+    mutate(
+      Modulo = sapply(module, norm_mod_local),
+      Variedad = toupper(trimws(as.character(variant)))
+    )
+  
+  if (nrow(df_camp) == 0) return(list(curvas = df_raw, resumen = tibble()))
+  
+  promos <- df_camp %>%
+    group_by(Modulo, Variedad, study_group, trial_start_week) %>%
+    summarise(
+      fases = list(unique(state_norm)),
+      tiene_obligatorias = all(fases_obligatorias %in% unlist(fases)),
+      dias_totales = sum(sojourn_days, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(Modulo, Variedad, trial_start_week)
+  
+  combos <- promos %>% distinct(Modulo, Variedad)
+  res_list <- lapply(seq_len(nrow(combos)), function(i) {
+    m <- combos$Modulo[i]
+    v <- combos$Variedad[i]
+    
+    df_sub <- promos %>%
+      filter(Modulo == m, Variedad == v, tiene_obligatorias) %>%
+      arrange(desc(trial_start_week))
+    
+    if (nrow(df_sub) == 0) return(NULL)
+    
+    sem_ult <- df_sub$trial_start_week[1]
+    dias_ult <- df_sub$dias_totales[1]
+    
+    # Semana contigua anterior inmediata (separada por 2 semanas: sem_ult - 2)
+    sem_ant_esp <- sem_ult - 2
+    fila_ant <- df_sub %>% filter(trial_start_week == sem_ant_esp)
+    
+    if (nrow(fila_ant) > 0) {
+      dias_ant <- fila_ant$dias_totales[1]
+      dias_final <- as.integer(round(mean(c(dias_ult, dias_ant))))
+      tibble(
+        Módulo = m,
+        Variedad = v,
+        Dias_Maduracion = dias_final,
+        Semana_Ultima = sem_ult,
+        Semana_Penultima = sem_ant_esp,
+        Metodo = "Promedio 2 semanas contiguas"
+      )
+    } else {
+      dias_final <- as.integer(round(dias_ult))
+      tibble(
+        Módulo = m,
+        Variedad = v,
+        Dias_Maduracion = dias_final,
+        Semana_Ultima = sem_ult,
+        Semana_Penultima = NA_real_,
+        Metodo = "Solo última semana completa"
+      )
+    }
+  })
+  
+  df_res <- bind_rows(res_list)
+  list(curvas = df_raw, resumen = df_res)
+}
+
+res_mad <- calcular_maduracion_df(ruta_mad_csv, campana_target = 2026)
+df_curvas_maduracion <- res_mad$curvas
+df_dias_maduracion_calculados <- res_mad$resumen
+
+if (nrow(df_dias_maduracion_calculados) > 0) {
+  cat(sprintf("   ✔ Curvas de maduración procesadas: %d combinaciones calculadas (Campaña 2026)\n\n",
+              nrow(df_dias_maduracion_calculados)))
+} else {
+  cat("   ⚠️ No se pudieron calcular días de maduración desde curvas. Se usará respaldo.\n\n")
+}
+
+
 
 # ------------------------------------------------------------------------------
 # 3. INGESTAR Y PROCESAR COSECHA DIARIA DE SAP
@@ -288,16 +464,27 @@ if (tiene_sap) {
   mod_vec <- suppressWarnings(as.character(as.numeric(sub(".*\\bM(\\d+).*", "\\1", consum_vals))))
   tur_vec <- suppressWarnings(as.numeric(sub(".*\\bT(\\d+).*", "\\1", consum_vals)))
   
+  col_consum_campo <- grep("CONSUMIDOR.*CAMPO|CAMPO.*CONSUMIDOR", names(df_sap_raw), value = TRUE, ignore.case = TRUE)[1]
+  es_tb <- if (!is.na(col_consum_campo) && col_consum_campo %in% names(df_sap_raw)) {
+    grepl("S04|TB", as.character(df_sap_raw[[col_consum_campo]]), ignore.case = TRUE)
+  } else {
+    rep(FALSE, nrow(df_sap_raw))
+  }
+  es_tb <- es_tb | grepl("^TB|\\bS0*4\\b", consum_vals, ignore.case = TRUE)
+  tipo_cosecha_vec <- ifelse(es_tb, "Testblock", "Comercial")
+  
   df_sap_turno <- df_sap_raw %>%
     mutate(
-      Fecha    = Fecha_Parsed,
-      Real     = suppressWarnings(as.numeric(gsub("[^0-9.-]", "", as.character(PESONETO)))),
-      Sector   = sec_vec,
-      Módulo   = mod_vec,
-      Turno    = tur_vec,
-      Variedad = limpiar_variedad(sub("^.*\\|\\s*", "", as.character(VARIEDAD))),
-      Semana   = Semana_ISO,
-      Campaña  = 2026
+      Fecha        = Fecha_Parsed,
+      Real         = suppressWarnings(as.numeric(gsub("[^0-9.-]", "", as.character(PESONETO)))),
+      Sector       = sec_vec,
+      Módulo       = mod_vec,
+      Turno        = tur_vec,
+      Variedad     = limpiar_variedad(sub("^.*\\|\\s*", "", as.character(VARIEDAD))),
+      Semana       = Semana_ISO,
+      Campaña      = 2026,
+      Tipo_Cosecha = tipo_cosecha_vec,
+      Es_Testblock = es_tb
     ) %>%
     filter(!is.na(Real), Real > 0, !is.na(Fecha)) %>%
     mutate(
@@ -315,31 +502,41 @@ if (tiene_sap) {
         TRUE                                   ~ Módulo
       )
     ) %>%
-    group_by(Fecha, Campaña, Semana, Sector, Módulo, Turno, Variedad) %>%
+    group_by(Fecha, Campaña, Semana, Sector, Módulo, Turno, Variedad, Tipo_Cosecha) %>%
     summarise(
-      `Kg Total` = sum(Real, na.rm = TRUE),
-      .groups    = "drop"
+      `Kg Total`   = sum(Real, na.rm = TRUE),
+      Es_Testblock = any(Es_Testblock),
+      .groups      = "drop"
     )
+  
+  if (!"Tipo_Cosecha" %in% names(df_cosecha)) {
+    df_cosecha$Tipo_Cosecha <- "Comercial"
+    df_cosecha$Es_Testblock <- FALSE
+  }
   
   fechas_sap_unicas <- unique(df_sap_turno$Fecha)
   df_cosecha <- df_cosecha %>%
     filter(!(Campaña == 2026 & as.Date(Fecha) %in% fechas_sap_unicas)) %>%
     bind_rows(df_sap_turno)
   
-  cat(sprintf("   ✔ df_cosecha actualizado con SAP: %d filas añadidas/reemplazadas (Total: %.1f Kg)\n",
-              nrow(df_sap_turno), sum(df_sap_turno$`Kg Total`, na.rm = TRUE)))
+  kg_comercial_sap <- sum(df_sap_turno$`Kg Total`[df_sap_turno$Tipo_Cosecha == "Comercial"], na.rm = TRUE)
+  kg_testblock_sap <- sum(df_sap_turno$`Kg Total`[df_sap_turno$Tipo_Cosecha == "Testblock"], na.rm = TRUE)
+  cat(sprintf("   ✔ df_cosecha actualizado con SAP: %d grupos (Comercial: %.1f Kg | Testblock: %.1f Kg)\n",
+              nrow(df_sap_turno), kg_comercial_sap, kg_testblock_sap))
   
   df_sap_valvs_raw <- df_sap_raw %>%
     mutate(
-      Fecha_Date  = Fecha_Parsed,
-      Semana      = Semana_ISO,
-      Dia_Num     = lubridate::wday(Fecha_Date, week_start = 1),
-      Kg          = suppressWarnings(as.numeric(PESONETO)),
-      Mod_Num     = suppressWarnings(as.numeric(sub("^M0*", "", MODULO))),
-      Tur_Num     = suppressWarnings(as.numeric(sub("^T0*", "", TURNO))),
-      Val_Num     = suppressWarnings(as.numeric(sub("^0*", "", coalesce(NROVALVULA, VALVULA_CAMPO)))),
-      codigo_norm = sprintf("M%d-T%d-V%d", Mod_Num, Tur_Num, Val_Num),
-      Variedad    = limpiar_variedad(sub("^.*\\|\\s*", "", as.character(VARIEDAD)))
+      Fecha_Date   = Fecha_Parsed,
+      Semana       = Semana_ISO,
+      Dia_Num      = lubridate::wday(Fecha_Date, week_start = 1),
+      Kg           = suppressWarnings(as.numeric(PESONETO)),
+      Mod_Num      = suppressWarnings(as.numeric(sub("^M0*", "", MODULO))),
+      Tur_Num      = suppressWarnings(as.numeric(sub("^T0*", "", TURNO))),
+      Val_Num      = suppressWarnings(as.numeric(sub("^0*", "", coalesce(NROVALVULA, VALVULA_CAMPO)))),
+      codigo_norm  = sprintf("M%d-T%d-V%d", Mod_Num, Tur_Num, Val_Num),
+      Variedad     = limpiar_variedad(sub("^.*\\|\\s*", "", as.character(VARIEDAD))),
+      Tipo_Cosecha = tipo_cosecha_vec,
+      Es_Testblock = es_tb
     ) %>%
     filter(!is.na(Kg), Kg > 0, !is.na(Mod_Num), !is.na(Tur_Num), !is.na(Val_Num), !is.na(Dia_Num))
   
@@ -363,7 +560,7 @@ if (tiene_sap) {
     filter(dia_col != "Otro")
   
   auditoria_sap_huerfanas <- df_sap_valvs %>%
-    filter(!codigo_norm %in% df_valvulas$codigo_norm) %>%
+    filter(!Es_Testblock, !codigo_norm %in% df_valvulas$codigo_norm) %>%
     group_by(Semana, codigo_norm) %>%
     summarise(Kg_Huerfanos = round(sum(Kg, na.rm = TRUE), 2), Filas = n(), .groups = "drop")
   
@@ -674,6 +871,9 @@ metadata_actualizacion <- list(
   Filas_Hist_Wide_Mapa            = nrow(df_hist_oficial_wide),
   Filas_Proyecciones              = nrow(df_proyecciones),
   Filas_Cosecha_Multicampana      = nrow(df_cosecha),
+  Filas_Conteo_Historico          = nrow(df_conteo_historico),
+  Filas_Curvas_Maduracion         = nrow(df_curvas_maduracion),
+  Total_Combos_Maduracion         = nrow(df_dias_maduracion_calculados),
   Matriz_Control_Proyecciones     = df_manifest_proy,
   Auditoria_Valvulas_Huerfanas    = auditoria_sap_huerfanas
 )
@@ -687,6 +887,7 @@ cat("💾 [4/5] Guardando datos maestros unificados...\n")
 ruta_rdata_drive <- file.path(ruta_drive_raiz, "datos_maestros_cosecha_2026.RData")
 ruta_rdata_d1    <- "D:/ACP/Actualizacion data maestra/datos_maestros_cosecha_2026.RData"
 ruta_rdata_d2    <- "D:/ACP/Rutas de Cosecha/datos_maestros_cosecha_2026.RData"
+ruta_rdata_d3    <- "D:/ACP/Actualizacion Semanal/datos_maestros_cosecha_2026.RData"
 
 save(
   df_cosecha,
@@ -695,6 +896,9 @@ save(
   df_hist_oficial_wide,
   df_proyecciones,
   df_manifest_proy,
+  df_conteo_historico,
+  df_curvas_maduracion,
+  df_dias_maduracion_calculados,
   metadata_actualizacion,
   file = ruta_rdata_d1
 )
@@ -704,8 +908,25 @@ cat(sprintf("   ✔ Guardado local exitoso en: %s (Tamaño: %.2f MB)\n",
 file.copy(ruta_rdata_d1, ruta_rdata_d2, overwrite = TRUE)
 cat(sprintf("   ✔ Espejo local actualizado en: %s\n", ruta_rdata_d2))
 
+file.copy(ruta_rdata_d1, ruta_rdata_d3, overwrite = TRUE)
+cat(sprintf("   ✔ Espejo local actualizado en: %s\n", ruta_rdata_d3))
+
 saveRDS(df_hist_oficial_wide, "D:/ACP/Rutas de Cosecha/historico_oficial_wide_2026.rds")
 saveRDS(df_valvulas, "D:/ACP/Rutas de Cosecha/valvulas_normalizadas.rds")
+
+# Guardar RDS de conteo histórico en rutas accesibles
+saveRDS(df_conteo_historico, "D:/ACP/Actualizacion Semanal/historico_conteo.rds")
+saveRDS(df_conteo_historico, "D:/ACP/Rutas de Cosecha/historico_conteo.rds")
+tryCatch({
+  saveRDS(df_conteo_historico, file.path(ruta_drive_raiz, "historico_conteo.rds"))
+}, error = function(e) NULL)
+
+# Guardar RDS de días de maduración calculados en rutas accesibles
+saveRDS(df_dias_maduracion_calculados, "D:/ACP/Actualizacion Semanal/dias_maduracion_calculados.rds")
+saveRDS(df_dias_maduracion_calculados, "D:/ACP/Rutas de Cosecha/dias_maduracion_calculados.rds")
+tryCatch({
+  saveRDS(df_dias_maduracion_calculados, file.path(ruta_drive_raiz, "dias_maduracion_calculados.rds"))
+}, error = function(e) NULL)
 
 guardado_drive <- FALSE
 tryCatch({

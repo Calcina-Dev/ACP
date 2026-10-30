@@ -596,7 +596,15 @@ obtener_usuarios_google_sheets <- function() {
       u_val <- usr_vec[idx]
       p_val <- pwd_vec[idx]
       n_val <- if (!is.null(nom_vec) && nzchar(nom_vec[idx])) nom_vec[idx] else u_val
-      r_val <- if (!is.null(rol_vec) && nzchar(rol_vec[idx])) rol_vec[idx] else "Sectorista"
+      r_raw <- if (!is.null(rol_vec) && nzchar(rol_vec[idx])) trimws(rol_vec[idx]) else "Sectorista"
+      r_lower <- tolower(r_raw)
+      r_val <- if (r_lower %in% c("administrador", "admin")) {
+        "Administrador"
+      } else if (r_lower %in% c("visualizador", "solo lectura", "consulta", "lector", "viewer", "invitado", "visita")) {
+        "Visualizador"
+      } else {
+        "Sectorista"
+      }
       m_str <- if (!is.null(mod_vec)) mod_vec[idx] else "1-14"
       
       res_list[[i]] <- tibble(
@@ -2110,7 +2118,7 @@ ui <- fluidPage(
         color: #FFFFFF !important;
         font-weight: 600 !important;
         font-size: 10.5px !important;
-        text-transform: uppercase !important;
+        text-transform: none !important;
         letter-spacing: 0.3px !important;
         padding: 10px 7px !important;
         border-bottom: 2px solid #0F172A !important;
@@ -3432,7 +3440,7 @@ ui <- fluidPage(
     }
     
     function handleDayKgCommit(diaNombre, valStr, el, force = false) {
-      if (activeMode === 'CosechaOficial') return;
+      if (activeMode === 'CosechaOficial' || (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador)) return;
       const rawVal = (valStr || '').replace(/[^0-9.]/g, '');
       const kgNum = Math.round(parseFloat(rawVal) || 0);
       
@@ -3493,6 +3501,10 @@ ui <- fluidPage(
     }
     
     function triggerResetDiaActivoModal() {
+      if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) {
+        showMapToast('🔒 Tu usuario tiene perfil de Solo Visualización.');
+        return;
+      }
       if (activeMode === 'CosechaOficial') {
         showMapToast('🔒 No se puede borrar la Cosecha Oficial (datos oficiales de packing).');
         return;
@@ -3509,6 +3521,10 @@ ui <- fluidPage(
     }
     
     function triggerResetPassModal() {
+      if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) {
+        showMapToast('🔒 Tu usuario tiene perfil de Solo Visualización.');
+        return;
+      }
       if (activeMode === 'CosechaOficial') {
         showMapToast('🔒 No se puede reiniciar la Cosecha Oficial (datos oficiales de packing).');
         return;
@@ -3518,6 +3534,61 @@ ui <- fluidPage(
       }
     }
     
+    function aplicarRestriccionesVisualizador() {
+      const isVis = !!(window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador);
+      const isOficial = (activeMode === 'CosechaOficial');
+      const bloquearEdicion = isVis || isOficial;
+      
+      if (bloquearEdicion) {
+        paintTool = 'pan';
+        if (wrapper) wrapper.style.cursor = 'grab';
+      }
+      
+      const btnGuardar = document.getElementById('btn_guardar_manual');
+      if (btnGuardar) {
+        btnGuardar.style.display = isVis ? 'none' : 'inline-flex';
+      }
+      
+      const lockSidebarBadge = document.getElementById('sidebar-lock-indicator');
+      if (lockSidebarBadge) {
+        lockSidebarBadge.style.display = bloquearEdicion ? 'inline-block' : 'none';
+      }
+      
+      document.querySelectorAll('.sidebar-drawing-tool').forEach(btn => {
+        btn.disabled = bloquearEdicion;
+        btn.style.opacity = bloquearEdicion ? '0.35' : '1';
+        btn.style.pointerEvents = bloquearEdicion ? 'none' : 'auto';
+        if (isVis) btn.title = '🔒 Modo Solo Lectura (Visualizador)';
+      });
+      
+      const btnUndo = document.getElementById('btn-undo');
+      if (btnUndo && isVis) {
+        btnUndo.disabled = true;
+        btnUndo.style.opacity = '0.35';
+        btnUndo.style.pointerEvents = 'none';
+      }
+      
+      document.querySelectorAll('.day-kg-input').forEach(inp => {
+        if (bloquearEdicion) {
+          inp.readOnly = true;
+          inp.style.pointerEvents = 'none';
+          inp.style.background = '#F2F2F7';
+        } else {
+          inp.readOnly = false;
+          inp.style.pointerEvents = 'auto';
+          inp.style.background = '';
+        }
+      });
+      
+      document.querySelectorAll('.badge-proy-sug').forEach(b => {
+        if (isVis) {
+          b.style.display = 'none';
+        }
+      });
+      
+      updateMenuIndicator();
+    }
+    
     function updateMenuIndicator() {
       const pill = document.getElementById('active-tool-indicator');
       const toolIds = ['mode-drag-cells-btn', 'mode-valve100-btn', 'mode-area-btn', 'mode-eraser-btn', 'mode-eraser100-btn', 'mode-pan-btn'];
@@ -3525,6 +3596,17 @@ ui <- fluidPage(
         const b = document.getElementById(id);
         if (b) b.classList.remove('active', 'active-eraser', 'active-pan');
       });
+      
+      if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) {
+        const b = document.getElementById('mode-pan-btn');
+        if (b) b.classList.add('active', 'active-pan');
+        if (pill) {
+          pill.textContent = '🔒 Solo Lectura';
+          pill.style.background = 'rgba(100, 116, 139, 0.16)';
+          pill.style.color = '#334155';
+        }
+        return;
+      }
       
       if (paintTool === 'pan') {
         const b = document.getElementById('mode-pan-btn');
@@ -3589,7 +3671,11 @@ ui <- fluidPage(
       const lblDia = document.getElementById('lbl-dia-activo-menu');
       if (lblDia) lblDia.textContent = DAY_NAMES[dayKey] || dayKey;
       
-      if (paintTool === 'pan' || paintTool === 'eraser' || paintTool === 'eraser100') {
+      const isVis = !!(window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador);
+      if (isVis) {
+        paintTool = 'pan';
+        if (wrapper) wrapper.style.cursor = 'grab';
+      } else if (paintTool === 'pan' || paintTool === 'eraser' || paintTool === 'eraser100') {
         paintTool = 'cells';
         if (wrapper) wrapper.style.cursor = 'crosshair';
       }
@@ -3632,20 +3718,49 @@ ui <- fluidPage(
         sugBadges.forEach(el => { el.style.display = 'inline-block'; });
       }
       document.querySelectorAll('.lbl-modo-kg').forEach(el => { el.textContent = txtLbl; });
-      document.querySelectorAll('.day-kg-input').forEach(el => { el.readOnly = isReadOnly; });
-
+      
       const isOficial = (modeName === 'CosechaOficial');
-      if (isOficial) {
+      const isVis = !!(window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador);
+      const bloquearEdicion = isOficial || isVis;
+      
+      if (bloquearEdicion) {
         if (paintTool !== 'pan') paintTool = 'pan';
         if (wrapper) wrapper.style.cursor = 'grab';
       }
       document.querySelectorAll('.sidebar-drawing-tool').forEach(btn => {
-        btn.disabled = isOficial;
-        btn.style.opacity = isOficial ? '0.38' : '1';
-        btn.style.pointerEvents = isOficial ? 'none' : 'auto';
+        btn.disabled = bloquearEdicion;
+        btn.style.opacity = bloquearEdicion ? '0.35' : '1';
+        btn.style.pointerEvents = bloquearEdicion ? 'none' : 'auto';
+        if (isVis) btn.title = '🔒 Modo Solo Lectura (Visualizador)';
       });
       const lockSidebarBadge = document.getElementById('sidebar-lock-indicator');
-      if (lockSidebarBadge) lockSidebarBadge.style.display = isOficial ? 'inline-block' : 'none';
+      if (lockSidebarBadge) lockSidebarBadge.style.display = bloquearEdicion ? 'inline-block' : 'none';
+      
+      const btnGuardar = document.getElementById('btn_guardar_manual');
+      if (btnGuardar) {
+        btnGuardar.style.display = isVis ? 'none' : 'inline-flex';
+      }
+      const btnUndo = document.getElementById('btn-undo');
+      if (btnUndo && isVis) {
+        btnUndo.disabled = true;
+        btnUndo.style.opacity = '0.35';
+        btnUndo.style.pointerEvents = 'none';
+      }
+      
+      document.querySelectorAll('.day-kg-input').forEach(el => { 
+        el.readOnly = isReadOnly || isVis; 
+        if (isVis) {
+          el.style.pointerEvents = 'none';
+          el.style.background = '#F2F2F7';
+        } else if (!isReadOnly) {
+          el.style.pointerEvents = 'auto';
+          el.style.background = '';
+        }
+      });
+      if (isVis) {
+        sugBadges.forEach(el => { el.style.display = 'none'; });
+      }
+
       const menuBox = document.getElementById('map-menu-box');
       if (menuBox) {
         menuBox.style.opacity = '1';
@@ -3660,6 +3775,7 @@ ui <- fluidPage(
     }
     
     function copiarSugeridoADia(dia) {
+      if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) return;
       const b = document.getElementById('badge_proy_sug_' + dia);
       const inp = document.getElementById('input_kg_' + dia);
       if (b && inp && b.dataset.rawKg) {
@@ -3684,6 +3800,12 @@ ui <- fluidPage(
     
     function selectToolFromMenu(tool) {
       closeToolsMenu();
+      if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) {
+        if (tool !== 'pan') {
+          showMapToast('🔒 Tu usuario tiene perfil de Solo Visualización. Solo puedes mover el mapa.');
+          return;
+        }
+      }
       paintTool = tool;
       if (wrapper) wrapper.style.cursor = tool === 'pan' ? 'grab' : 'crosshair';
       updateMenuIndicator();
@@ -3691,6 +3813,10 @@ ui <- fluidPage(
     
     function selectEraserFromMenu(type) {
       closeToolsMenu();
+      if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) {
+        showMapToast('🔒 Tu usuario tiene perfil de Solo Visualización. Solo puedes mover el mapa.');
+        return;
+      }
       paintTool = (type === 'valve100') ? 'eraser100' : 'eraser';
       if (wrapper) wrapper.style.cursor = 'crosshair';
       updateMenuIndicator();
@@ -3703,6 +3829,10 @@ ui <- fluidPage(
     }
     
     function guardarRutaCompleta() {
+      if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) {
+        showMapToast('🔒 Tu usuario tiene perfil de Solo Visualización.');
+        return;
+      }
       if (!hasUnsavedChanges) {
         showMapToast('✓ No hay cambios pendientes por guardar');
         return;
@@ -4476,7 +4606,7 @@ ui <- fluidPage(
             octx.fillStyle = '#64748B';
             octx.font = 'bold 15px Inter, -apple-system, sans-serif';
             octx.textAlign = 'right';
-            octx.fillText('ÁREA (HA)', vx + vHaW - 12, subThY + (thH - 40) / 2);
+            octx.fillText('ÁREA (ha)', vx + vHaW - 12, subThY + (thH - 40) / 2);
             octx.fillText('KILOS (KG)', vx + singleVarW - 14, subThY + (thH - 40) / 2);
           });
           
@@ -4725,6 +4855,7 @@ ui <- fluidPage(
     }
     
     function undoLastStroke() {
+      if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) return;
       if (undoStack.length === 0) return;
       const snap = undoStack.pop();
       const mapSnap = new Map(snap.items.map(s => [s.id, s]));
@@ -4942,6 +5073,11 @@ ui <- fluidPage(
     function applyPaint(v, wx, wy) {
       if (!v) return false;
       if (filteredIds && !filteredIds.has(v.id)) return false;
+      
+      if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) {
+        showMapToast('🔒 Tu usuario tiene perfil de Solo Visualización.');
+        return false;
+      }
       
       if (window.USER_PERMISOS && !window.USER_PERMISOS.es_admin) {
         const modNum = Number(v.Módulo);
@@ -5178,6 +5314,11 @@ ui <- fluidPage(
     function abrirModalAsignarArea(v) {
       if (!v) return;
       if (filteredIds && !filteredIds.has(v.id)) return;
+      
+      if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) {
+        showMapToast('🔒 Tu usuario tiene perfil de Solo Visualización.');
+        return;
+      }
       
       if (window.USER_PERMISOS && !window.USER_PERMISOS.es_admin) {
         const modNum = Number(v.Módulo);
@@ -5620,6 +5761,11 @@ ui <- fluidPage(
     }
 
     function aplicarAsignarArea() {
+      if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) {
+        showMapToast('🔒 Tu usuario tiene perfil de Solo Visualización.');
+        cerrarModalAsignarArea();
+        return;
+      }
       if (!valveSeleccionadaModal) return;
       const v = valveSeleccionadaModal;
       const totalHa = parseFloat(v.Área) || 0;
@@ -5686,6 +5832,7 @@ ui <- fluidPage(
       window.addEventListener('keydown', function(e) {
         if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
           e.preventDefault();
+          if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) return;
           undoLastStroke();
         }
       });
@@ -5711,7 +5858,7 @@ ui <- fluidPage(
         if (menuBox && menuBox.contains(e.target)) return;
         closeToolsMenu();
         
-        if (e.button === 2 || e.shiftKey || paintTool === 'pan') {
+        if (e.button === 2 || e.shiftKey || paintTool === 'pan' || (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador)) {
           isPanning = true;
           startPanX = e.clientX - panX;
           startPanY = e.clientY - panY;
@@ -5766,7 +5913,10 @@ ui <- fluidPage(
         }
         if (isPanning) {
           isPanning = false;
-          if (wrapper) wrapper.style.cursor = paintTool === 'pan' ? 'grab' : 'crosshair';
+          if (wrapper) {
+            const isVis = window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador;
+            wrapper.style.cursor = (paintTool === 'pan' || isVis) ? 'grab' : 'crosshair';
+          }
         }
       });
 
@@ -5789,7 +5939,7 @@ ui <- fluidPage(
           lastTouchDist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
         } else if (e.touches.length === 1) {
           const t = e.touches[0];
-          if (paintTool === 'pan') {
+          if (paintTool === 'pan' || (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador)) {
             isPanning = true;
             startPanX = t.clientX - panX;
             startPanY = t.clientY - panY;
@@ -5879,6 +6029,10 @@ ui <- fluidPage(
       
       wrapper.addEventListener('dblclick', function(e) {
         e.preventDefault();
+        if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) {
+          showMapToast('🔒 Tu usuario tiene perfil de Solo Visualización.');
+          return;
+        }
         const pos = screenToWorld(e.clientX, e.clientY);
         const v = findValveAt(pos.x, pos.y);
         if (v) {
@@ -6452,6 +6606,7 @@ ui <- fluidPage(
         });
         
         Shiny.addCustomMessageHandler('limpiar_dia_activo', function(message) {
+          if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) return;
           $('body').removeClass('modal-open').css({ 'padding-right': '', 'overflow': '' });
           $('.modal-backdrop').remove();
           saveSnapshotForUndo();
@@ -6517,6 +6672,7 @@ ui <- fluidPage(
         });
         
         Shiny.addCustomMessageHandler('limpiar_pasada_activa', function(message) {
+          if (window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador) return;
           $('body').removeClass('modal-open').css({ 'padding-right': '', 'overflow': '' });
           $('.modal-backdrop').remove();
           saveSnapshotForUndo();
@@ -6559,13 +6715,15 @@ ui <- fluidPage(
             btn.innerHTML = 'Iniciar Sesión';
             btn.disabled = false;
           }
-          setTimeout(function() { bloquearFiltroGrupo(!data.es_admin); }, 150);
+          setTimeout(function() { bloquearFiltroGrupo(!data.es_admin && !data.es_visualizador); }, 150);
+          aplicarRestriccionesVisualizador();
           if (typeof resizeCanvas === 'function') resizeCanvas();
         });
 
         Shiny.addCustomMessageHandler('logout_exitoso', function() {
           window.USER_PERMISOS = null;
           bloquearFiltroGrupo(false);
+          aplicarRestriccionesVisualizador();
           const ov = document.getElementById('login-overlay');
           if (ov) ov.style.display = 'flex';
           const btn = document.getElementById('btn_iniciar_sesion');
@@ -6850,16 +7008,19 @@ server <- function(input, output, session) {
       })
       
       # Informar al motor 2D Canvas sobre permisos y usuario activo
+      es_adm <- (usr$rol == "Administrador")
+      es_vis <- (usr$rol == "Visualizador")
       session$sendCustomMessage("login_exitoso", list(
-        usuario  = usr$usuario,
-        nombre   = usr$nombre,
-        rol      = usr$rol,
-        modulos  = as.list(as.numeric(unlist(usr$modulos))),
-        es_admin = (usr$rol == "Administrador")
+        usuario         = usr$usuario,
+        nombre          = usr$nombre,
+        rol             = usr$rol,
+        modulos         = as.list(as.numeric(unlist(usr$modulos))),
+        es_admin        = es_adm,
+        es_visualizador = es_vis
       ))
       
-      # Si es sectorista, auto-seleccionar su grupo de módulos correspondiente; si es Admin, mostrar todos
-      if (usr$rol != "Administrador") {
+      # Si es sectorista, auto-seleccionar su grupo de módulos correspondiente; si es Admin o Visualizador, mostrar todos
+      if (usr$rol == "Sectorista") {
         mods_u <- as.numeric(unlist(usr$modulos))
         grp_match <- names(grupos_modulos)[vapply(grupos_modulos, function(m) any(m %in% mods_u), logical(1))]
         # Solo el/los grupo(s) asignado(s) y únicamente sus módulos asignados
@@ -6916,9 +7077,13 @@ server <- function(input, output, session) {
                   span("👤"), span("Iniciar Sesión"))
     } else {
       es_admin <- (u$rol == "Administrador")
+      es_vis   <- (u$rol == "Visualizador")
       badge_icon <- if (es_admin) {
         tags$span(style = "display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; background: rgba(0, 122, 255, 0.12); color: #007AFF;",
                   HTML("<svg width='13' height='13' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.3' stroke-linecap='round' stroke-linejoin='round'><path d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'></path></svg>"))
+      } else if (es_vis) {
+        tags$span(style = "display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; background: rgba(142, 142, 147, 0.18); color: #636366;",
+                  span(style = "font-size: 13px;", "👁️"))
       } else {
         tags$span(style = "display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; background: rgba(52, 199, 89, 0.12); color: #34C759;",
                   span(style = "font-size: 13px;", "🚜"))
@@ -6929,7 +7094,9 @@ server <- function(input, output, session) {
           div(style = "display: flex; flex-direction: column; text-align: left; line-height: 1.15;",
               span(style = "font-size: 11.5px; font-weight: 700; color: #1C1C1E;", u$nombre),
               span(style = "font-size: 10px; color: #007AFF; font-weight: 600;", 
-                   if (es_admin) "Administrador • Todos los módulos" else paste("Módulos:", paste(u$modulos[[1]], collapse = ",")))
+                   if (es_admin) "Administrador • Todos los módulos"
+                   else if (es_vis) "Visualizador • Solo lectura"
+                   else paste("Módulos:", paste(u$modulos[[1]], collapse = ",")))
           ),
           actionButton("btn_logout", label = "Salir", 
                        style = "border: none; background: rgba(0,0,0,0.06); border-radius: 6px; font-size: 10.5px; font-weight: 600; color: #636366; padding: 3px 8px; height: 24px; cursor: pointer; margin-left: 4px;")
@@ -7253,8 +7420,11 @@ server <- function(input, output, session) {
     p_acts <- if (!is.null(pasada)) as.numeric(pasada) else pasada_activa()
     
     usr <- usuario_autenticado_rv()
+    if (!is.null(usr) && usr$rol == "Visualizador") {
+      return(FALSE)
+    }
     es_admin <- if (!is.null(usr)) usr$rol == "Administrador" else TRUE
-    modulos_usr <- if (!is.null(usr) && !es_admin) usr$modulos[[1]] else 1:14
+    modulos_usr <- if (!is.null(usr) && usr$rol == "Sectorista") usr$modulos[[1]] else 1:14
     
     ids_alcance <- if (!is.null(ids_scope)) ids_scope else isolate(catalogo_filtrado()$id)
     if (!es_admin) {
@@ -7522,6 +7692,8 @@ server <- function(input, output, session) {
   # Recibir trazos desde el Canvas JS y conservar/recalcular Kilos
   observeEvent(input$mapa_programacion_json, {
     req(input$mapa_programacion_json)
+    usr <- usuario_autenticado_rv()
+    if (!is.null(usr) && usr$rol == "Visualizador") return()
     raw_json <- trimws(as.character(input$mapa_programacion_json))
     
     prev_state <- programacion_semana()
@@ -7624,6 +7796,11 @@ server <- function(input, output, session) {
   observeEvent(input$ingresar_kg_dia, {
     info <- input$ingresar_kg_dia
     req(!is.null(info$dia))
+    usr <- usuario_autenticado_rv()
+    if (!is.null(usr) && usr$rol == "Visualizador") {
+      showNotification("🔒 Tu usuario tiene perfil de Solo Visualización.", type = "warning", duration = 4)
+      return()
+    }
     dia_col <- as.character(info$dia)
     kg_val  <- max(0, suppressWarnings(as.numeric(info$kg)), na.rm = TRUE)
     
@@ -7677,6 +7854,12 @@ server <- function(input, output, session) {
   })
   
   ejecutar_guardado_con_kilos <- function(info_kg = NULL) {
+    usr <- usuario_autenticado_rv()
+    if (!is.null(usr) && usr$rol == "Visualizador") {
+      showNotification("🔒 Tu usuario tiene perfil de Solo Visualización. No se pueden guardar cambios.", type = "warning", duration = 4)
+      session$sendCustomMessage("ocultar_loader", list())
+      return()
+    }
     session$sendCustomMessage("mostrar_loader", list(
       titulo = "Guardando Ruta...",
       subtitulo = "Sincronizando con Google Sheets y Disco"
@@ -7966,7 +8149,7 @@ server <- function(input, output, session) {
     mods_disp <- sort(unique(na.omit(as.character(df_u$Módulo))))
     mods_disp <- mods_disp[order(suppressWarnings(as.numeric(mods_disp)))]
     usr_f <- isolate(usuario_autenticado_rv())
-    if (!is.null(usr_f) && usr_f$rol != "Administrador") {
+    if (!is.null(usr_f) && usr_f$rol == "Sectorista") {
       mods_disp <- intersect(mods_disp, as.character(unlist(usr_f$modulos)))
     }
     sel_prev <- isolate(input$filtro_modulo)
@@ -8057,9 +8240,9 @@ server <- function(input, output, session) {
     if (!is.null(input$filtro_variedad) && length(input$filtro_variedad) > 0) {
       df_res <- df_res %>% filter(as.character(Variedad) %in% as.character(input$filtro_variedad))
     }
-    # Restricción obligatoria para usuarios no administradores: solo sus módulos asignados
+    # Restricción obligatoria para sectoristas: solo sus módulos asignados
     usr_c <- usuario_autenticado_rv()
-    if (!is.null(usr_c) && usr_c$rol != "Administrador") {
+    if (!is.null(usr_c) && usr_c$rol == "Sectorista") {
       df_res <- df_res %>% filter(suppressWarnings(as.numeric(Módulo)) %in% as.numeric(unlist(usr_c$modulos)))
     }
     df_res
@@ -8119,7 +8302,7 @@ server <- function(input, output, session) {
   
   observe({
     usr_m <- usuario_autenticado_rv()
-    es_restringido <- !is.null(usr_m) && usr_m$rol != "Administrador"
+    es_restringido <- !is.null(usr_m) && usr_m$rol == "Sectorista"
     hay_filtro <- es_restringido ||
       (!is.null(input$filtro_grupo) && length(input$filtro_grupo) > 0) ||
       (!is.null(input$filtro_modulo) && length(input$filtro_modulo) > 0) ||
@@ -8206,6 +8389,11 @@ server <- function(input, output, session) {
   
   # Limpiar exclusivamente el DÍA ACTIVO dentro del filtro activo
   observeEvent(input$btn_confirmar_limpiar_dia, {
+    usr <- usuario_autenticado_rv()
+    if (!is.null(usr) && usr$rol == "Visualizador") {
+      showNotification("🔒 Tu usuario tiene perfil de Solo Visualización.", type = "warning", duration = 4)
+      return()
+    }
     info <- input$btn_confirmar_limpiar_dia
     req(info$dia_key, info$dia_nombre)
     dia_k <- as.character(info$dia_key)
@@ -8252,6 +8440,11 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$btn_confirmar_limpiar, {
+    usr <- usuario_autenticado_rv()
+    if (!is.null(usr) && usr$rol == "Visualizador") {
+      showNotification("🔒 Tu usuario tiene perfil de Solo Visualización.", type = "warning", duration = 4)
+      return()
+    }
     m_val <- modo_activo()
     if (m_val == "CosechaOficial") {
       showNotification("🔒 No se puede reiniciar la Cosecha Oficial (datos oficiales de packing).", type = "warning", duration = 4)
