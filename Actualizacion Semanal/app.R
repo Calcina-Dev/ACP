@@ -50,6 +50,34 @@ orden_semana_campana <- function(sem) {
   ifelse(!is.na(sem_num) & sem_num < 20, sem_num + 53, sem_num)
 }
 
+# Función para asignar colores y texto a las celdas del heatmap de frecuencia (estilo Emil Kowalski)
+color_frecuencia <- function(val) {
+  if (is.null(val) || length(val) == 0 || is.na(val[1]) || !is.finite(val[1])) {
+    return(list(bg = "#F4F4F6", text = "#C7C7CC", str = "-"))
+  }
+  
+  v_num <- suppressWarnings(as.numeric(val[1]))
+  if (is.na(v_num) || !is.finite(v_num)) {
+    return(list(bg = "#F4F4F6", text = "#C7C7CC", str = "-"))
+  }
+  
+  # Clamping estricto de ratio entre 0.0 y 1.0 para evitar NAs en colorRamp
+  ratio <- pmax(0.0, pmin(1.0, (v_num - 3.0) / 4.0))
+  
+  col_func <- colorRamp(c("#C2E7C7", "#D5E593", "#E3D17A", "#DA9B5F", "#BF6A3B"))
+  rgb_mat  <- col_func(ratio)
+  
+  bg_hex <- if (any(is.na(rgb_mat))) {
+    "#BF6A3B"
+  } else {
+    rgb(rgb_mat[1, 1], rgb_mat[1, 2], rgb_mat[1, 3], maxColorValue = 255)
+  }
+  
+  text_col <- if (v_num >= 6.4) "#FFFFFF" else "#1C1C1E"
+  
+  list(bg = bg_hex, text = text_col, str = sprintf("%.1f", v_num))
+}
+
 # Definir la ruta raíz de Arándano
 ruta_raiz_arandano <- "G:/Unidades compartidas/Compartido Proyecciones/3.- Arándano"
 
@@ -170,12 +198,45 @@ guardar_ediciones_disco <- function(df_ediciones) {
   return(guardado)
 }
 
-# Rutas y funciones para persistencia de Frecuencias de Cosecha por Variedad
-ruta_frecuencias_principal <- file.path(ruta_raiz_arandano, "frecuencias_variedad_cosecha.rds")
-ruta_frecuencias_nube      <- "frecuencias_variedad_cosecha.rds"
+# Rutas y funciones para persistencia de Frecuencias de Cosecha por Módulo y Variedad
+ruta_frecuencias_principal        <- file.path(ruta_raiz_arandano, "frecuencias_modulo_variedad_cosecha.rds")
+ruta_frecuencias_nube             <- "frecuencias_modulo_variedad_cosecha.rds"
+ruta_frecuencias_legacy_principal <- file.path(ruta_raiz_arandano, "frecuencias_variedad_cosecha.rds")
+ruta_frecuencias_legacy_nube      <- "frecuencias_variedad_cosecha.rds"
+
+ruta_modo_frec_principal <- file.path(ruta_raiz_arandano, "modo_frecuencia_cosecha.rds")
+ruta_modo_frec_nube      <- "modo_frecuencia_cosecha.rds"
+
+id_input_frec_mod <- function(m, v) {
+  mod_clean <- gsub("[^A-Za-z0-9]", "_", trimws(as.character(m)))
+  var_clean <- gsub("[^A-Za-z0-9]", "_", limpiar_variedad(v))
+  paste0("frec_mv_", mod_clean, "_", var_clean)
+}
 
 id_input_frec <- function(v) {
   paste0("frec_var_", gsub("[^A-Z0-9]", "_", limpiar_variedad(v)))
+}
+
+cargar_modo_frecuencia_disco <- function() {
+  m <- NULL
+  if (file.exists(ruta_modo_frec_principal)) {
+    m <- tryCatch(readRDS(ruta_modo_frec_principal), error = function(e) NULL)
+  } else if (file.exists(ruta_modo_frec_nube)) {
+    m <- tryCatch(readRDS(ruta_modo_frec_nube), error = function(e) NULL)
+  }
+  if (!is.null(m) && is.character(m) && length(m) == 1 && m %in% c("automatico", "manual")) {
+    return(m)
+  }
+  return("automatico")
+}
+
+guardar_modo_frecuencia_disco <- function(modo) {
+  if (is.null(modo) || !is.character(modo) || length(modo) != 1) return(FALSE)
+  if (dir.exists(dirname(ruta_modo_frec_principal))) {
+    tryCatch(saveRDS(modo, ruta_modo_frec_principal), error = function(e) NULL)
+  }
+  tryCatch(saveRDS(modo, ruta_modo_frec_nube), error = function(e) NULL)
+  return(TRUE)
 }
 
 desplazar_dia_frecuencia <- function(dia_base_vec, frec_vec, dias_nombres, dia_inicio_idx, dia_inicio_nom, dia_fin_idx = 6L, dia_fin_nom = "Sábado") {
@@ -189,37 +250,76 @@ desplazar_dia_frecuencia <- function(dia_base_vec, frec_vec, dias_nombres, dia_i
   ifelse(!is.na(idx_res) & idx_res > dia_fin_idx, dia_fin_nom, dia_res)
 }
 
-cargar_frecuencias_disco <- function(variedades_default = NULL) {
+cargar_frecuencias_disco <- function(combos_default = NULL) {
   df <- NULL
   if (file.exists(ruta_frecuencias_principal)) {
     df <- tryCatch(readRDS(ruta_frecuencias_principal), error = function(e) NULL)
   } else if (file.exists(ruta_frecuencias_nube)) {
     df <- tryCatch(readRDS(ruta_frecuencias_nube), error = function(e) NULL)
+  } else if (file.exists(ruta_frecuencias_legacy_principal)) {
+    df <- tryCatch(readRDS(ruta_frecuencias_legacy_principal), error = function(e) NULL)
+  } else if (file.exists(ruta_frecuencias_legacy_nube)) {
+    df <- tryCatch(readRDS(ruta_frecuencias_legacy_nube), error = function(e) NULL)
   }
-  vars_base <- if (!is.null(variedades_default) && length(variedades_default) > 0) {
-    sort(unique(limpiar_variedad(variedades_default)))
-  } else if (exists("df_valvulas") && is.data.frame(df_valvulas) && "Variedad" %in% names(df_valvulas)) {
-    sort(unique(limpiar_variedad(df_valvulas$Variedad)))
+  
+  combos_base <- if (!is.null(combos_default) && is.data.frame(combos_default) && nrow(combos_default) > 0) {
+    combos_default %>% distinct(Módulo = trimws(as.character(Módulo)), Variedad = limpiar_variedad(Variedad))
+  } else if (exists("df_valvulas") && is.data.frame(df_valvulas) && all(c("Módulo", "Variedad") %in% names(df_valvulas))) {
+    df_valvulas %>%
+      mutate(
+        Turno_num = suppressWarnings(as.numeric(Turno)),
+        Módulo_c = case_when(
+          Módulo %in% c("13.1", "13.2") ~ "13",
+          Módulo %in% c("14.1", "14.2") ~ "14",
+          Módulo == "9" & between(Turno_num, 1, 11)  ~ "9.2",
+          Módulo == "9" & Turno_num >= 12            ~ "9.1",
+          Módulo == "11" & between(Turno_num, 1, 12) ~ "11.1",
+          Módulo == "11" & Turno_num >= 13           ~ "11.2",
+          TRUE                                       ~ trimws(as.character(Módulo))
+        ),
+        Variedad_c = limpiar_variedad(Variedad)
+      ) %>%
+      filter(!is.na(Módulo_c), nzchar(Módulo_c), !is.na(Variedad_c), nzchar(Variedad_c)) %>%
+      distinct(Módulo = Módulo_c, Variedad = Variedad_c)
   } else {
-    c("ATLAS BLUE", "BILOXI", "IMPERIAL", "MADEIRA", "MAGICA", "MALIBU", "MANILA", "MILAGROS", "ROCIO", "SEKOYA BEAUTY", "SEKOYA POP", "VENTURA")
+    tibble(
+      Módulo   = c("13", "14", "6", "8", "10"),
+      Variedad = c("ROCIO", "ROCIO", "MAGICA", "BILOXI", "MADEIRA")
+    )
   }
-  vars_base <- vars_base[!is.na(vars_base) & nzchar(vars_base)]
-  df_def <- tibble(
-    Variedad        = vars_base,
-    Frecuencia_Dias = ifelse(vars_base == "ROCIO", 3L, 7L)
-  )
-  if (!is.null(df) && is.data.frame(df) && all(c("Variedad", "Frecuencia_Dias") %in% names(df))) {
+  
+  df_def <- combos_base %>%
+    mutate(
+      Frecuencia_Dias = ifelse(Variedad == "ROCIO", 3L, 7L)
+    )
+  
+  if (!is.null(df) && is.data.frame(df) && all(c("Módulo", "Variedad", "Frecuencia_Dias") %in% names(df))) {
+    df_clean <- df %>%
+      mutate(
+        Módulo          = trimws(as.character(Módulo)),
+        Variedad        = limpiar_variedad(Variedad),
+        Frecuencia_Dias = suppressWarnings(as.integer(Frecuencia_Dias))
+      ) %>%
+      filter(!is.na(Módulo), nzchar(Módulo), !is.na(Variedad), nzchar(Variedad), !is.na(Frecuencia_Dias), Frecuencia_Dias >= 1L, Frecuencia_Dias <= 21L) %>%
+      distinct(Módulo, Variedad, .keep_all = TRUE)
+      
+    df_def <- df_def %>%
+      left_join(df_clean, by = c("Módulo", "Variedad"), suffix = c("_def", "")) %>%
+      mutate(Frecuencia_Dias = coalesce(Frecuencia_Dias, Frecuencia_Dias_def)) %>%
+      select(Módulo, Variedad, Frecuencia_Dias)
+  } else if (!is.null(df) && is.data.frame(df) && all(c("Variedad", "Frecuencia_Dias") %in% names(df))) {
     df_clean <- df %>%
       mutate(
         Variedad        = limpiar_variedad(Variedad),
         Frecuencia_Dias = suppressWarnings(as.integer(Frecuencia_Dias))
       ) %>%
-      filter(!is.na(Variedad), nzchar(Variedad), !is.na(Frecuencia_Dias), Frecuencia_Dias >= 1L, Frecuencia_Dias <= 21L) %>%
+      filter(!is.na(Variedad), nzchar(Variedad), !is.na(Frecuencia_Dias)) %>%
       distinct(Variedad, .keep_all = TRUE)
+      
     df_def <- df_def %>%
       left_join(df_clean, by = "Variedad", suffix = c("_def", "")) %>%
       mutate(Frecuencia_Dias = coalesce(Frecuencia_Dias, Frecuencia_Dias_def)) %>%
-      select(Variedad, Frecuencia_Dias)
+      select(Módulo, Variedad, Frecuencia_Dias)
   }
   return(df_def)
 }
@@ -231,6 +331,119 @@ guardar_frecuencias_disco <- function(df_frec) {
   }
   tryCatch(saveRDS(df_frec, ruta_frecuencias_nube), error = function(e) NULL)
   return(TRUE)
+}
+
+# Algoritmo para calcular frecuencias medianas observadas de campo por Módulo y Variedad
+calcular_frecuencias_historicas_mv <- function(df_w_data, df_c_data, combos_mv_target, camp_sel = 2026) {
+  all_ev <- NULL
+  if (!is.null(df_w_data) && is.data.frame(df_w_data) && nrow(df_w_data) > 0 && "Codigo_Valv" %in% names(df_w_data)) {
+    dias_cols <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
+    dias_map  <- setNames(1:6, dias_cols)
+    df_w_sub  <- df_w_data %>% filter(!is.na(Codigo_Valv), nzchar(as.character(Codigo_Valv)))
+    
+    events_list <- list()
+    for (d in dias_cols) {
+      kg_col <- paste0("Kg_", d)
+      if (kg_col %in% names(df_w_sub)) {
+        sub_d <- df_w_sub %>%
+          filter(!is.na(.data[[kg_col]]), .data[[kg_col]] > 0) %>%
+          select(Semana, Módulo = Módulo_Norm, Turno = Turno_Norm, Variedad, Codigo_Valv, Kg = all_of(kg_col)) %>%
+          mutate(Dia_Num = dias_map[d], Dia_Abs = (as.numeric(Semana) - 1) * 7 + dias_map[d])
+        events_list[[d]] <- sub_d
+      }
+    }
+    if (length(events_list) > 0) {
+      all_ev <- bind_rows(events_list) %>% arrange(Codigo_Valv, Dia_Abs)
+      all_ev <- all_ev %>%
+        group_by(Codigo_Valv) %>%
+        mutate(diff_days = Dia_Abs - lag(Dia_Abs)) %>%
+        ungroup() %>%
+        filter(!is.na(diff_days), diff_days >= 1, diff_days <= 35)
+    }
+  }
+  
+  if (is.null(all_ev) || nrow(all_ev) == 0) {
+    if (!is.null(df_c_data) && is.data.frame(df_c_data) && nrow(df_c_data) > 0) {
+      df_c_sub <- df_c_data %>%
+        filter(
+          as.character(Campaña) == as.character(camp_sel) | Campaña == suppressWarnings(as.numeric(camp_sel)),
+          coalesce(`Kg Total`, 0) > 0,
+          coalesce(Es_Testblock, "NO") != "SI"
+        ) %>%
+        mutate(
+          Fecha_d    = as.Date(Fecha),
+          Semana_n   = as.numeric(Semana),
+          Módulo_c   = as.character(Módulo),
+          Turno_c    = as.character(Turno),
+          Valvula_c  = as.character(Válvula),
+          Variedad_c = limpiar_variedad(Variedad)
+        )
+      if (nrow(df_c_sub) > 0) {
+        valv_ev <- df_c_sub %>%
+          group_by(Módulo_c, Turno_c, Valvula_c, Variedad_c, Fecha_d, Semana_n) %>%
+          summarise(Kg = sum(`Kg Total`, na.rm = TRUE), .groups = "drop") %>%
+          arrange(Módulo_c, Turno_c, Valvula_c, Fecha_d) %>%
+          group_by(Módulo_c, Turno_c, Valvula_c, Variedad_c) %>%
+          mutate(diff_days = as.numeric(Fecha_d - lag(Fecha_d))) %>%
+          ungroup() %>%
+          filter(!is.na(diff_days), diff_days >= 1, diff_days <= 35)
+        
+        all_ev <- valv_ev %>%
+          select(Semana = Semana_n, Módulo = Módulo_c, Turno = Turno_c, Variedad = Variedad_c, diff_days, Kg)
+      }
+    }
+  }
+  
+  if (is.null(all_ev) || nrow(all_ev) == 0) {
+    return(combos_mv_target %>% mutate(Frecuencia_Dias = ifelse(Variedad == "ROCIO", 3L, 7L)))
+  }
+  
+  all_ev <- all_ev %>%
+    mutate(
+      Turno_num = suppressWarnings(as.numeric(Turno)),
+      Módulo_c = case_when(
+        as.character(Módulo) %in% c("13.1", "13.2") ~ "13",
+        as.character(Módulo) %in% c("14.1", "14.2") ~ "14",
+        as.character(Módulo) == "9" & between(Turno_num, 1, 11)  ~ "9.2",
+        as.character(Módulo) == "9" & Turno_num >= 12            ~ "9.1",
+        as.character(Módulo) == "11" & between(Turno_num, 1, 12) ~ "11.1",
+        as.character(Módulo) == "11" & Turno_num >= 13           ~ "11.2",
+        TRUE                                                     ~ trimws(as.character(Módulo))
+      ),
+      Variedad_c = limpiar_variedad(Variedad),
+      Semana_num = suppressWarnings(as.numeric(Semana))
+    )
+  
+  max_s <- max(all_ev$Semana_num, na.rm = TRUE)
+  if (is.na(max_s) || max_s <= 0) max_s <- 44
+  
+  frec_mv_hist <- all_ev %>%
+    filter(Semana_num >= (max_s - 3)) %>%
+    group_by(Módulo = Módulo_c, Variedad = Variedad_c) %>%
+    summarise(
+      Frec_Med = round(median(diff_days)),
+      .groups  = "drop"
+    )
+  
+  frec_v_fallback <- all_ev %>%
+    filter(Semana_num >= (max_s - 3)) %>%
+    group_by(Variedad = Variedad_c) %>%
+    summarise(
+      Frec_Var_Med = round(median(diff_days)),
+      .groups      = "drop"
+    )
+  
+  combos_mv_target %>%
+    left_join(frec_mv_hist, by = c("Módulo", "Variedad")) %>%
+    left_join(frec_v_fallback, by = "Variedad") %>%
+    mutate(
+      Frecuencia_Dias = pmin(15L, pmax(1L, as.integer(coalesce(
+        Frec_Med,
+        Frec_Var_Med,
+        ifelse(Variedad == "ROCIO", 3, 7)
+      ))))
+    ) %>%
+    select(Módulo, Variedad, Frecuencia_Dias)
 }
 
 ruta_pct_rocio_principal <- file.path(Sys.getenv("USERPROFILE"), "Desktop", "porcentajes_rocio_modulo.rds")
@@ -2810,6 +3023,349 @@ ui <- fluidPage(
         transition: all 0.2s ease !important;
       }
       .btn-refresh-sap:hover {
+        background-color: rgba(0, 122, 255, 0.20) !important;
+      }
+
+      /* =========================================================================
+         EMIL KOWALSKI 3-DOTS ACTION DROPDOWN
+         ========================================================================= */
+      .more-options-dropdown-wrapper {
+        position: relative;
+        display: inline-block;
+      }
+
+      .btn-more-options {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 38px;
+        height: 38px;
+        box-sizing: border-box;
+        border-radius: 10px;
+        background: #F2F2F7;
+        color: #1C1C1E;
+        border: 1px solid rgba(0, 0, 0, 0.10);
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+        transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+        cursor: pointer;
+        padding: 0;
+      }
+
+      .btn-more-options:hover, .btn-more-options:focus {
+        background: #E5E5EA !important;
+        color: #007AFF !important;
+        border-color: rgba(0, 122, 255, 0.30) !important;
+        transform: translateY(-1px);
+        box-shadow: 0 3px 8px rgba(0, 0, 0, 0.08) !important;
+        outline: none !important;
+      }
+
+      .btn-more-options.open {
+        background: rgba(0, 122, 255, 0.10) !important;
+        color: #007AFF !important;
+        border-color: rgba(0, 122, 255, 0.35) !important;
+      }
+
+      .btn-more-options i {
+        font-size: 15px;
+        color: #636366;
+        transition: transform 0.2s ease, color 0.18s ease;
+      }
+
+      .btn-more-options:hover i, .btn-more-options.open i {
+        color: #007AFF;
+      }
+
+      .more-options-menu {
+        display: none;
+        position: absolute;
+        top: calc(100% + 8px);
+        right: 0;
+        width: 285px;
+        background: rgba(255, 255, 255, 0.96);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border-radius: 14px;
+        border: 1px solid rgba(0, 0, 0, 0.09);
+        box-shadow: 0 16px 36px -8px rgba(0, 0, 0, 0.14), 0 4px 14px -2px rgba(0, 0, 0, 0.06);
+        padding: 6px;
+        z-index: 2100;
+        user-select: none;
+      }
+
+      .more-options-menu.show {
+        display: block;
+        animation: fadeInMoreOptions 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+      }
+
+      @keyframes fadeInMoreOptions {
+        from { opacity: 0; transform: translateY(-6px) scale(0.98); }
+        to { opacity: 1; transform: translateY(0) scale(1); }
+      }
+
+      .more-options-header {
+        padding: 8px 10px 4px 10px;
+        font-size: 10px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        color: #8E8E93;
+      }
+
+      .more-options-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .more-options-divider {
+        height: 1px;
+        background: rgba(0, 0, 0, 0.06);
+        margin: 4px 6px;
+      }
+
+      .more-options-item-btn {
+        display: flex !important;
+        align-items: center !important;
+        gap: 10px !important;
+        width: 100% !important;
+        text-align: left !important;
+        padding: 8px 10px !important;
+        background: transparent !important;
+        border: none !important;
+        border-radius: 9px !important;
+        color: #1C1C1E !important;
+        text-decoration: none !important;
+        cursor: pointer !important;
+        box-shadow: none !important;
+        box-sizing: border-box !important;
+        transition: background 0.15s ease, transform 0.1s ease !important;
+      }
+
+      .more-options-item-btn:hover {
+        background: #F2F2F7 !important;
+        color: #1C1C1E !important;
+        text-decoration: none !important;
+      }
+
+      .more-options-item-btn:active {
+        transform: scale(0.98) !important;
+        background: #E5E5EA !important;
+      }
+
+      .menu-item-icon {
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+
+      .menu-item-icon i {
+        font-size: 13px;
+      }
+
+      .menu-item-icon.icon-excel {
+        background: rgba(52, 199, 89, 0.12);
+        color: #34C759;
+      }
+
+      .menu-item-icon.icon-gear {
+        background: rgba(0, 122, 255, 0.12);
+        color: #007AFF;
+      }
+
+      .menu-item-icon.icon-sliders {
+        background: rgba(175, 82, 222, 0.12);
+        color: #AF52DE;
+      }
+
+      .menu-item-icon.icon-hourglass {
+        background: rgba(255, 149, 0, 0.12);
+        color: #FF9500;
+      }
+
+      .menu-item-content {
+        display: flex;
+        flex-direction: column;
+        line-height: 1.25;
+      }
+
+      .menu-item-title {
+        font-size: 12.5px;
+        font-weight: 600;
+        color: #1C1C1E;
+      }
+
+      .menu-item-desc {
+        font-size: 10.5px;
+        font-weight: 400;
+        color: #8E8E93;
+      }
+
+      /* =========================================================================
+         FRECUENCIA TAB: CARDS & HEATMAP MATRIX STYLING
+         ========================================================================= */
+      .freq-chart-card {
+        padding: 20px 24px;
+        background: #FFFFFF;
+        border-radius: 16px;
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04);
+      }
+
+      .freq-card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-bottom: 6px;
+      }
+
+      .freq-card-title {
+        font-size: 16px;
+        font-weight: 700;
+        color: #1C1C1E;
+        margin: 0 0 3px 0;
+      }
+
+      .freq-card-subtitle {
+        font-size: 12px;
+        color: #8E8E93;
+        font-weight: 400;
+      }
+
+      .freq-badge-dias, .freq-badge-selecciona {
+        font-size: 11px;
+        font-weight: 600;
+        padding: 4px 12px;
+        border-radius: 20px;
+        background: rgba(52, 199, 89, 0.12);
+        color: #248A3D;
+        white-space: nowrap;
+      }
+
+      .freq-card-hint {
+        text-align: right;
+        font-size: 11px;
+        color: #8E8E93;
+        margin-top: 4px;
+        user-select: none;
+      }
+
+      .freq-heatmap-container {
+        width: 100%;
+        overflow-x: auto;
+        margin-top: 14px;
+        padding-bottom: 6px;
+      }
+
+      .freq-heatmap-table {
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 4px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif;
+      }
+
+      .freq-heatmap-table th {
+        font-size: 11px;
+        font-weight: 600;
+        color: #8E8E93;
+        padding: 6px 4px;
+        text-align: center;
+        white-space: nowrap;
+      }
+
+      .freq-heatmap-table th.col-turno-header {
+        text-align: left;
+        padding-left: 8px;
+        min-width: 130px;
+      }
+
+      .freq-heatmap-row {
+        cursor: pointer;
+        transition: transform 0.1s ease;
+      }
+
+      .freq-heatmap-row:hover .cell-turno-label {
+        color: #007AFF;
+      }
+
+      .freq-heatmap-row.row-selected .cell-turno-label {
+        color: #007AFF;
+        font-weight: 700;
+      }
+
+      .freq-heatmap-row.row-selected .freq-cell {
+        box-shadow: 0 0 0 2px #007AFF;
+      }
+
+      .cell-turno-label {
+        font-size: 12px;
+        font-weight: 600;
+        color: #1C1C1E;
+        padding: 6px 8px;
+        white-space: nowrap;
+        transition: color 0.15s ease;
+      }
+
+      .freq-cell {
+        height: 28px;
+        min-width: 36px;
+        border-radius: 6px;
+        font-size: 11px;
+        font-weight: 600;
+        text-align: center;
+        vertical-align: middle;
+        line-height: 28px;
+        transition: all 0.15s ease;
+      }
+
+      .freq-cell-empty {
+        background: #F4F4F6;
+        color: #C7C7CC;
+      }
+
+      .freq-heatmap-footer {
+        font-size: 11px;
+        color: #8E8E93;
+        margin-top: 12px;
+      }
+
+      .modo-frec-segmented {
+        display: inline-flex;
+        background: #E5E5EA;
+        padding: 3px;
+        border-radius: 9px;
+        gap: 2px;
+      }
+      .btn-modo-frec-pill {
+        border: none;
+        background: transparent;
+        color: #636366;
+        font-size: 12px;
+        font-weight: 600;
+        padding: 5px 14px;
+        border-radius: 7px;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+      .btn-modo-frec-pill:hover {
+        color: #1C1C1E;
+      }
+      .btn-modo-frec-pill.active-auto {
+        background: #007AFF;
+        color: #FFFFFF;
+        box-shadow: 0 1px 3px rgba(0, 122, 255, 0.28);
+      }
+      .btn-modo-frec-pill.active-manual {
+        background: #34C759;
+        color: #FFFFFF;
+        box-shadow: 0 1px 3px rgba(52, 199, 89, 0.28);
+      }
     ")),
     tags$script(HTML("
       $(document).ready(function() {
@@ -2834,15 +3390,45 @@ ui <- fluidPage(
           e.stopPropagation();
           $('#menu_agrupar_por').toggleClass('show');
           $(this).toggleClass('open');
+          $('#menu_mas_opciones').removeClass('show');
+          $('#btn_toggle_mas_opciones').removeClass('open');
         });
 
         $(document).on('click', '#menu_agrupar_por', function(e) {
           e.stopPropagation();
         });
 
+        $(document).on('click', '#btn_toggle_mas_opciones', function(e) {
+          e.stopPropagation();
+          $('#menu_mas_opciones').toggleClass('show');
+          $(this).toggleClass('open');
+          $('#menu_agrupar_por').removeClass('show');
+          $('#btn_toggle_agrupar').removeClass('open');
+        });
+
+        $(document).on('click', '#menu_mas_opciones', function(e) {
+          if ($(e.target).closest('a, button').length) {
+            setTimeout(function() {
+              $('#menu_mas_opciones').removeClass('show');
+              $('#btn_toggle_mas_opciones').removeClass('open');
+            }, 120);
+          } else {
+            e.stopPropagation();
+          }
+        });
+
         $(document).on('click', function() {
           $('#menu_agrupar_por').removeClass('show');
           $('#btn_toggle_agrupar').removeClass('open');
+          $('#menu_mas_opciones').removeClass('show');
+          $('#btn_toggle_mas_opciones').removeClass('open');
+        });
+
+        $(document).on('click', '.freq-heatmap-row', function() {
+          var turnoKey = $(this).data('turno-key');
+          if (window.Shiny && Shiny.setInputValue) {
+            Shiny.setInputValue('frecuencia_turno_click', turnoKey, { priority: 'event' });
+          }
         });
 
         $(document).on('change', '.chk-agrupar-item', function(e) {
@@ -3035,7 +3621,7 @@ ui <- fluidPage(
                           ),
                           tags$label(
                             class = "agrupar-switch-row",
-                            div(class = "agrupar-dim-info", icon("faucet-drip"), tags$span("Válvula"), span(style = "font-size: 9px; font-weight: 700; color: #AF52DE; background: rgba(175, 82, 222, 0.12); padding: 2px 6px; border-radius: 6px; margin-left: 6px;", "Conteo")),
+                            div(class = "agrupar-dim-info", icon("faucet-drip"), tags$span("Válvula"), span(style = "font-size: 9px; font-weight: 700; color: #0E7A68; background: rgba(14, 122, 104, 0.12); padding: 2px 6px; border-radius: 6px; margin-left: 6px;", "Conteo / Frecuencia")),
                             tags$input(type = "checkbox", class = "chk-agrupar-item", value = "Válvula"),
                             tags$span(class = "ios-switch-toggle")
                           ),
@@ -3054,32 +3640,72 @@ ui <- fluidPage(
                       )
                   )
               ),
-              # Descargar Excel (al costado de Agrupar por)
-              downloadButton(
-                "btn_descarga_excel",
-                "Descargar Excel",
-                class = "btn-descargar-excel",
-                icon = icon("file-excel")
-              ),
-              actionButton(
-                "btn_abrir_modal_frecuencias",
-                label = tagList(icon("gear"), tags$span("Frecuencias")),
-                title = "Configurar frecuencias de cosecha por variedad",
-                class = "btn-config-frecuencias"
-              ),
-              # % 2ª Pasada Rocío por Módulo
-              actionButton(
-                "btn_abrir_modal_pct_rocio",
-                label = tagList(icon("sliders"), tags$span("% 2ª Pasada")),
-                title = "Configurar % de 2ª pasada de Rocío por módulo (Lunes y Martes)",
-                class = "btn-config-frecuencias"
-              ),
-              # Maduración por Módulo y Variedad
-              actionButton(
-                "btn_abrir_modal_maduracion",
-                label = tagList(icon("hourglass-half"), tags$span("Maduración")),
-                title = "Configurar días de maduración por módulo y variedad",
-                class = "btn-config-frecuencias"
+              # Menú Desplegable "Más Opciones" estilo Emil Kowalski
+              div(class = "more-options-dropdown-wrapper",
+                  tags$button(
+                    id = "btn_toggle_mas_opciones",
+                    type = "button",
+                    class = "btn-more-options",
+                    title = "Más opciones y configuraciones",
+                    icon("ellipsis-vertical")
+                  ),
+                  div(id = "menu_mas_opciones",
+                      class = "more-options-menu",
+                      div(class = "more-options-header",
+                          tags$span("Acciones y Configuración")
+                      ),
+                      div(class = "more-options-list",
+                          # 1. Descargar Excel
+                          downloadButton(
+                            "btn_descarga_excel",
+                            label = tagList(
+                              div(class = "menu-item-icon icon-excel", icon("file-excel")),
+                              div(class = "menu-item-content",
+                                  tags$span(class = "menu-item-title", "Descargar Excel"),
+                                  tags$span(class = "menu-item-desc", "Exportar tabla con detalle completo")
+                              )
+                            ),
+                            class = "more-options-item-btn"
+                          ),
+                          div(class = "more-options-divider"),
+                          # 2. Configurar Frecuencias
+                          actionButton(
+                            "btn_abrir_modal_frecuencias",
+                            label = tagList(
+                              div(class = "menu-item-icon icon-gear", icon("gear")),
+                              div(class = "menu-item-content",
+                                  tags$span(class = "menu-item-title", "Frecuencias"),
+                                  tags$span(class = "menu-item-desc", "Modo Auto (por válvula) o Manual (por módulo)")
+                              )
+                            ),
+                            class = "more-options-item-btn"
+                          ),
+                          # 3. % 2ª Pasada Rocío
+                          actionButton(
+                            "btn_abrir_modal_pct_rocio",
+                            label = tagList(
+                              div(class = "menu-item-icon icon-sliders", icon("sliders")),
+                              div(class = "menu-item-content",
+                                  tags$span(class = "menu-item-title", "% 2ª Pasada"),
+                                  tags$span(class = "menu-item-desc", "Reparto Rocío por módulo (Lun/Mar)")
+                              )
+                            ),
+                            class = "more-options-item-btn"
+                          ),
+                          # 4. Maduración
+                          actionButton(
+                            "btn_abrir_modal_maduracion",
+                            label = tagList(
+                              div(class = "menu-item-icon icon-hourglass", icon("hourglass-half")),
+                              div(class = "menu-item-content",
+                                  tags$span(class = "menu-item-title", "Maduración"),
+                                  tags$span(class = "menu-item-desc", "Días de maduración por módulo y variedad")
+                              )
+                            ),
+                            class = "more-options-item-btn"
+                          )
+                      )
+                  )
               )
           ),
           
@@ -3315,6 +3941,46 @@ ui <- fluidPage(
                          ),
                          # Motor Canvas JavaScript incrustado de forma segura
                          tags$script(HTML(paste0("const VALVES_MAPA = ", json_valvulas_mapa, ";\n", codigo_js_mapa_archivo)))
+                     )
+            ),
+            # Pestaña Frecuencia (Evolución por turno & Turnos por semana)
+            tabPanel("Frecuencia",
+                     div(style = "margin-top: 14px; display: flex; flex-direction: column; gap: 20px;",
+                         # TARJETA 1: Evolución por turno
+                         div(class = "ios-card freq-chart-card",
+                             div(class = "freq-card-header",
+                                 div(
+                                   h3(class = "freq-card-title", textOutput("titulo_grafico_frecuencia", inline = TRUE)),
+                                   span(class = "freq-card-subtitle", textOutput("subtitulo_grafico_frecuencia", inline = TRUE))
+                                 ),
+                                 div(class = "freq-badge-dias", "Días entre cosechas")
+                             ),
+                             div(style = "position: relative; margin-top: 8px;",
+                                 plotlyOutput("grafico_frecuencia_turno", height = "390px")
+                             ),
+                             div(class = "freq-card-hint",
+                                 textOutput("ui_hint_grafico_frecuencia", inline = TRUE)
+                             )
+                         ),
+                         
+                         # TARJETA 2: Turnos por semana (Heatmap Matrix)
+                         div(class = "ios-card freq-chart-card",
+                             div(class = "freq-card-header",
+                                 div(
+                                   h3(class = "freq-card-title", textOutput("titulo_tabla_frecuencia", inline = TRUE)),
+                                   span(class = "freq-card-subtitle", "Lee cada fila de izquierda a derecha para seguir el cambio durante la campaña.")
+                                 ),
+                                 div(class = "freq-badge-selecciona",
+                                     uiOutput("ui_badge_filtro_turno", inline = TRUE)
+                                 )
+                             ),
+                             div(class = "freq-heatmap-container",
+                                 uiOutput("tabla_heatmap_frecuencia")
+                             ),
+                             div(class = "freq-heatmap-footer",
+                                 "El color más intenso representa una frecuencia mayor. Las celdas grises no tienen frecuencia registrada."
+                             )
+                         )
                      )
             )
           )
@@ -4730,61 +5396,120 @@ server <- function(input, output, session) {
   })
 
   # ============================================================================== =
-  # MODAL DE CONFIGURACIÓN DE FRECUENCIAS DE COSECHA POR VARIEDAD (DÍAS)
+  # MODAL DE CONFIGURACIÓN DE FRECUENCIAS DE COSECHA POR MÓDULO Y VARIEDAD (DÍAS)
   # ============================================================================== =
-  rv_frecuencias <- reactiveVal(cargar_frecuencias_disco())
+  rv_modo_frecuencia <- reactiveVal(cargar_modo_frecuencia_disco())
+  rv_frecuencias     <- reactiveVal(cargar_frecuencias_disco())
 
-  variedades_activas_frec <- reactive({
+  combinaciones_frecuencias_activas <- reactive({
+    es_campana_act <- if (!is.null(input$filtro_campana)) grepl("2026|^26", as.character(input$filtro_campana)) else TRUE
     u <- universo_base()
-    vars_u <- if (!is.null(u) && nrow(u) > 0 && "Variedad" %in% names(u)) {
-      unique(limpiar_variedad(u$Variedad))
-    } else if (exists("df_valvulas") && is.data.frame(df_valvulas)) {
-      unique(limpiar_variedad(df_valvulas$Variedad))
+    combos <- if (!is.null(u) && nrow(u) > 0 && all(c("Módulo", "Variedad") %in% names(u))) {
+      u %>%
+        mutate(
+          Turno_num = suppressWarnings(as.numeric(Turno)),
+          Módulo_c = case_when(
+            es_campana_act & Módulo %in% c("13.1", "13.2") ~ "13",
+            es_campana_act & Módulo %in% c("14.1", "14.2") ~ "14",
+            Módulo == "9" & between(Turno_num, 1, 11)  ~ "9.2",
+            Módulo == "9" & Turno_num >= 12            ~ "9.1",
+            Módulo == "11" & between(Turno_num, 1, 12) ~ "11.1",
+            Módulo == "11" & Turno_num >= 13           ~ "11.2",
+            TRUE                                       ~ trimws(as.character(Módulo))
+          ),
+          Variedad_c = limpiar_variedad(Variedad)
+        ) %>%
+        filter(!is.na(Módulo_c), nzchar(Módulo_c), !is.na(Variedad_c), nzchar(Variedad_c)) %>%
+        distinct(Módulo = Módulo_c, Variedad = Variedad_c)
+    } else if (exists("df_valvulas") && is.data.frame(df_valvulas) && all(c("Módulo", "Variedad") %in% names(df_valvulas))) {
+      df_valvulas %>%
+        mutate(
+          Turno_num = suppressWarnings(as.numeric(Turno)),
+          Módulo_c = case_when(
+            es_campana_act & Módulo %in% c("13.1", "13.2") ~ "13",
+            es_campana_act & Módulo %in% c("14.1", "14.2") ~ "14",
+            Módulo == "9" & between(Turno_num, 1, 11)  ~ "9.2",
+            Módulo == "9" & Turno_num >= 12            ~ "9.1",
+            Módulo == "11" & between(Turno_num, 1, 12) ~ "11.1",
+            Módulo == "11" & Turno_num >= 13           ~ "11.2",
+            TRUE                                       ~ trimws(as.character(Módulo))
+          ),
+          Variedad_c = limpiar_variedad(Variedad)
+        ) %>%
+        filter(!is.na(Módulo_c), nzchar(Módulo_c), !is.na(Variedad_c), nzchar(Variedad_c)) %>%
+        distinct(Módulo = Módulo_c, Variedad = Variedad_c)
     } else {
-      c("ROCIO", "MAGICA", "VENTURA", "SEKOYA POP", "SEKOYA BEAUTY", "BILOXI", "MADEIRA", "MALIBU", "MANILA", "MILAGROS", "ATLAS BLUE", "IMPERIAL")
+      tibble(Módulo = c("13", "14", "6", "8", "10"), Variedad = c("ROCIO", "ROCIO", "MAGICA", "BILOXI", "MADEIRA"))
     }
-    vars_u <- sort(unique(vars_u[!is.na(vars_u) & nzchar(vars_u)]))
-    if ("ROCIO" %in% vars_u) {
-      vars_u <- c("ROCIO", setdiff(vars_u, "ROCIO"))
-    }
-    vars_u
+    
+    combos %>%
+      arrange(suppressWarnings(as.numeric(sub("^M", "", Módulo))), Módulo, Variedad)
   })
 
-  observeEvent(input$btn_abrir_modal_frecuencias, {
-    vars_mostrar <- variedades_activas_frec()
-    req(length(vars_mostrar) > 0)
+  output$ui_modal_frecuencias_contenido <- renderUI({
+    combos <- combinaciones_frecuencias_activas()
+    req(nrow(combos) > 0)
     df_frec <- rv_frecuencias()
-
-    cards_list <- lapply(vars_mostrar, function(v) {
-      id_in <- id_input_frec(v)
-      idx_m <- match(v, df_frec$Variedad)
-      val_actual <- if (!is.na(idx_m)) df_frec$Frecuencia_Dias[idx_m] else if (v == "ROCIO") 3L else 7L
-
+    if (is.null(df_frec) || nrow(df_frec) == 0) {
+      df_frec <- cargar_frecuencias_disco(combos)
+    }
+    
+    es_auto <- identical(rv_modo_frecuencia(), "automatico")
+    
+    cards_list <- lapply(seq_len(nrow(combos)), function(i) {
+      m <- combos$Módulo[i]
+      v <- combos$Variedad[i]
+      id_in <- id_input_frec_mod(m, v)
+      
+      idx_m <- which(df_frec$Módulo == m & df_frec$Variedad == v)
+      val_actual <- if (length(idx_m) > 0 && !is.na(df_frec$Frecuencia_Dias[idx_m[1]])) {
+        as.integer(df_frec$Frecuencia_Dias[idx_m[1]])
+      } else if (v == "ROCIO") {
+        3L
+      } else {
+        7L
+      }
+      
+      if (!is.null(input[[id_in]])) {
+        val_in <- suppressWarnings(as.integer(input[[id_in]]))
+        if (!is.na(val_in) && val_in >= 1L && val_in <= 15L) {
+          val_actual <- val_in
+        }
+      }
+      
       es_2da   <- (val_actual <= 4L)
-      bg_card  <- if (es_2da) "rgba(0, 122, 255, 0.05)" else "#FFFFFF"
-      brd_card <- if (es_2da) "rgba(0, 122, 255, 0.28)" else "rgba(0, 0, 0, 0.09)"
-      col_txt  <- if (es_2da) "#0056B3" else "#1C1C1E"
-      badge_tx <- if (es_2da) "2ª Pasada" else "Ciclo Semanal"
-      badge_bg <- if (es_2da) "rgba(0, 122, 255, 0.12)" else "rgba(142, 142, 147, 0.12)"
+      col_m    <- if (v == "ROCIO") "#007AFF" else "#5856D6"
+      bg_badge <- if (v == "ROCIO") "rgba(0, 122, 255, 0.10)" else "rgba(88, 86, 214, 0.10)"
+      
+      badge_tx <- if (es_2da) "2ª Pasada (≤ 4d)" else "Ciclo 1 Pasada"
       badge_cl <- if (es_2da) "#007AFF" else "#636366"
-
+      badge_bg <- if (es_2da) "rgba(0, 122, 255, 0.10)" else "rgba(142, 142, 147, 0.12)"
+      
+      card_style <- paste0(
+        "background: #FFFFFF; border: 1.5px solid ",
+        if (es_auto) "rgba(0,0,0,0.06)" else if (es_2da) "rgba(0, 122, 255, 0.30)" else "rgba(0,0,0,0.10)",
+        "; border-radius: 12px; padding: 10px 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.02); display: flex; align-items: center; justify-content: space-between; gap: 10px;",
+        if (es_auto) " opacity: 0.60; pointer-events: none;" else ""
+      )
+      
       div(
-        class = "frec-var-card",
-        style = sprintf(
-          "display: flex; align-items: center; justify-content: space-between; gap: 8px; background: %s; border: 1px solid %s; border-radius: 10px; padding: 8px 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.02);",
-          bg_card, brd_card
-        ),
+        class = "frec-modvar-card",
+        style = card_style,
         div(
-          style = "display: flex; flex-direction: column; gap: 2px; min-width: 0;",
-          tags$span(style = sprintf("font-size: 12px; font-weight: 700; color: %s; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;", col_txt), v),
+          style = "display: flex; flex-direction: column; gap: 3px; min-width: 0;",
+          div(
+            style = "display: flex; align-items: center; gap: 6px; flex-wrap: wrap;",
+            tags$span(style = sprintf("font-size: 11px; font-weight: 700; color: %s; background: %s; padding: 2px 7px; border-radius: 6px;", col_m, bg_badge), paste("Módulo", m)),
+            tags$span(style = "font-size: 12.5px; font-weight: 700; color: #1C1C1E; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;", v)
+          ),
           tags$span(style = sprintf("font-size: 10px; font-weight: 600; color: %s; background: %s; padding: 1px 6px; border-radius: 6px; width: fit-content;", badge_cl, badge_bg), badge_tx)
         ),
-        tags$div(
+        div(
           style = "width: 78px; flex-shrink: 0;",
           selectInput(
             inputId   = id_in,
             label     = NULL,
-            choices   = setNames(1:15, paste0(1:15, " días")),
+            choices   = setNames(1:15, paste0(1:15, " d")),
             selected  = as.character(val_actual),
             selectize = FALSE,
             width     = "78px"
@@ -4792,95 +5517,228 @@ server <- function(input, output, session) {
         )
       )
     })
-
-    showModal(
-      modalDialog(
-        title = div(
+    
+    tagList(
+      # Switch / Selector de modo Automático vs Manual
+      div(
+        style = "background: #F2F2F7; border: 1px solid rgba(0,0,0,0.06); border-radius: 12px; padding: 12px 16px; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;",
+        div(
           style = "display: flex; align-items: center; gap: 10px;",
           div(
-            style = "width: 34px; height: 34px; border-radius: 9px; background: rgba(0, 122, 255, 0.10); color: #007AFF; display: flex; align-items: center; justify-content: center; font-size: 16px;",
-            icon("gear")
+            style = sprintf("width: 34px; height: 34px; border-radius: 9px; background: %s; display: flex; align-items: center; justify-content: center; font-size: 16px; color: #FFFFFF;",
+                            if (es_auto) "#007AFF" else "#34C759"),
+            icon(if (es_auto) "bolt" else "sliders")
           ),
           div(
-            tags$div(style = "font-size: 15px; font-weight: 700; color: #1C1C1E; line-height: 1.2;", "Frecuencia de Cosecha por Variedad"),
-            tags$div(style = "font-size: 11.5px; font-weight: 400; color: #8E8E93; margin-top: 2px;", "Configura los días de intervalo por variedad para el cálculo de Ajustar Semana")
-          )
-        ),
-        size = "l",
-        easyClose = TRUE,
-        div(
-          style = "padding: 4px 2px;",
-          div(
-            style = "background: #F2F2F7; border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; display: flex; flex-wrap: wrap; gap: 14px; align-items: center; font-size: 11.5px; color: #3A3A3C;",
-            span(HTML("<b style='color:#007AFF;'>● ≤ 4 días (ej. ROCIO = 3d):</b> Genera 2ª pasada en la semana (Lun → Jue / Mar → Vie).")),
-            span(HTML("<b style='color:#34C759;'>● ≥ 5 días (ej. 7d):</b> 1 sola pasada semanal según ciclo de la semana previa."))
-          ),
-          div(
-            style = "display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 10px;",
-            cards_list
-          )
-        ),
-        footer = div(
-          style = "display: flex; align-items: center; justify-content: space-between; width: 100%; flex-wrap: wrap; gap: 8px;",
-          actionButton(
-            "btn_reset_frecuencias",
-            label = tagList(icon("rotate-left"), "Restablecer (Rocio 3d / Resto 7d)"),
-            style = "font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 8px; background: #F2F2F7; color: #3A3A3C; border: 1px solid rgba(0,0,0,0.08);"
-          ),
-          div(
-            style = "display: flex; align-items: center; gap: 8px;",
-            modalButton("Cancelar"),
-            actionButton(
-              "btn_guardar_frecuencias",
-              label = tagList(icon("check"), "Guardar Frecuencias"),
-              style = "font-size: 12px; font-weight: 600; padding: 6px 16px; border-radius: 8px; background: #007AFF; color: #FFFFFF; border: none; box-shadow: 0 2px 6px rgba(0, 122, 255, 0.25);"
+            tags$div(style = "font-size: 13px; font-weight: 700; color: #1C1C1E;", 
+                     paste("Modo de Frecuencia:", if (es_auto) "Automático (Por Válvula)" else "Manual (Por Módulo y Variedad)")),
+            tags$div(
+              style = "font-size: 11px; color: #636366; margin-top: 2px;",
+              if (es_auto) "Calcula automáticamente el intervalo real de cada válvula (S-2 vs S-1). Botones e inputs deshabilitados."
+              else "Usa estrictamente las frecuencias configuradas por Módulo y Variedad en este panel."
             )
           )
+        ),
+        div(
+          class = "modo-frec-segmented",
+          actionButton(
+            "btn_switch_modo_auto",
+            label = tagList(icon("bolt"), "Automático"),
+            class = paste0("btn-modo-frec-pill", if (es_auto) " active-auto" else "")
+          ),
+          actionButton(
+            "btn_switch_modo_manual",
+            label = tagList(icon("sliders"), "Manual"),
+            class = paste0("btn-modo-frec-pill", if (!es_auto) " active-manual" else "")
+          )
+        )
+      ),
+      
+      # Banner contextual
+      if (es_auto) {
+        div(
+          style = "background: rgba(0, 122, 255, 0.06); border: 1px solid rgba(0, 122, 255, 0.20); border-radius: 10px; padding: 9px 14px; margin-bottom: 12px; font-size: 11.5px; color: #004085; display: flex; align-items: center; gap: 8px;",
+          icon("info-circle"),
+          tags$span("En modo ", tags$b("Automático"), ", el motor de ajuste calcula en tiempo real la frecuencia de cada válvula. Para fijar valores personalizados o cargar del histórico, cambia el switch a ", tags$b("Manual"), ".")
+        )
+      } else {
+        div(
+          style = "background: rgba(52, 199, 89, 0.08); border: 1px solid rgba(52, 199, 89, 0.25); border-radius: 10px; padding: 9px 14px; margin-bottom: 12px; font-size: 11.5px; color: #1B5E20; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;",
+          div(
+            style = "display: flex; align-items: center; gap: 8px;",
+            icon("check-circle"),
+            tags$span("En modo ", tags$b("Manual"), ", el motor aplicará exactamente los días configurados. Puedes usar el botón inferior para ", tags$b("Actualizar en base al histórico"), ".")
+          )
+        )
+      },
+      
+      # Rejilla de tarjetas por Módulo y Variedad
+      div(
+        style = "display: grid; grid-template-columns: repeat(auto-fill, minmax(225px, 1fr)); gap: 10px; max-height: 480px; overflow-y: auto; padding-right: 4px;",
+        cards_list
+      )
+    )
+  })
+
+  output$ui_modal_frecuencias_footer <- renderUI({
+    es_auto <- identical(rv_modo_frecuencia(), "automatico")
+    
+    div(
+      style = "display: flex; align-items: center; justify-content: space-between; width: 100%; flex-wrap: wrap; gap: 8px;",
+      div(
+        style = "display: flex; align-items: center; gap: 8px; flex-wrap: wrap;",
+        actionButton(
+          "btn_actualizar_frec_hist",
+          label = tagList(icon("sync-alt"), "Actualizar frecuencias en base al histórico"),
+          title = if (es_auto) "Deshabilitado en modo Automático (cambia el switch a Manual)" else "Calcular mediana real observada en las últimas semanas para cada Módulo y Variedad",
+          disabled = if (es_auto) "disabled" else NULL,
+          style = if (es_auto) {
+            "font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 8px; background: #E5E5EA; color: #8E8E93; border: 1px solid rgba(0,0,0,0.06); cursor: not-allowed; opacity: 0.5;"
+          } else {
+            "font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 8px; background: rgba(0, 122, 255, 0.10); color: #007AFF; border: 1px solid rgba(0, 122, 255, 0.30); cursor: pointer;"
+          }
+        ),
+        actionButton(
+          "btn_reset_frecuencias",
+          label = tagList(icon("rotate-left"), "Restablecer (Rocío 3d / Resto 7d)"),
+          disabled = if (es_auto) "disabled" else NULL,
+          style = if (es_auto) {
+            "font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 8px; background: #F2F2F7; color: #AEAEB2; border: 1px solid rgba(0,0,0,0.05); cursor: not-allowed; opacity: 0.5;"
+          } else {
+            "font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 8px; background: #F2F2F7; color: #3A3A3C; border: 1px solid rgba(0,0,0,0.08); cursor: pointer;"
+          }
+        )
+      ),
+      div(
+        style = "display: flex; align-items: center; gap: 8px;",
+        modalButton("Cerrar"),
+        actionButton(
+          "btn_guardar_frecuencias",
+          label = tagList(icon("check"), "Guardar Frecuencias"),
+          disabled = if (es_auto) "disabled" else NULL,
+          style = if (es_auto) {
+            "font-size: 12px; font-weight: 600; padding: 6px 16px; border-radius: 8px; background: #E5E5EA; color: #8E8E93; border: none; cursor: not-allowed; opacity: 0.5;"
+          } else {
+            "font-size: 12px; font-weight: 600; padding: 6px 16px; border-radius: 8px; background: #34C759; color: #FFFFFF; border: none; box-shadow: 0 2px 6px rgba(52, 199, 89, 0.28); cursor: pointer;"
+          }
         )
       )
     )
   })
 
+  observeEvent(input$btn_abrir_modal_frecuencias, {
+    showModal(
+      modalDialog(
+        title = div(
+          style = "display: flex; align-items: center; justify-content: space-between; width: 100%;",
+          div(
+            style = "display: flex; align-items: center; gap: 10px;",
+            div(
+              style = "width: 36px; height: 36px; border-radius: 10px; background: rgba(0, 122, 255, 0.10); color: #007AFF; display: flex; align-items: center; justify-content: center; font-size: 16px;",
+              icon("sliders")
+            ),
+            div(
+              tags$div(style = "font-size: 15px; font-weight: 700; color: #1C1C1E; line-height: 1.2;", "Frecuencias de Cosecha por Módulo y Variedad"),
+              tags$div(style = "font-size: 11.5px; font-weight: 400; color: #8E8E93; margin-top: 2px;", "Configuración del motor para la distribución de días en Ajustar Semana")
+            )
+          )
+        ),
+        size = "l",
+        easyClose = TRUE,
+        uiOutput("ui_modal_frecuencias_contenido"),
+        footer = uiOutput("ui_modal_frecuencias_footer")
+      )
+    )
+  })
+
+  observeEvent(input$btn_switch_modo_auto, {
+    rv_modo_frecuencia("automatico")
+    guardar_modo_frecuencia_disco("automatico")
+  })
+
+  observeEvent(input$btn_switch_modo_manual, {
+    rv_modo_frecuencia("manual")
+    guardar_modo_frecuencia_disco("manual")
+  })
+
+  observeEvent(input$btn_actualizar_frec_hist, {
+    if (identical(rv_modo_frecuencia(), "automatico")) return()
+    combos <- combinaciones_frecuencias_activas()
+    req(nrow(combos) > 0)
+    
+    withProgress(message = "Analizando histórico de cosecha...", detail = "Calculando medianas por Módulo y Variedad", value = 0.4, {
+      df_sug <- tryCatch({
+        calcular_frecuencias_historicas_mv(
+          df_w_data        = if (exists("df_hist_oficial_wide")) df_hist_oficial_wide else NULL,
+          df_c_data        = rv_cosecha(),
+          combos_mv_target = combos,
+          camp_sel         = input$filtro_campana
+        )
+      }, error = function(e) {
+        cat("[ERROR FREC HISTORICO]", e$message, "\n")
+        NULL
+      })
+      
+      if (!is.null(df_sug) && nrow(df_sug) > 0) {
+        for (i in seq_len(nrow(df_sug))) {
+          m <- df_sug$Módulo[i]
+          v <- df_sug$Variedad[i]
+          f_val <- df_sug$Frecuencia_Dias[i]
+          id_in <- id_input_frec_mod(m, v)
+          updateSelectInput(session, id_in, selected = as.character(f_val))
+        }
+        showNotification("🔄 Frecuencias autocompletadas en base al histórico por Módulo y Variedad. Revisa y pulsa 'Guardar Frecuencias'.", type = "message", duration = 4)
+      } else {
+        showNotification("No se pudieron extraer datos históricos suficientes para calcular frecuencias.", type = "warning", duration = 4)
+      }
+    })
+  })
+
   observeEvent(input$btn_guardar_frecuencias, {
-    vars_todas_cat <- if (exists("df_valvulas") && is.data.frame(df_valvulas)) {
-      sort(unique(limpiar_variedad(df_valvulas$Variedad)))
-    } else {
-      variedades_activas_frec()
-    }
+    if (identical(rv_modo_frecuencia(), "automatico")) return()
+    combos <- combinaciones_frecuencias_activas()
+    req(nrow(combos) > 0)
     df_frec_prev <- rv_frecuencias()
-    nuevas_frec <- tibble(Variedad = vars_todas_cat) %>%
+    
+    df_nuevas <- combos %>%
       mutate(
-        Frecuencia_Dias = vapply(Variedad, function(v) {
-          val_ui <- input[[id_input_frec(v)]]
+        Frecuencia_Dias = vapply(seq_len(n()), function(i) {
+          m <- Módulo[i]
+          v <- Variedad[i]
+          id_in <- id_input_frec_mod(m, v)
+          val_ui <- input[[id_in]]
           val_int <- suppressWarnings(as.integer(val_ui))
-          if (!is.null(val_ui) && length(val_int) == 1 && !is.na(val_int) && val_int >= 1L && val_int <= 21L) {
+          if (!is.null(val_ui) && length(val_int) == 1 && !is.na(val_int) && val_int >= 1L && val_int <= 15L) {
             return(val_int)
           }
-          idx_p <- match(v, df_frec_prev$Variedad)
-          if (!is.na(idx_p)) return(as.integer(df_frec_prev$Frecuencia_Dias[idx_p]))
+          idx_p <- which(df_frec_prev$Módulo == m & df_frec_prev$Variedad == v)
+          if (length(idx_p) > 0 && !is.na(df_frec_prev$Frecuencia_Dias[idx_p[1]])) {
+            return(as.integer(df_frec_prev$Frecuencia_Dias[idx_p[1]]))
+          }
           if (v == "ROCIO") 3L else 7L
         }, integer(1))
       )
-    rv_frecuencias(nuevas_frec)
-    guardar_frecuencias_disco(nuevas_frec)
+    
+    rv_frecuencias(df_nuevas)
+    guardar_frecuencias_disco(df_nuevas)
+    rv_modo_frecuencia("manual")
+    guardar_modo_frecuencia_disco("manual")
     removeModal()
-    showNotification("⚙️ Frecuencias por variedad guardadas correctamente.", type = "message", duration = 3)
+    showNotification("⚙️ Frecuencias guardadas en Modo Manual por Módulo y Variedad.", type = "message", duration = 3)
   })
 
   observeEvent(input$btn_reset_frecuencias, {
-    vars_todas_cat <- if (exists("df_valvulas") && is.data.frame(df_valvulas)) {
-      sort(unique(limpiar_variedad(df_valvulas$Variedad)))
-    } else {
-      variedades_activas_frec()
+    if (identical(rv_modo_frecuencia(), "automatico")) return()
+    combos <- combinaciones_frecuencias_activas()
+    req(nrow(combos) > 0)
+    for (i in seq_len(nrow(combos))) {
+      m <- combos$Módulo[i]
+      v <- combos$Variedad[i]
+      val_def <- if (v == "ROCIO") 3L else 7L
+      id_in <- id_input_frec_mod(m, v)
+      updateSelectInput(session, id_in, selected = as.character(val_def))
     }
-    df_def <- cargar_frecuencias_disco(vars_todas_cat) %>%
-      mutate(Frecuencia_Dias = ifelse(Variedad == "ROCIO", 3L, 7L))
-    rv_frecuencias(df_def)
-    guardar_frecuencias_disco(df_def)
-    for (i in seq_len(nrow(df_def))) {
-      updateSelectInput(session, id_input_frec(df_def$Variedad[i]), selected = as.character(df_def$Frecuencia_Dias[i]))
-    }
-    showNotification("Frecuencias restablecidas: ROCIO = 3 días, demás variedades = 7 días.", type = "message", duration = 3)
+    showNotification("Valores restablecidos a defecto (Rocío = 3d, resto = 7d). Pulsa 'Guardar Frecuencias' para confirmar.", type = "message", duration = 3)
   })
 
   # ============================================================================== =
@@ -5397,29 +6255,12 @@ server <- function(input, output, session) {
     
     dias_ajustables_nom <- dias_nombres[dia_inicio_idx:dia_fin_idx]
     
-    # Leer frecuencias configuradas por variedad en la UI
-    vars_todas_cat <- if (exists("df_valvulas") && is.data.frame(df_valvulas)) {
-      sort(unique(limpiar_variedad(df_valvulas$Variedad)))
-    } else {
-      variedades_activas_frec()
+    # Modo de frecuencia configurado (Automático vs Manual) y tabla de frecuencias
+    modo_frec <- rv_modo_frecuencia()
+    df_frec_mv <- rv_frecuencias()
+    if (is.null(df_frec_mv) || nrow(df_frec_mv) == 0) {
+      df_frec_mv <- cargar_frecuencias_disco()
     }
-    df_frec_prev <- rv_frecuencias()
-    
-    frecuencias_var <- tibble(Variedad = vars_todas_cat) %>%
-      mutate(
-        Frecuencia_Dias = vapply(Variedad, function(v) {
-          val_ui <- input[[id_input_frec(v)]]
-          val_int <- suppressWarnings(as.integer(val_ui))
-          if (!is.null(val_ui) && length(val_int) == 1 && !is.na(val_int) && val_int >= 1L && val_int <= 21L) {
-            return(val_int)
-          }
-          idx_p <- match(v, df_frec_prev$Variedad)
-          if (!is.na(idx_p)) return(as.integer(df_frec_prev$Frecuencia_Dias[idx_p]))
-          if (v == "ROCIO") 3L else 7L
-        }, integer(1))
-      )
-    rv_frecuencias(frecuencias_var)
-    guardar_frecuencias_disco(frecuencias_var)
     
     # Cargar porcentajes de 2da pasada de Rocío configurados por módulo
     df_pct_rocio <- rv_pct_rocio()
@@ -5427,7 +6268,13 @@ server <- function(input, output, session) {
       df_pct_rocio <- cargar_pct_rocio_disco()
     }
     
-    withProgress(message = sprintf("Ajustando semana (%s a %s)...", dia_inicio_nom, dia_fin_nom), detail = "Calculando frecuencias reales de 2 semanas y combinatoria de rendimientos", value = 0.2, {
+    msg_detail_frec <- if (modo_frec == "manual") {
+      "Aplicando frecuencias manuales por Módulo y Variedad"
+    } else {
+      "Calculando frecuencias reales de 2 semanas y combinatoria de rendimientos"
+    }
+    
+    withProgress(message = sprintf("Ajustando semana (%s a %s)...", dia_inicio_nom, dia_fin_nom), detail = msg_detail_frec, value = 0.2, {
       # ====================================================================
       # FRECUENCIAS AUTOMÁTICAS POR VÁLVULA (HISTÓRICO 2 SEMANAS: S-2 vs S-1)
       # ====================================================================
@@ -5683,7 +6530,10 @@ server <- function(input, output, session) {
           Variedad    = limpiar_variedad(Variedad),
           Área        = suppressWarnings(as.numeric(Área))
         ) %>%
-        left_join(frecuencias_var, by = "Variedad") %>%
+        left_join(
+          df_frec_mv %>% select(Módulo, Variedad, Frec_Manual_Dias = Frecuencia_Dias),
+          by = c("Módulo", "Variedad")
+        ) %>%
         left_join(
           if (!is.null(df_frec_valvs_2sem) && nrow(df_frec_valvs_2sem) > 0) {
             df_frec_valvs_2sem %>% select(codigo_norm, Frec_Auto_Dias = Dias_Frecuencia, Dia_Auto_Valv = Dia_Proyectado_Nom)
@@ -5691,7 +6541,12 @@ server <- function(input, output, session) {
           by = "codigo_norm"
         ) %>%
         mutate(
-          Frecuencia_Dias = coalesce(Frec_Auto_Dias, Frecuencia_Dias, ifelse(Variedad == "ROCIO", 3L, 7L))
+          Frecuencia_Dias = if (modo_frec == "manual") {
+            coalesce(as.integer(Frec_Manual_Dias), ifelse(Variedad == "ROCIO", 3L, 7L))
+          } else {
+            coalesce(as.integer(Frec_Auto_Dias), as.integer(Frec_Manual_Dias), ifelse(Variedad == "ROCIO", 3L, 7L))
+          },
+          Dia_Auto_Valv = if (modo_frec == "manual") NA_character_ else Dia_Auto_Valv
         ) %>%
         left_join(
           df_pct_rocio %>%
@@ -7874,6 +8729,471 @@ server <- function(input, output, session) {
     )
     session$sendCustomMessage("actualizar_mapa_semana", payload_mapa)
   }, ignoreInit = FALSE)
+
+  # ==============================================================================
+  # SECCIÓN: FRECUENCIA DE COSECHA (EVOLUCIÓN POR TURNO & TURNOS POR SEMANA)
+  # ==============================================================================
+
+  # Reactive val para turno seleccionado en tabla/gráfico
+  rv_frecuencia_turno_sel <- reactiveVal(NULL)
+
+  # Observer para click en fila de la tabla heatmap
+  observeEvent(input$frecuencia_turno_click, {
+    req(input$frecuencia_turno_click)
+    current_sel <- rv_frecuencia_turno_sel()
+    if (!is.null(current_sel) && identical(current_sel, input$frecuencia_turno_click)) {
+      # Si ya estaba seleccionado, deseleccionar
+      rv_frecuencia_turno_sel(NULL)
+    } else {
+      rv_frecuencia_turno_sel(input$frecuencia_turno_click)
+    }
+  })
+
+  # Observer para limpiar selección desde el badge
+  observeEvent(input$btn_reset_filtro_frec, {
+    rv_frecuencia_turno_sel(NULL)
+  })
+
+  # Limpiar selección al cambiar filtros globales o agrupación
+  observeEvent(list(input$filtro_campana, input$filtro_modulo, input$filtro_grupo, input$filtro_turno, input$filtro_variedad, cols_agrupar()), {
+    rv_frecuencia_turno_sel(NULL)
+  }, ignoreInit = TRUE)
+
+  # Títulos y subtítulos dinámicos según el nivel de agrupación (Turno vs Válvula)
+  output$titulo_grafico_frecuencia <- renderText({
+    if ("Válvula" %in% cols_agrupar()) "Evolución por válvula" else "Evolución por turno"
+  })
+
+  output$subtitulo_grafico_frecuencia <- renderText({
+    if ("Válvula" %in% cols_agrupar()) "Frecuencia semanal de cada válvula seleccionada." else "Frecuencia semanal de cada turno seleccionado."
+  })
+
+  output$titulo_tabla_frecuencia <- renderText({
+    if ("Válvula" %in% cols_agrupar()) "Válvulas por semana" else "Turnos por semana"
+  })
+
+  output$ui_hint_grafico_frecuencia <- renderText({
+    if ("Válvula" %in% cols_agrupar()) "Haz clic en una válvula para aislarla" else "Haz clic en un turno para aislarlo"
+  })
+
+  # Reactive que calcula las frecuencias de cosecha semanales por turno o válvula
+  frecuencia_campana_data <- reactive({
+    camp_sel <- input$filtro_campana
+    req(camp_sel)
+    es_camp_act      <- grepl("2026|^26", as.character(camp_sel))
+    es_nivel_valvula <- "Válvula" %in% cols_agrupar()
+    
+    # 1. Base de datos
+    df_res <- if (es_camp_act && exists("df_hist_oficial_wide", inherits = TRUE) && !is.null(df_hist_oficial_wide)) {
+      dias_cols <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
+      dias_map  <- setNames(1:6, dias_cols)
+      df_w <- df_hist_oficial_wide %>% filter(!is.na(Codigo_Valv), nzchar(as.character(Codigo_Valv)))
+      
+      events_list <- list()
+      for (d in dias_cols) {
+        kg_col <- paste0("Kg_", d)
+        if (kg_col %in% names(df_w)) {
+          sub_d <- df_w %>%
+            filter(!is.na(.data[[kg_col]]), .data[[kg_col]] > 0) %>%
+            select(Semana, Módulo = Módulo_Norm, Turno = Turno_Norm, Variedad, Codigo_Valv, Kg = all_of(kg_col)) %>%
+            mutate(Dia_Num = dias_map[d], Dia_Abs = (as.numeric(Semana) - 1) * 7 + dias_map[d])
+          events_list[[d]] <- sub_d
+        }
+      }
+      all_ev <- bind_rows(events_list) %>% arrange(Codigo_Valv, Dia_Abs)
+      all_ev <- all_ev %>%
+        group_by(Codigo_Valv) %>%
+        mutate(diff_days = Dia_Abs - lag(Dia_Abs)) %>%
+        ungroup() %>%
+        filter(!is.na(diff_days), diff_days >= 1, diff_days <= 35)
+      
+      if (es_nivel_valvula) {
+        all_ev <- all_ev %>%
+          mutate(
+            Valvula_num = suppressWarnings(as.numeric(sub(".*-V0*", "", Codigo_Valv))),
+            Valvula_str = paste0("V", sub(".*-V0*", "", Codigo_Valv))
+          )
+        all_ev %>%
+          group_by(Módulo, Turno, Codigo_Valv, Valvula_num, Valvula_str, Variedad, Semana) %>%
+          summarise(
+            Frecuencia = round(weighted.mean(diff_days, w = Kg), 1),
+            Total_Kg = sum(Kg, na.rm = TRUE),
+            .groups = "drop"
+          )
+      } else {
+        all_ev %>%
+          group_by(Módulo, Turno, Variedad, Semana) %>%
+          summarise(
+            Frecuencia = round(weighted.mean(diff_days, w = Kg), 1),
+            Total_Kg = sum(Kg, na.rm = TRUE),
+            .groups = "drop"
+          )
+      }
+    } else {
+      # Fallback histórico desde df_cosecha
+      df_c <- rv_cosecha() %>%
+        filter(
+          as.character(Campaña) == as.character(camp_sel),
+          coalesce(`Kg Total`, 0) > 0,
+          coalesce(Es_Testblock, "NO") != "SI"
+        ) %>%
+        mutate(
+          Fecha_d    = as.Date(Fecha),
+          Semana_n   = as.numeric(Semana),
+          Módulo_c   = as.character(Módulo),
+          Turno_c    = as.character(Turno),
+          Valvula_c  = as.character(Válvula),
+          Variedad_c = limpiar_variedad(Variedad)
+        )
+      
+      valv_ev <- df_c %>%
+        group_by(Módulo_c, Turno_c, Valvula_c, Variedad_c, Fecha_d, Semana_n) %>%
+        summarise(Kg = sum(`Kg Total`, na.rm = TRUE), .groups = "drop") %>%
+        arrange(Módulo_c, Turno_c, Valvula_c, Fecha_d) %>%
+        group_by(Módulo_c, Turno_c, Valvula_c, Variedad_c) %>%
+        mutate(diff_days = as.numeric(Fecha_d - lag(Fecha_d))) %>%
+        ungroup() %>%
+        filter(!is.na(diff_days), diff_days >= 1, diff_days <= 35)
+      
+      if (es_nivel_valvula) {
+        valv_ev %>%
+          mutate(
+            Valvula_num = suppressWarnings(as.numeric(Valvula_c)),
+            Valvula_str = paste0("V", Valvula_c),
+            Codigo_Valv = paste0("M", Módulo_c, "-T", Turno_c, "-V", Valvula_c)
+          ) %>%
+          group_by(Módulo = Módulo_c, Turno = Turno_c, Codigo_Valv, Valvula_num, Valvula_str, Variedad = Variedad_c, Semana = Semana_n) %>%
+          summarise(
+            Frecuencia = round(weighted.mean(diff_days, w = Kg), 1),
+            Total_Kg = sum(Kg, na.rm = TRUE),
+            .groups = "drop"
+          )
+      } else {
+        valv_ev %>%
+          group_by(Módulo = Módulo_c, Turno = Turno_c, Variedad = Variedad_c, Semana = Semana_n) %>%
+          summarise(
+            Frecuencia = round(weighted.mean(diff_days, w = Kg), 1),
+            Total_Kg = sum(Kg, na.rm = TRUE),
+            .groups = "drop"
+          )
+      }
+    }
+    
+    if (nrow(df_res) == 0) return(df_res)
+    
+    # Normalizar turnos y submódulos (ej. 13.1 vs 13.2)
+    df_res <- df_res %>%
+      mutate(
+        Turno_Num  = suppressWarnings(as.numeric(Turno)),
+        Modulo_Disp = case_when(
+          as.character(Módulo) == "13" & between(Turno_Num, 1, 9)  ~ "13.1",
+          as.character(Módulo) == "13" & Turno_Num >= 10           ~ "13.2",
+          as.character(Módulo) == "14" & between(Turno_Num, 1, 8)  ~ "14.1",
+          as.character(Módulo) == "14" & Turno_Num >= 9            ~ "14.2",
+          as.character(Módulo) == "9"  & between(Turno_Num, 1, 11) ~ "9.2",
+          as.character(Módulo) == "9"  & Turno_Num >= 12           ~ "9.1",
+          as.character(Módulo) == "11" & between(Turno_Num, 1, 12) ~ "11.1",
+          as.character(Módulo) == "11" & Turno_Num >= 13          ~ "11.2",
+          TRUE                                                     ~ as.character(Módulo)
+        ),
+        Turno_Key   = if (es_nivel_valvula) {
+          paste0("M", Modulo_Disp, " · T", Turno, " · ", Valvula_str)
+        } else {
+          paste0("M", Modulo_Disp, " · T", Turno)
+        },
+        Variedad_c  = limpiar_variedad(Variedad),
+        Serie_Label = if (es_nivel_valvula) {
+          paste0("M", Modulo_Disp, " · T", Turno, " · ", Valvula_str, " · ", Variedad_c)
+        } else {
+          paste0("M", Modulo_Disp, " · T", Turno, " · ", Variedad_c)
+        },
+        Semana_Num  = as.numeric(Semana)
+      )
+    
+    # 2. Aplicar filtros globales de la aplicación
+    # Filtro Grupo
+    if (!is.null(input$filtro_grupo) && length(input$filtro_grupo) > 0) {
+      mods_grupo <- as.character(unlist(grupos_modulos[input$filtro_grupo], use.names = FALSE))
+      df_res <- df_res %>%
+        filter(as.character(Módulo) %in% mods_grupo | sub("\\..*", "", as.character(Módulo)) %in% mods_grupo |
+               Modulo_Disp %in% mods_grupo | sub("\\..*", "", Modulo_Disp) %in% mods_grupo)
+    }
+    
+    # Filtro Módulo
+    if (!is.null(input$filtro_modulo) && length(input$filtro_modulo) > 0) {
+      df_res <- df_res %>%
+        filter(as.character(Módulo) %in% as.character(input$filtro_modulo) |
+               sub("\\..*", "", as.character(Módulo)) %in% sub("\\..*", "", as.character(input$filtro_modulo)) |
+               Modulo_Disp %in% as.character(input$filtro_modulo) |
+               sub("\\..*", "", Modulo_Disp) %in% sub("\\..*", "", as.character(input$filtro_modulo)))
+    }
+    
+    # Filtro Turno
+    if (!is.null(input$filtro_turno) && length(input$filtro_turno) > 0) {
+      df_res <- df_res %>%
+        filter(as.character(Turno) %in% as.character(input$filtro_turno))
+    }
+    
+    # Filtro Variedad
+    if (!is.null(input$filtro_variedad) && length(input$filtro_variedad) > 0) {
+      df_res <- df_res %>%
+        filter(limpiar_variedad(Variedad) %in% limpiar_variedad(input$filtro_variedad))
+    }
+    
+    df_res
+  })
+
+  # Badge de selección para la tarjeta de tabla heatmap
+  output$ui_badge_filtro_turno <- renderUI({
+    sel <- rv_frecuencia_turno_sel()
+    if (!is.null(sel) && nzchar(sel)) {
+      tagList(
+        span(style = "font-weight: 700; color: #007AFF;", paste("Filtrado:", sel)),
+        actionLink(
+          "btn_reset_filtro_frec",
+          label = "✕ Limpiar",
+          style = "margin-left: 8px; color: #FF3B30; font-weight: 700; text-decoration: none; cursor: pointer; font-size: 11px;"
+        )
+      )
+    } else {
+      "Selecciona una fila"
+    }
+  })
+
+  # Gráfico Plotly: Evolución por turno o válvula
+  output$grafico_frecuencia_turno <- renderPlotly({
+    df_freq <- frecuencia_campana_data()
+    
+    if (is.null(df_freq) || nrow(df_freq) == 0) {
+      return(
+        plot_ly() %>%
+          layout(
+            title = list(text = "Sin datos de frecuencia para los filtros seleccionados", font = list(size = 13, color = "#8E8E93")),
+            xaxis = list(visible = FALSE),
+            yaxis = list(visible = FALSE),
+            paper_bgcolor = "#FFFFFF",
+            plot_bgcolor = "#FFFFFF"
+          )
+      )
+    }
+    
+    turno_sel        <- rv_frecuencia_turno_sel()
+    es_nivel_valvula <- "Válvula" %in% cols_agrupar()
+    
+    # Determinar rango de semanas ordenado cronológicamente
+    sems_camp <- sort(unique(df_freq$Semana_Num))
+    sems_camp <- sems_camp[order(orden_semana_campana(sems_camp))]
+    
+    # Lista de series únicas ordenadas por submódulo, turno y válvula (si aplica)
+    series_u <- if (es_nivel_valvula && "Valvula_num" %in% names(df_freq)) {
+      df_freq %>%
+        distinct(Turno_Key, Modulo_Disp, Turno_Num, Valvula_num, Serie_Label) %>%
+        mutate(
+          ord_mod = suppressWarnings(as.numeric(sub("^M", "", Modulo_Disp))),
+          ord_tur = coalesce(Turno_Num, 0),
+          ord_val = coalesce(Valvula_num, 0)
+        ) %>%
+        arrange(ord_mod, Modulo_Disp, ord_tur, ord_val)
+    } else {
+      df_freq %>%
+        distinct(Turno_Key, Modulo_Disp, Turno_Num, Serie_Label) %>%
+        mutate(
+          ord_mod = suppressWarnings(as.numeric(sub("^M", "", Modulo_Disp))),
+          ord_tur = coalesce(Turno_Num, 0)
+        ) %>%
+        arrange(ord_mod, Modulo_Disp, ord_tur)
+    }
+    
+    # Paleta de colores distintivos estilo Image 1
+    paleta_freq <- c(
+      "#0E7A68", "#D9531E", "#0066CC", "#AF2B7B", "#5C7829", 
+      "#5A4B81", "#D9822B", "#1D829B", "#995D3F", "#3B82F6",
+      "#10B981", "#F59E0B", "#EF4444", "#8B5CF6", "#EC4899"
+    )
+    
+    p <- plot_ly()
+    
+    for (i in seq_len(nrow(series_u))) {
+      t_key   <- series_u$Turno_Key[i]
+      s_label <- series_u$Serie_Label[i]
+      
+      sub_s <- df_freq %>%
+        filter(Turno_Key == t_key) %>%
+        arrange(orden_semana_campana(Semana_Num))
+      
+      if (nrow(sub_s) == 0) next
+      
+      col_serie <- paleta_freq[((i - 1) %% length(paleta_freq)) + 1]
+      
+      es_aislado <- !is.null(turno_sel)
+      es_el_sel  <- identical(turno_sel, t_key)
+      
+      line_width <- if (es_aislado) {
+        if (es_el_sel) 3.5 else 1.2
+      } else {
+        2.2
+      }
+      
+      opacity_val <- if (es_aislado) {
+        if (es_el_sel) 1.0 else 0.16
+      } else {
+        0.92
+      }
+      
+      marker_size <- if (es_aislado) {
+        if (es_el_sel) 7.5 else 4
+      } else {
+        5.5
+      }
+      
+      hover_text <- sprintf("<b>%s</b><br>Semana S%d: <b>%.1f</b> días entre cosechas", s_label, sub_s$Semana_Num, sub_s$Frecuencia)
+      
+      p <- p %>% add_trace(
+        data        = sub_s,
+        x           = ~Semana_Num,
+        y           = ~Frecuencia,
+        name        = s_label,
+        type        = "scatter",
+        mode        = "lines+markers",
+        line        = list(color = col_serie, width = line_width),
+        marker      = list(color = col_serie, size = marker_size),
+        opacity     = opacity_val,
+        text        = hover_text,
+        hoverinfo   = "text"
+      )
+    }
+    
+    tick_vals <- sems_camp
+    tick_text <- paste0("S", tick_vals)
+    
+    p <- p %>% layout(
+      xaxis = list(
+        title = "",
+        tickmode = "array",
+        tickvals = tick_vals,
+        ticktext = tick_text,
+        gridcolor = "#F0F0F2",
+        zeroline = FALSE,
+        tickfont = list(size = 11, color = "#8E8E93", family = "-apple-system, BlinkMacSystemFont, 'Inter', sans-serif")
+      ),
+      yaxis = list(
+        title = "",
+        gridcolor = "#F0F0F2",
+        zeroline = FALSE,
+        tickfont = list(size = 11, color = "#8E8E93", family = "-apple-system, BlinkMacSystemFont, 'Inter', sans-serif"),
+        dtick = 1.2
+      ),
+      hoverlabel = list(
+        bgcolor = "#1C1C1E",
+        bordercolor = "#1C1C1E",
+        font = list(color = "#FFFFFF", family = "-apple-system, BlinkMacSystemFont, 'Inter', sans-serif", size = 12)
+      ),
+      legend = list(
+        orientation = "h",
+        x = 0.5,
+        xanchor = "center",
+        y = -0.25,
+        font = list(size = 10.5, color = "#1C1C1E", family = "-apple-system, BlinkMacSystemFont, 'Inter', sans-serif")
+      ),
+      margin = list(l = 40, r = 20, t = 10, b = 75),
+      paper_bgcolor = "#FFFFFF",
+      plot_bgcolor = "#FFFFFF"
+    ) %>%
+      plotly::config(displaylogo = FALSE, modeBarButtonsToRemove = c("lasso2d", "select2d"))
+    
+    p
+  })
+
+  # Tabla Heatmap Matrix: Turnos o Válvulas por semana
+  output$tabla_heatmap_frecuencia <- renderUI({
+    df_freq <- frecuencia_campana_data()
+    
+    if (is.null(df_freq) || nrow(df_freq) == 0) {
+      return(div(style = "text-align: center; color: #8E8E93; padding: 24px;", "No hay datos de frecuencia para los filtros seleccionados."))
+    }
+    
+    turno_sel        <- rv_frecuencia_turno_sel()
+    es_nivel_valvula <- "Válvula" %in% cols_agrupar()
+    
+    # Semanas de campaña
+    sems_todas <- sort(unique(df_freq$Semana_Num))
+    sems_todas <- sems_todas[order(orden_semana_campana(sems_todas))]
+    
+    # Completar rango continuo de semanas para la matriz visual (ej. S20 a S44)
+    min_sem <- min(sems_todas, na.rm = TRUE)
+    max_sem <- max(sems_todas, na.rm = TRUE)
+    sems_matrix <- min_sem:max_sem
+    
+    # Listado de turnos o válvulas ordenados
+    turnos_info <- if (es_nivel_valvula && "Valvula_num" %in% names(df_freq)) {
+      df_freq %>%
+        distinct(Turno_Key, Modulo_Disp, Turno_Num, Valvula_num, Variedad_c) %>%
+        mutate(
+          ord_mod = suppressWarnings(as.numeric(sub("^M", "", Modulo_Disp))),
+          ord_tur = coalesce(Turno_Num, 0),
+          ord_val = coalesce(Valvula_num, 0)
+        ) %>%
+        arrange(ord_mod, Modulo_Disp, ord_tur, ord_val)
+    } else {
+      df_freq %>%
+        distinct(Turno_Key, Modulo_Disp, Turno_Num, Variedad_c) %>%
+        mutate(
+          ord_mod = suppressWarnings(as.numeric(sub("^M", "", Modulo_Disp))),
+          ord_tur = coalesce(Turno_Num, 0)
+        ) %>%
+        arrange(ord_mod, Modulo_Disp, ord_tur)
+    }
+    
+    # Lookup rápido de frecuencia por Turno_Key y Semana
+    freq_lookup <- setNames(df_freq$Frecuencia, paste(df_freq$Turno_Key, df_freq$Semana_Num, sep = "___"))
+    
+    # Cabecera con título dinámico de columna
+    header_col_title <- if (es_nivel_valvula) "Módulo · turno · válvula" else "Módulo · turno"
+    header_cells <- list(
+      tags$th(class = "col-turno-header", header_col_title)
+    )
+    for (s in sems_matrix) {
+      header_cells[[length(header_cells) + 1]] <- tags$th(paste0("S", s))
+    }
+    thead <- tags$thead(tags$tr(header_cells))
+    
+    # Filas
+    rows_list <- list()
+    for (i in seq_len(nrow(turnos_info))) {
+      t_key   <- turnos_info$Turno_Key[i]
+      is_sel  <- !is.null(turno_sel) && identical(turno_sel, t_key)
+      row_cls <- paste("freq-heatmap-row", if (is_sel) "row-selected" else "")
+      
+      cells <- list(
+        tags$td(class = "cell-turno-label", t_key)
+      )
+      
+      for (s in sems_matrix) {
+        k <- paste(t_key, s, sep = "___")
+        val <- freq_lookup[k]
+        val_num <- suppressWarnings(as.numeric(val[1]))
+        es_val <- !is.na(val_num) && is.finite(val_num)
+        c_info <- color_frecuencia(val_num)
+        
+        cells[[length(cells) + 1]] <- tags$td(
+          div(
+            class = paste("freq-cell", if (es_val) "" else "freq-cell-empty"),
+            style = if (es_val) sprintf("background: %s; color: %s;", c_info$bg, c_info$text) else NULL,
+            c_info$str
+          )
+        )
+      }
+      
+      rows_list[[length(rows_list) + 1]] <- tags$tr(
+        class = row_cls,
+        `data-turno-key` = t_key,
+        title = paste("Haz clic para aislar", t_key, "en el gráfico"),
+        cells
+      )
+    }
+    
+    tags$table(class = "freq-heatmap-table", thead, tags$tbody(rows_list))
+  })
 
 }
 
