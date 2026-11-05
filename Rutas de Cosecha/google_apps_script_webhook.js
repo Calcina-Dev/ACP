@@ -39,7 +39,7 @@ function doPost(e) {
     
     var campana   = data.campana;
     var semana    = data.semana;
-    var modo      = data.modo; // "Proyección" o "Cosecha Campo"
+    var modo      = data.modo; // "Proyección", "Cosecha Campo" o "Rectificación"
     var pasada    = data.pasada;
     var evaluador = data.evaluador || "Evaluador Campo";
     var fechaHora = Utilities.formatDate(new Date(), "GMT-5", "yyyy-MM-dd HH:mm:ss");
@@ -84,7 +84,7 @@ function doPost(e) {
       
       rowsToInsert.push([
         idReg,
-        fechaHora,
+        (r.fecha_hora && String(r.fecha_hora).trim() !== "") ? String(r.fecha_hora).trim() : fechaHora,
         versionTag,
         evaluador,
         campana,
@@ -113,9 +113,9 @@ function doPost(e) {
     //    - Parcial: solo las válvulas del alcance del usuario
     //    - Completo: todo el modo/pasada de la semana
     if (parcial) {
-      eliminarCodigosPrevios(sheetVigentes, campana, semana, modo, pasada, data.alcance_codigos);
+      eliminarCodigosPrevios(sheetVigentes, sheetAuditoria, campana, semana, modo, pasada, data.alcance_codigos, fechaHora);
     } else {
-      eliminarVersionPrevia(sheetVigentes, campana, semana, modo, pasada);
+      eliminarVersionPrevia(sheetVigentes, sheetAuditoria, campana, semana, modo, pasada, fechaHora);
     }
     
     if (rowsToInsert.length > 0) {
@@ -306,7 +306,47 @@ function calcularSiguienteVersion(sheet, campana, semana, modo, pasada) {
   return maxVersion + 1;
 }
 
-function eliminarVersionPrevia(sheet, campana, semana, modo, pasada) {
+// Restaura Fecha_Hora desde Auditoria_Historial si alguna fila existente en Rutas_Vigentes quedó con Fecha_Hora vacía
+function rellenarFechasFaltantes(rowsToKeep, sheetAuditoria, fechaFallback) {
+  var needsLookup = false;
+  for (var i = 1; i < rowsToKeep.length; i++) {
+    var fh = rowsToKeep[i][1];
+    if (fh === "" || fh === null || fh === undefined) {
+      needsLookup = true;
+      break;
+    }
+  }
+  if (!needsLookup) return;
+
+  var mapExact = {};
+  var mapById = {};
+  if (sheetAuditoria) {
+    var lastRowAud = sheetAuditoria.getLastRow();
+    if (lastRowAud > 1) {
+      var audData = sheetAuditoria.getRange(2, 1, lastRowAud - 1, 3).getValues();
+      for (var a = 0; a < audData.length; a++) {
+        var idA = String(audData[a][0] || "").trim();
+        var fhA = audData[a][1];
+        var verA = String(audData[a][2] || "").trim();
+        if (idA !== "" && fhA !== "" && fhA !== null && fhA !== undefined) {
+          mapExact[idA + "|" + verA] = fhA;
+          mapById[idA] = fhA;
+        }
+      }
+    }
+  }
+
+  for (var k = 1; k < rowsToKeep.length; k++) {
+    var curFh = rowsToKeep[k][1];
+    if (curFh === "" || curFh === null || curFh === undefined) {
+      var idK = String(rowsToKeep[k][0] || "").trim();
+      var verK = String(rowsToKeep[k][2] || "").trim();
+      rowsToKeep[k][1] = mapExact[idK + "|" + verK] || mapById[idK] || fechaFallback || Utilities.formatDate(new Date(), "GMT-5", "yyyy-MM-dd HH:mm:ss");
+    }
+  }
+}
+
+function eliminarVersionPrevia(sheet, sheetAuditoria, campana, semana, modo, pasada, fechaFallback) {
   var lastRow = sheet.getLastRow();
   if (lastRow <= 1) return;
   
@@ -316,6 +356,7 @@ function eliminarVersionPrevia(sheet, campana, semana, modo, pasada) {
   var data = sheet.getRange(1, 1, lastRow, lastCol).getValues();
   var headers = data[0];
   var rowsToKeep = [headers];
+  var hadBlankDates = false;
   
   for (var i = 1; i < data.length; i++) {
     var row = data[i];
@@ -324,11 +365,16 @@ function eliminarVersionPrevia(sheet, campana, semana, modo, pasada) {
                 (String(row[6]).trim() === String(modo).trim()) &&
                 (String(row[7]).trim() === String(pasada).trim());
     if (!match) {
+      if (row[1] === "" || row[1] === null || row[1] === undefined) hadBlankDates = true;
       rowsToKeep.push(row);
     }
   }
   
-  if (rowsToKeep.length < data.length) {
+  if (hadBlankDates) {
+    rellenarFechasFaltantes(rowsToKeep, sheetAuditoria, fechaFallback);
+  }
+  
+  if (rowsToKeep.length < data.length || hadBlankDates) {
     sheet.clearContents();
     sheet.getRange(1, 1, rowsToKeep.length, headers.length).setValues(rowsToKeep);
     crearEncabezados(sheet);
@@ -337,7 +383,7 @@ function eliminarVersionPrevia(sheet, campana, semana, modo, pasada) {
 
 // Elimina de Rutas_Vigentes SOLO las válvulas (por Codigo_Valvula) incluidas en el alcance del usuario,
 // para la campaña/semana/modo/pasada indicados. Las filas de otros usuarios permanecen intactas.
-function eliminarCodigosPrevios(sheet, campana, semana, modo, pasada, codigos) {
+function eliminarCodigosPrevios(sheet, sheetAuditoria, campana, semana, modo, pasada, codigos, fechaFallback) {
   var lastRow = sheet.getLastRow();
   if (lastRow <= 1) return;
   
@@ -352,6 +398,7 @@ function eliminarCodigosPrevios(sheet, campana, semana, modo, pasada, codigos) {
   var data = sheet.getRange(1, 1, lastRow, lastCol).getValues();
   var headers = data[0];
   var rowsToKeep = [headers];
+  var hadBlankDates = false;
   
   for (var i = 1; i < data.length; i++) {
     var row = data[i];
@@ -361,14 +408,18 @@ function eliminarCodigosPrevios(sheet, campana, semana, modo, pasada, codigos) {
                      (String(row[7]).trim() === String(pasada).trim());
     var enAlcance = setCodigos[String(row[12]).trim()] === true; // col 13 = Codigo_Valvula
     if (!(mismoGrupo && enAlcance)) {
+      if (row[1] === "" || row[1] === null || row[1] === undefined) hadBlankDates = true;
       rowsToKeep.push(row);
     }
   }
   
-  if (rowsToKeep.length < data.length) {
+  if (hadBlankDates) {
+    rellenarFechasFaltantes(rowsToKeep, sheetAuditoria, fechaFallback);
+  }
+  
+  if (rowsToKeep.length < data.length || hadBlankDates) {
     sheet.clearContents();
     sheet.getRange(1, 1, rowsToKeep.length, headers.length).setValues(rowsToKeep);
     crearEncabezados(sheet);
   }
 }
-

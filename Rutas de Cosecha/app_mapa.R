@@ -332,19 +332,32 @@ generar_cells_str_vec <- function(p_lun, p_mar, p_mie, p_jue, p_vie, p_sab) {
       next
     }
     counts <- round(row_p / 10)
+    # Garantizar que cualquier día con porcentaje > 0 tenga al menos 1 celda representativa en cells_str
+    counts[row_p > 0 & counts == 0] <- 1
     # Solo ajustar por redondeo si la suma total es aproximadamente 100% (para completar exactamente 10 celdas)
     if (tot >= 99.5) {
       diff <- 10 - sum(counts)
-      if (diff != 0) {
-        max_idx <- which.max(row_p)
-        counts[max_idx] <- max(0, counts[max_idx] + diff)
+      while (diff != 0) {
+        if (diff > 0) {
+          max_idx <- which.max(row_p - counts * 10)
+          counts[max_idx] <- counts[max_idx] + 1
+          diff <- diff - 1
+        } else {
+          elig <- which(counts > 1)
+          if (length(elig) == 0) elig <- which(counts > 0)
+          min_idx <- elig[which.min(row_p[elig] - counts[elig] * 10)]
+          counts[min_idx] <- max(0, counts[min_idx] - 1)
+          diff <- diff + 1
+        }
       }
     } else {
-      # Si es menor a 100%, asegurar que no exceda 10 celdas
-      if (sum(counts) > 10) {
-        diff <- sum(counts) - 10
-        max_idx <- which.max(row_p)
-        counts[max_idx] <- max(0, counts[max_idx] - diff)
+      # Si es menor a 100% (ha partida), dejar SIEMPRE al menos 1 celda libre (máx 9 celdas ocupadas)
+      max_cells_allowed <- max(sum(row_p > 0), min(9, ceiling(tot / 10)))
+      while (sum(counts) > max_cells_allowed) {
+        elig <- which(counts > 1)
+        if (length(elig) == 0) break
+        idx_reduce <- elig[which.max(counts[elig] * 10 - row_p[elig])]
+        counts[idx_reduce] <- counts[idx_reduce] - 1
       }
     }
     cells <- rep(dias, times = pmax(0, counts))
@@ -864,11 +877,13 @@ obtener_rutas_google_sheets <- function(sem_num = NULL) {
       Kg_Jueves      = get_num("kg.*jue", 0),
       Kg_Viernes     = get_num("kg.*vie", 0),
       Kg_Sábado      = get_num("kg.*sab", 0),
-      Cells_Str_Sheet = get_chr("^cells.*str$", "")
+      Cells_Str_Sheet = get_chr("^cells.*str$", ""),
+      Fecha_Hora_Sheet = get_chr("^fecha.*hora$", "")
     ) %>%
       filter(!is.na(Semana), nzchar(Codigo_Valvula)) %>%
       mutate(
         Tipo_Registro = case_when(
+          grepl("rectif", Modo_Raw, ignore.case = TRUE) ~ "Rectificacion",
           grepl("cosecha.*campo|cosecha", Modo_Raw, ignore.case = TRUE) ~ "CosechaCampo",
           grepl("oficial", Modo_Raw, ignore.case = TRUE) ~ "CosechaOficial",
           TRUE ~ "Proyeccion"
@@ -893,25 +908,49 @@ obtener_rutas_google_sheets <- function(sem_num = NULL) {
       pull(codigo_norm) %>%
       unique()
     
-    df_multi_clean <- df_clean %>% filter(codigo_norm %in% codigos_multi)
+    df_multi_clean <- df_clean %>%
+      filter(codigo_norm %in% codigos_multi) %>%
+      mutate(row_idx_multi = row_number())
     df_res_multi <- df_multi_clean %>%
-      inner_join(df_valv_map, by = c("codigo_norm", "variedad_norm", "Area_Sheet" = "Area_Round")) %>%
+      inner_join(df_valv_map, by = c("codigo_norm", "variedad_norm", "Area_Sheet" = "Area_Round"), relationship = "many-to-many") %>%
+      distinct(row_idx_multi, .keep_all = TRUE) %>%
       select(-Area_Sheet)
     
     if (nrow(df_res_multi) < nrow(df_multi_clean)) {
-      faltantes <- df_multi_clean %>% filter(!codigo_norm %in% df_res_multi$codigo_norm)
+      faltantes <- df_multi_clean %>% filter(!row_idx_multi %in% df_res_multi$row_idx_multi)
       if (nrow(faltantes) > 0) {
         df_recup <- faltantes %>%
-          inner_join(df_valv_map, by = c("codigo_norm", "variedad_norm")) %>%
-          select(-Area_Sheet)
+          inner_join(df_valv_map, by = c("codigo_norm", "variedad_norm"), relationship = "many-to-many") %>%
+          mutate(diff_area = abs(coalesce(Area_Sheet, 0) - coalesce(Area_Round, 0))) %>%
+          group_by(row_idx_multi) %>%
+          slice_min(order_by = diff_area, n = 1, with_ties = FALSE) %>%
+          ungroup() %>%
+          select(-Area_Sheet, -Area_Round, -diff_area)
         df_res_multi <- bind_rows(df_res_multi, df_recup)
       }
     }
+    df_res_multi <- df_res_multi %>% select(-any_of("row_idx_multi"))
     
     df_res_uni <- df_clean %>%
       filter(!codigo_norm %in% codigos_multi) %>%
       inner_join(df_valv_map %>% distinct(codigo_norm, .keep_all = TRUE) %>% select(-variedad_norm, -Area_Round), by = "codigo_norm") %>%
       select(-any_of(c("Area_Sheet")))
+    
+    parse_fecha_sheet <- function(f_vec) {
+      res_t <- rep(as.POSIXct(NA, tz = "America/Lima"), length(f_vec))
+      for (idx_f in seq_along(f_vec)) {
+        val_f <- trimws(as.character(f_vec[idx_f]))
+        if (is.na(val_f) || !nzchar(val_f)) next
+        t_parsed <- if (grepl("T.*Z$", val_f)) {
+          p_utc <- suppressWarnings(as.POSIXct(sub("\\.[0-9]+Z$", "Z", val_f), format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"))
+          if (!is.na(p_utc)) as.POSIXct(format(p_utc, tz = "America/Lima", usetz = FALSE), tz = "America/Lima") else as.POSIXct(NA, tz = "America/Lima")
+        } else {
+          suppressWarnings(as.POSIXct(val_f, format = "%Y-%m-%d %H:%M:%S", tz = "America/Lima"))
+        }
+        if (!is.na(t_parsed)) res_t[idx_f] <- t_parsed
+      }
+      ifelse(is.na(res_t), Sys.time(), res_t) %>% as.POSIXct(origin = "1970-01-01", tz = "America/Lima")
+    }
     
     df_res <- bind_rows(df_res_multi, df_res_uni) %>%
       mutate(
@@ -924,8 +963,11 @@ obtener_rutas_google_sheets <- function(sem_num = NULL) {
         Ha_Total_Prog       = round(Ha_Lunes + Ha_Martes + Ha_Miércoles + Ha_Jueves + Ha_Viernes + Ha_Sábado, 2),
         Kg_Total_Prog       = round(Kg_Lunes + Kg_Martes + Kg_Miércoles + Kg_Jueves + Kg_Viernes + Kg_Sábado, 2),
         cells_str           = coalesce(as.character(Cells_Str_Sheet), ""),
-        Fecha_Actualizacion = Sys.time()
+        Fecha_Actualizacion = parse_fecha_sheet(Fecha_Hora_Sheet)
       ) %>%
+      group_by(Campaña, Semana, Tipo_Registro, Num_Pasada, id) %>%
+      slice_tail(n = 1) %>%
+      ungroup() %>%
       select(
         Campaña, Semana, Tipo_Registro, id, codigo, Grupo, Sector, Módulo, Turno, Variedad, Área, Num_Pasada,
         Lunes, Martes, Miércoles, Jueves, Viernes, Sábado,
@@ -1618,6 +1660,11 @@ ui <- fluidPage(
         background: #FFFFFF;
         color: #16A34A;
         box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+      }
+      .pass-pill.active-rectificacion {
+        background: #FFFFFF;
+        color: #D97706;
+        box-shadow: 0 2px 6px rgba(217, 119, 6, 0.18);
       }
       .pass-pill.active-oficial {
         background: #0F172A;
@@ -2545,10 +2592,11 @@ ui <- fluidPage(
                      "En Proyección planifica la ruta; en Cosecha Campo anota la ejecución real; en Cosecha Oficial consulta los datos de balanza packing (🔒 solo lectura).")
               ),
               div(style = "display: flex; align-items: center; gap: 10px; flex-wrap: wrap;",
-                  # Switch Modo: Proyección vs Cosecha Campo vs Cosecha Oficial
+                  # Switch Modo: Proyección vs Cosecha Campo vs Rectificaciones vs Cosecha Oficial
                   div(class = "ios-segmented-pass",
                       tags$button(type = "button", id = "btn-mode-proy", class = "pass-pill", onclick = "setMode('Proyeccion')", "📋 Proyección"),
                       tags$button(type = "button", id = "btn-mode-cos-campo", class = "pass-pill active-cosecha", onclick = "setMode('CosechaCampo')", "🚜 Cosecha Campo"),
+                      tags$button(type = "button", id = "btn-mode-rectificacion", class = "pass-pill", onclick = "setMode('Rectificacion')", "🛠️ Rectificaciones"),
                       tags$button(type = "button", id = "btn-mode-cos-oficial", class = "pass-pill", onclick = "setMode('CosechaOficial')", "🏛️ Cosecha Oficial 🔒")
                   ),
                   # Switch Pasada: 1ª vs 2ª Pasada
@@ -2887,6 +2935,8 @@ ui <- fluidPage(
         'Proyeccion_2':     createEmptySlot(),
         'CosechaCampo_1':   createEmptySlot(),
         'CosechaCampo_2':   createEmptySlot(),
+        'Rectificacion_1':  createEmptySlot(),
+        'Rectificacion_2':  createEmptySlot(),
         'CosechaOficial_1': createEmptySlot(),
         'CosechaOficial_2': createEmptySlot()
       };
@@ -3014,7 +3064,23 @@ ui <- fluidPage(
             cellSum += frac * 10;
           }
         }
-        if (countSum <= 0 || Math.abs(cellSum - countSum) < 0.5) {
+        // Usar las celdas tal cual solo si coinciden con los porcentajes de CADA día (no solo con el total);
+        // si no, se posiciona por grupos con los % exactos (evita desfases y franjas blancas entre días).
+        const cellByDay = {};
+        for (let c = 0; c < 10; c++) {
+          const dC = slot.cells[c];
+          if (dC) {
+            const frC = (slot.cellFractions && slot.cellFractions[c] !== undefined) ? slot.cellFractions[c] : 1.0;
+            cellByDay[dC] = (cellByDay[dC] || 0) + frC * 10;
+          }
+        }
+        let perDayOk = Math.abs(cellSum - countSum) < 0.05;
+        if (perDayOk) {
+          for (let d of DAY_KEYS) {
+            if (Math.abs((cellByDay[d] || 0) - (Number(counts[d]) || 0)) >= 0.05) { perDayOk = false; break; }
+          }
+        }
+        if (countSum <= 0 || perDayOk) {
           return buildRangesFromCells(slot);
         }
         
@@ -3028,27 +3094,39 @@ ui <- fluidPage(
           }
         }
         
-        const groups = [];
-        let curGroup = null;
-        for (let c = 0; c < 10; c++) {
-          const d = slot.cells[c];
-          if (d && (Number(counts[d]) || 0) > 0) {
-            if (!curGroup) {
-              curGroup = { firstIdx: c, lastIdx: c, runs: [{ day: d, count: 1 }] };
-            } else {
-              curGroup.lastIdx = c;
-              const lastRun = curGroup.runs[curGroup.runs.length - 1];
-              if (lastRun.day === d) lastRun.count++;
-              else curGroup.runs.push({ day: d, count: 1 });
-            }
-          } else {
-            if (curGroup) {
-              groups.push(curGroup);
-              curGroup = null;
-            }
+        // Verificar que todos los días con counts > 0 tengan presencia en slot.cells;
+        // si algún día activo no figura en cells_str, usar la reconstrucción proporcional completa de más abajo.
+        let allDaysHaveCells = true;
+        for (let d of DAY_KEYS) {
+          if ((Number(counts[d]) || 0) > 0 && !totalCellsByDay[d]) {
+            allDaysHaveCells = false;
+            break;
           }
         }
-        if (curGroup) groups.push(curGroup);
+        
+        const groups = [];
+        if (allDaysHaveCells) {
+          let curGroup = null;
+          for (let c = 0; c < 10; c++) {
+            const d = slot.cells[c];
+            if (d && (Number(counts[d]) || 0) > 0) {
+              if (!curGroup) {
+                curGroup = { firstIdx: c, lastIdx: c, runs: [{ day: d, count: 1 }] };
+              } else {
+                curGroup.lastIdx = c;
+                const lastRun = curGroup.runs[curGroup.runs.length - 1];
+                if (lastRun.day === d) lastRun.count++;
+                else curGroup.runs.push({ day: d, count: 1 });
+              }
+            } else {
+              if (curGroup) {
+                groups.push(curGroup);
+                curGroup = null;
+              }
+            }
+          }
+          if (curGroup) groups.push(curGroup);
+        }
         
         if (groups.length > 0) {
           const ranges = [];
@@ -3197,19 +3275,21 @@ ui <- fluidPage(
         }
       }
       
-      // Si el total pintado es >90% y <99.5% (no llega al 100%), dejar libre la celda del extremo opuesto
-      // en slot.cells para que cells_str en Google Sheets refleje inequívocamente la orientación (derecha/centro/izquierda)
+      // Si el total pintado es <99.5% (no llega al 100%, ha partida), garantizar que nunca queden las 10 celdas llenas
+      // en slot.cells para que cells_str en Google Sheets refleje inequívocamente que es área parcial y su orientación
       let totalRangePct = 0;
       let minRangeStart = 100;
       let maxRangeEnd = 0;
+      const daysInRanges = new Set();
       for (let r of ranges) {
         if (r.pct > 0) {
           totalRangePct += r.pct;
+          daysInRanges.add(r.day);
           if (r.start < minRangeStart) minRangeStart = r.start;
           if (r.end > maxRangeEnd) maxRangeEnd = r.end;
         }
       }
-      if (totalRangePct > 90 && totalRangePct < 99.5 && slot.cells.every(c => c !== '')) {
+      if (totalRangePct > 0 && totalRangePct < 99.5 && slot.cells.every(c => c !== '')) {
         if (minRangeStart > 0.5 && maxRangeEnd >= 99.5) {
           slot.cells[0] = '';
           delete slot.cellFractions[0];
@@ -3221,12 +3301,76 @@ ui <- fluidPage(
           slot.cells[9] = '';
           delete slot.cellFractions[0];
           delete slot.cellFractions[9];
+        } else {
+          slot.cells[9] = '';
+          delete slot.cellFractions[9];
+        }
+      }
+      // Asegurar que todo día presente en ranges tenga al menos 1 celda en slot.cells
+      for (let d of daysInRanges) {
+        if (!slot.cells.includes(d)) {
+          const rDay = ranges.find(r => r.day === d && r.pct > 0);
+          if (rDay) {
+            const midC = Math.min(9, Math.max(0, Math.floor(((rDay.start + rDay.end) / 2) / 10)));
+            slot.cells[midC] = d;
+          }
         }
       }
       
-      slot.hasExactPcts = Object.values(slot.counts || {}).some(p => (Number(p) || 0) % 10 !== 0);
+      slot.hasExactPcts = Object.values(slot.counts || {}).some(p => Math.abs((Number(p) || 0) - Math.round((Number(p) || 0) / 10) * 10) > 0.05);
     }
 
+    // ---- Utilitarios de pintado por rangos continuos (0-100%), independientes de la dirección ----
+    function round2(x) { return Math.round((Number(x) || 0) * 100) / 100; }
+    
+    function computeFreeIntervals(ranges) {
+      const sorted = (ranges || []).filter(r => (r.end - r.start) > 0.001).slice().sort((a, b) => a.start - b.start);
+      const free = [];
+      let cursor = 0;
+      for (const r of sorted) {
+        if (r.start > cursor + 0.01) free.push({ start: cursor, end: r.start, len: r.start - cursor });
+        cursor = Math.max(cursor, r.end);
+      }
+      if (cursor < 100 - 0.01) free.push({ start: cursor, end: 100, len: 100 - cursor });
+      return free;
+    }
+    
+    function normalizeRanges(ranges) {
+      const sorted = (ranges || [])
+        .filter(r => r && r.day && (r.end - r.start) > 0.001)
+        .map(r => ({ day: r.day, start: Math.max(0, round2(r.start)), end: Math.min(100, round2(r.end)) }))
+        .sort((a, b) => a.start - b.start);
+      const out = [];
+      for (const r of sorted) {
+        const last = out[out.length - 1];
+        if (last && last.day === r.day && Math.abs(last.end - r.start) < 0.05) {
+          last.end = Math.max(last.end, r.end);
+        } else {
+          out.push({ day: r.day, start: r.start, end: r.end });
+        }
+      }
+      out.forEach(r => { r.pct = round2(r.end - r.start); });
+      return out.filter(r => r.pct > 0.001);
+    }
+    
+    function subtractFromRanges(ranges, day, s, e) {
+      const out = [];
+      for (const r of ranges) {
+        if (r.day !== day || r.end <= s || r.start >= e) { out.push(r); continue; }
+        if (r.start < s) out.push({ day: r.day, start: r.start, end: s });
+        if (r.end > e) out.push({ day: r.day, start: e, end: r.end });
+      }
+      return out;
+    }
+    
+    function applyRangesToSlot(slot, ranges) {
+      slot.ranges = normalizeRanges(ranges);
+      if (!slot.counts) slot.counts = emptyCounts();
+      for (let d of DAY_KEYS) slot.counts[d] = 0;
+      for (let r of slot.ranges) slot.counts[r.day] = round2((slot.counts[r.day] || 0) + r.pct);
+      syncCellsFromRanges(slot);
+    }
+    
     function updateSlotDay(slot, targetDay, targetPct, direction = null) {
       if (!slot) return;
       if (!slot.counts) slot.counts = emptyCounts();
@@ -3283,9 +3427,12 @@ ui <- fluidPage(
       
       // 3. Asignar el nuevo porcentaje en el espacio libre respetando la dirección
       const newSegments = [];
-      if (Math.abs(roundPct - maxAvailable) < 0.01 && freeIntervals.length === 1) {
-        // Asignación completa del espacio libre restante: ocupa exactamente todo el intervalo libre sin desfases ni líneas blancas
-        newSegments.push({ day: targetDay, start: freeIntervals[0].start, end: freeIntervals[0].end, pct: freeIntervals[0].len });
+      if (Math.abs(roundPct - maxAvailable) < 0.01) {
+        // Asignación completa del espacio libre restante: ocupa exactamente TODOS los intervalos libres
+        // (izquierda, derecha o ambos lados si el día anterior se pintó desde el centro) sin líneas blancas
+        for (const fi of freeIntervals) {
+          newSegments.push({ day: targetDay, start: fi.start, end: fi.end, pct: fi.len });
+        }
       } else if (dir === 'end') {
         // Desde abajo / derecha hacia arriba
         let remaining = roundPct;
@@ -3389,10 +3536,19 @@ ui <- fluidPage(
 
     function renderValveFills(c2d, v, slot, horiz) {
       if (!slot) return;
-      const ranges = getSlotRanges(slot);
-      if (!ranges || ranges.length === 0) return;
+      const rangesRaw = getSlotRanges(slot);
+      if (!rangesRaw || rangesRaw.length === 0) return;
+      const ranges = rangesRaw.slice().sort((a, b) => a.start - b.start);
       
-      for (let r of ranges) {
+      // Solape de ~1 px de pantalla entre segmentos contiguos para que el antialiasing no deje una línea blanca
+      let epsWorld = 0;
+      try {
+        const tr = c2d.getTransform();
+        epsWorld = 1.0 / (Math.abs(tr.a) || 1);
+      } catch (errT) { epsWorld = 0; }
+      
+      for (let i = 0; i < ranges.length; i++) {
+        const r = ranges[i];
         if (!r.pct || r.pct <= 0.001) continue;
         const color = DAY_COLORS[r.day] || '#007AFF';
         c2d.fillStyle = color;
@@ -3400,14 +3556,18 @@ ui <- fluidPage(
         const e = Math.max(0, Math.min(100, r.end));
         const len = e - s;
         if (len <= 0) continue;
+        const nxt = ranges[i + 1];
+        const touchesNext = !!(nxt && nxt.pct > 0.001 && Math.abs(nxt.start - e) < 0.6);
         
         if (horiz) {
           const y = v.y + (s / 100) * v.h;
-          const h = (len / 100) * v.h;
+          let h = (len / 100) * v.h;
+          if (touchesNext) h = Math.min(v.y + v.h - y, h + epsWorld + ((nxt.start - e) / 100) * v.h);
           c2d.fillRect(v.x, y, v.w, h);
         } else {
           const x = v.x + (s / 100) * v.w;
-          const w = (len / 100) * v.w;
+          let w = (len / 100) * v.w;
+          if (touchesNext) w = Math.min(v.x + v.w - x, w + epsWorld + ((nxt.start - e) / 100) * v.w);
           c2d.fillRect(x, v.y, w, v.h);
         }
       }
@@ -3415,6 +3575,13 @@ ui <- fluidPage(
     
     let hasUnsavedChanges = false;
     let previousSemana = null;
+    window.addEventListener('beforeunload', function(e) {
+      if (hasUnsavedChanges && !(window.USER_PERMISOS && window.USER_PERMISOS.es_visualizador)) {
+        e.preventDefault();
+        e.returnValue = 'Tienes cambios sin guardar. Presiona Guardar Ruta antes de salir.';
+        return e.returnValue;
+      }
+    });
 
     function marcarCambiosPendientes(hayCambios) {
       hasUnsavedChanges = !!hayCambios;
@@ -3687,6 +3854,8 @@ ui <- fluidPage(
       document.getElementById('btn-mode-proy').classList.toggle('active', modeName === 'Proyeccion');
       const btnCosCampo = document.getElementById('btn-mode-cos-campo');
       if (btnCosCampo) btnCosCampo.classList.toggle('active-cosecha', modeName === 'CosechaCampo' || modeName === 'Cosecha');
+      const btnRectif = document.getElementById('btn-mode-rectificacion');
+      if (btnRectif) btnRectif.classList.toggle('active-rectificacion', modeName === 'Rectificacion');
       const btnCosOficial = document.getElementById('btn-mode-cos-oficial');
       if (btnCosOficial) btnCosOficial.classList.toggle('active-oficial', modeName === 'CosechaOficial');
       
@@ -3708,6 +3877,9 @@ ui <- fluidPage(
       const sugBadges = document.querySelectorAll('.badge-proy-sug');
       if (modeName === 'CosechaCampo' || modeName === 'Cosecha') {
         txtLbl = 'KG COSECHA CAMPO:';
+        sugBadges.forEach(el => { el.style.display = 'none'; });
+      } else if (modeName === 'Rectificacion') {
+        txtLbl = 'KG RECTIFICACIÓN:';
         sugBadges.forEach(el => { el.style.display = 'none'; });
       } else if (modeName === 'CosechaOficial') {
         txtLbl = 'KG OFICIAL PACKING:';
@@ -3840,8 +4012,22 @@ ui <- fluidPage(
       
       // Asegurar que todos los inputs de kilos guarden su valor actual y pierdan foco
       // para evitar que un evento de blur posterior active cambios pendientes falsos
+      const kgsEdited = {};
+      const idToColMap = {
+        input_kg_lunes: 'Lunes',
+        input_kg_martes: 'Martes',
+        input_kg_miercoles: 'Miércoles',
+        input_kg_jueves: 'Jueves',
+        input_kg_viernes: 'Viernes',
+        input_kg_sabado: 'Sábado'
+      };
       document.querySelectorAll('.day-kg-input').forEach(inp => {
         const v = Math.round(parseFloat((inp.value || '').replace(/[^0-9.]/g, '')) || 0);
+        const lastV = parseFloat(inp.dataset.lastVal || '0') || 0;
+        const colName = idToColMap[inp.id];
+        if (colName) {
+          kgsEdited[colName] = (Math.abs(v - lastV) >= 1);
+        }
         inp.dataset.lastVal = String(v);
         inp.blur();
       });
@@ -3855,6 +4041,9 @@ ui <- fluidPage(
         btn.style.opacity = '0.75';
       }
       
+      // Sincronizar de inmediato el estado actual de programación antes de enviar la orden de guardado
+      syncStateToShiny(true);
+      
       showIosLoader('Guardando Ruta...', 'Sincronizando con Google Sheets y Disco');
       const kgs = {
         Lunes:     parseFloat(($('#input_kg_lunes').val() || '').replace(/[^0-9.]/g, '')) || 0,
@@ -3866,10 +4055,12 @@ ui <- fluidPage(
       };
       if (window.Shiny && window.Shiny.setInputValue) {
         Shiny.setInputValue('guardar_ruta_con_kilos', {
-          modo:   activeMode,
-          pasada: activePass,
-          kgs:    kgs,
-          ts:     Date.now()
+          modo:             activeMode,
+          pasada:           activePass,
+          kgs:              kgs,
+          kgs_edited:       kgsEdited,
+          programacion_str: JSON.stringify(buildProgramacionPayload()),
+          ts:               Date.now()
         }, { priority: 'event' });
       }
     }
@@ -3882,6 +4073,7 @@ ui <- fluidPage(
           const semNum = $('#sel_semana').val() || 'Actual';
           let modoLabel = 'PROYECCIÓN';
           if (activeMode === 'CosechaCampo' || activeMode === 'Cosecha') modoLabel = 'COSECHA CAMPO';
+          else if (activeMode === 'Rectificacion') modoLabel = 'RECTIFICACIONES';
           else if (activeMode === 'CosechaOficial') modoLabel = 'COSECHA OFICIAL (PACKING)';
           
           const pasadaLabel = activePass === 1 ? '1ª Pasada' : '2ª Pasada';
@@ -3920,6 +4112,7 @@ ui <- fluidPage(
           let totalKgSemana = 0;
           let totalAreaFisica = 0;
           let totalValvulasVisibles = 0;
+          const rectRows = [];
           
           let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
           let paintedMinX = Infinity, paintedMinY = Infinity, paintedMaxX = -Infinity, paintedMaxY = -Infinity;
@@ -3970,6 +4163,34 @@ ui <- fluidPage(
                   vHasPainted = true;
                   hasAnyPainted = true;
                 }
+              }
+              
+              // Recolectar rectificaciones de esta válvula (en la pasada activa o general de la semana)
+              const rectKey = 'Rectificacion_' + activePass;
+              const rectSlot = (v.slots && v.slots[rectKey]) ? v.slots[rectKey] : null;
+              if (rectSlot && rectSlot.counts) {
+                let codeTV = v.codigo || '';
+                if (v.Turno && v.Válvula) codeTV = 'T' + v.Turno + '-V' + v.Válvula;
+                else codeTV = codeTV.replace(/^M[0-9]+-/, '');
+                DAY_KEYS.forEach((d, dIdx) => {
+                  const rCnt = Number(rectSlot.counts[d]) || 0;
+                  if (rCnt > 0) {
+                    const rHa = vArea * (rCnt / 100);
+                    const rKg = (rectSlot.kg && rectSlot.kg[d]) ? Number(rectSlot.kg[d]) : 0;
+                    rectRows.push({
+                      dayKey: d,
+                      dayIdx: dIdx,
+                      dayName: DAY_NAMES[d] || d,
+                      dayColor: DAY_COLORS[d] || '#D97706',
+                      codigoTV: codeTV,
+                      modulo: v.Módulo,
+                      variedad: vVar,
+                      pct: Math.round(rCnt * 10) / 10,
+                      ha: rHa,
+                      kg: rKg
+                    });
+                  }
+                });
               }
               
               if (vHasPainted) {
@@ -4074,15 +4295,25 @@ ui <- fluidPage(
             mapW = Math.max(2640, Math.min(3328, contentW + 140));
           }
 
-          // Dimensiones del Cuadro Único de Resumen con columnas por variedad
+          // Dimensiones del Cuadro Único de Resumen con columnas por variedad (incluye DÍA + FECHA)
           const nTableVars = tableVars.length;
-          const dayColW_init = nTableVars <= 3 ? 255 : 230;
+          const dayColW_init = nTableVars <= 3 ? 245 : 215;
+          const dateColW_init = nTableVars <= 3 ? 205 : 185;
           const totColW_init = nTableVars <= 3 ? 345 : 310;
           const perVarW_init = nTableVars <= 1 ? 480 : (nTableVars === 2 ? 410 : (nTableVars === 3 ? 355 : 320));
-          const tableW = Math.min(mapW - 48, Math.max(1060, dayColW_init + nTableVars * perVarW_init + totColW_init));
+          rectRows.sort((a, b) => (a.dayIdx - b.dayIdx) || a.codigoTV.localeCompare(b.codigoTV));
+          const hasRectBox = rectRows.length > 0;
+          const rectBoxGap = hasRectBox ? 28 : 0;
+          const rectBoxW   = hasRectBox ? 920 : 0;
+          const rectRowH   = rectRows.length <= 6 ? 73 : Math.max(46, Math.floor(438 / Math.min(rectRows.length, 12)));
+          const rectBoxH   = hasRectBox ? Math.max(660, 74 + 74 + rectRows.length * rectRowH + 74) : 0;
+          const maxTableWAllowed = hasRectBox ? Math.max(1240, mapW - 48 - rectBoxW - rectBoxGap) : (mapW - 48);
+          const tableW = Math.min(maxTableWAllowed, Math.max(1240, dayColW_init + dateColW_init + nTableVars * perVarW_init + totColW_init));
           const tableH = 660;
+          const totalSummaryBlockW = tableW + rectBoxGap + rectBoxW;
+          const totalSummaryBlockH = Math.max(tableH, rectBoxH);
 
-          const outW = mapW + 72;
+          const outW = Math.max(mapW + 72, totalSummaryBlockW + 96);
 
           // Ajuste fino final de fitScale y centrado con mapW definitivo
           fitScale = Math.min(mapW / (bboxW * paddingFactor), (mapH - 50) / (bboxH * paddingFactor));
@@ -4133,42 +4364,44 @@ ui <- fluidPage(
               }
             }
 
-            if (m11Free) {
+            if (m11Free && !hasRectBox) {
               outH = mapY + mapH + 36;
             } else {
               const valvesLeftScreen = bMinX * fitScale + mapPanX;
-              tableX = Math.max(mapX + 24, Math.min(mapX + mapW - tableW - 24, Math.round(valvesLeftScreen)));
+              tableX = Math.max(mapX + 24, Math.min(outW - totalSummaryBlockW - 36, Math.round(valvesLeftScreen)));
               tableY = mapY + mapH + 24;
-              outH = tableY + tableH + 36;
+              outH = tableY + totalSummaryBlockH + 36;
             }
           } else {
             const candTL_X = mapX + 36;
             const candTL_Y = mapY + 36;
-            let candTL_Free = true;
+            let candTL_Free = (candTL_X + totalSummaryBlockW + 25 <= mapX + mapW);
 
-            for (let i = 0; i < VALVES_DATA.length; i++) {
-              const v = VALVES_DATA[i];
-              if (hasFilter && !filteredIds.has(v.id)) continue;
-              const vx1 = v.x * fitScale + mapPanX;
-              const vy1 = v.y * fitScale + mapPanY;
-              const vx2 = (v.x + v.w) * fitScale + mapPanX;
-              const vy2 = (v.y + v.h) * fitScale + mapPanY;
+            if (candTL_Free) {
+              for (let i = 0; i < VALVES_DATA.length; i++) {
+                const v = VALVES_DATA[i];
+                if (hasFilter && !filteredIds.has(v.id)) continue;
+                const vx1 = v.x * fitScale + mapPanX;
+                const vy1 = v.y * fitScale + mapPanY;
+                const vx2 = (v.x + v.w) * fitScale + mapPanX;
+                const vy2 = (v.y + v.h) * fitScale + mapPanY;
 
-              if (!(vx2 < candTL_X - 25 || vx1 > candTL_X + tableW + 25 || vy2 < candTL_Y - 25 || vy1 > candTL_Y + tableH + 25)) {
-                candTL_Free = false;
-                break;
+                if (!(vx2 < candTL_X - 25 || vx1 > candTL_X + totalSummaryBlockW + 25 || vy2 < candTL_Y - 25 || vy1 > candTL_Y + totalSummaryBlockH + 25)) {
+                  candTL_Free = false;
+                  break;
+                }
               }
             }
 
             if (candTL_Free) {
               tableX = candTL_X;
               tableY = candTL_Y;
-              outH = mapY + mapH + 36;
+              outH = Math.max(mapY + mapH + 36, tableY + totalSummaryBlockH + 36);
             } else {
               const valvesLeftScreen = bMinX * fitScale + mapPanX;
-              tableX = Math.max(mapX + 24, Math.min(mapX + mapW - tableW - 24, Math.round(valvesLeftScreen)));
+              tableX = Math.max(mapX + 24, Math.min(outW - totalSummaryBlockW - 36, Math.round(valvesLeftScreen)));
               tableY = mapY + mapH + 24;
-              outH = tableY + tableH + 36;
+              outH = tableY + totalSummaryBlockH + 36;
             }
           }
 
@@ -4271,7 +4504,7 @@ ui <- fluidPage(
           octx.textAlign = 'right';
           octx.textBaseline = 'middle';
           
-          const modeBg = activeMode === 'CosechaCampo' ? '#16A34A' : (activeMode === 'CosechaOficial' ? '#0F172A' : '#007AFF');
+          const modeBg = activeMode === 'CosechaCampo' ? '#16A34A' : (activeMode === 'Rectificacion' ? '#D97706' : (activeMode === 'CosechaOficial' ? '#0F172A' : '#007AFF'));
           const modeTxt = `${modoLabel} (${pasadaLabel})`;
           octx.font = 'bold 22px Inter, -apple-system, sans-serif';
           const mTextW = octx.measureText(modeTxt).width;
@@ -4546,13 +4779,30 @@ ui <- fluidPage(
           octx.font = 'bold 25px Inter, -apple-system, sans-serif';
           octx.fillText(`✓ ${pctAvanceFiltro}% avance físico (${fmtHa(totalAreaFisica)} ha)`, tableX + tableW - 28, tableY + barTopH / 2);
           
-          // B. Geometría de Columnas: DÍA | Variedad 1 (ha | kg) | Variedad 2 (ha | kg) | ... | ÁREA | KILOS
-          const dayColW = nTableVars <= 3 ? 255 : 225;
+          // B. Geometría de Columnas: DÍA | FECHA | Variedad 1 (ha | kg) | Variedad 2 (ha | kg) | ... | ÁREA | KILOS
+          const dayColW = nTableVars <= 3 ? 245 : 215;
+          const dateColW = nTableVars <= 3 ? 205 : 185;
+          const leftColsW = dayColW + dateColW;
           const totBlockW = nTableVars <= 3 ? 345 : 305;
           const totHaW = Math.round(totBlockW * 0.45);
           const totKgW = totBlockW - totHaW;
-          const varsBlockW = tableW - dayColW - totBlockW;
+          const varsBlockW = tableW - leftColsW - totBlockW;
           const singleVarW = nTableVars > 0 ? (varsBlockW / nTableVars) : 0;
+          
+          // Cálculo de fechas exactas (dd/mm/yyyy) para la semana ISO seleccionada de la campaña 2026
+          function getIsoWeekDayDateStr(weekNum, dayIdx) {
+            const w = parseInt(weekNum, 10);
+            const yearRef = 2026;
+            if (isNaN(w) || w < 1 || w > 53) return '--/--/----';
+            const jan4 = new Date(Date.UTC(yearRef, 0, 4));
+            const jan4Dow = jan4.getUTCDay() || 7;
+            const mondayW1 = new Date(Date.UTC(yearRef, 0, 4 - (jan4Dow - 1)));
+            const targetDate = new Date(mondayW1.getTime() + ((w - 1) * 7 + dayIdx) * 86400000);
+            const dd = String(targetDate.getUTCDate()).padStart(2, '0');
+            const mm = String(targetDate.getUTCMonth() + 1).padStart(2, '0');
+            const yyyy = targetDate.getUTCFullYear();
+            return `${dd}/${mm}/${yyyy}`;
+          }
           
           const thY = tableY + barTopH;
           const thH = 74;
@@ -4571,22 +4821,24 @@ ui <- fluidPage(
             octx.strokeStyle = '#CBD5E1';
             octx.lineWidth = 1.5;
             octx.beginPath();
-            octx.moveTo(tableX + dayColW, subThY);
-            octx.lineTo(tableX + dayColW + varsBlockW, subThY);
+            octx.moveTo(tableX + leftColsW, subThY);
+            octx.lineTo(tableX + leftColsW + varsBlockW, subThY);
             octx.stroke();
           }
           
-          // Encabezado Columna DÍA
+          // Encabezado Columna DÍA y Columna FECHA
           octx.fillStyle = '#334155';
           octx.font = 'bold 22px Inter, -apple-system, sans-serif';
           octx.textAlign = 'left';
           octx.textBaseline = 'middle';
           octx.fillText('DÍA', tableX + 28, thY + thH / 2);
+          octx.textAlign = 'center';
+          octx.fillText('FECHA', tableX + dayColW + dateColW / 2, thY + thH / 2);
           
           // Encabezados de cada Variedad y sus subcolumnas (HA | KG)
           const fVarHdrBase = nTableVars <= 2 ? 20 : (nTableVars === 3 ? 18 : 16);
           tableVars.forEach((vObj, vIdx) => {
-            const vx = tableX + dayColW + vIdx * singleVarW;
+            const vx = tableX + leftColsW + vIdx * singleVarW;
             const vHaW = singleVarW * 0.45;
             const vKgW = singleVarW * 0.55;
             
@@ -4611,7 +4863,7 @@ ui <- fluidPage(
           });
           
           // Encabezados de Totales Diarios Derecha (ÁREA | KILOS)
-          const totStartX = tableX + dayColW + varsBlockW;
+          const totStartX = tableX + leftColsW + varsBlockW;
           octx.fillStyle = '#0F172A';
           octx.font = 'bold 20px Inter, -apple-system, sans-serif';
           octx.textAlign = 'right';
@@ -4653,13 +4905,19 @@ ui <- fluidPage(
             octx.stroke();
             
             octx.fillStyle = '#0F172A';
-            octx.font = 'bold 24px Inter, -apple-system, sans-serif';
+            octx.font = 'bold 23px Inter, -apple-system, sans-serif';
             octx.fillText(st.name.toUpperCase(), tableX + 58, textY);
+            
+            // Columna 2: Fecha correspondiente al día (dd/mm/yyyy)
+            octx.textAlign = 'center';
+            octx.fillStyle = '#334155';
+            octx.font = '600 21px Inter, -apple-system, sans-serif';
+            octx.fillText(getIsoWeekDayDateStr(semNum, idx), tableX + dayColW + dateColW / 2, textY);
             
             // Columnas por cada Variedad (ha | kg)
             octx.textAlign = 'right';
             tableVars.forEach((vObj, vIdx) => {
-              const vx = tableX + dayColW + vIdx * singleVarW;
+              const vx = tableX + leftColsW + vIdx * singleVarW;
               const vHaW = singleVarW * 0.45;
               const vHa = st.haByVar[vObj.name] || 0;
               const vKg = st.kgByVar[vObj.name] || 0;
@@ -4710,7 +4968,7 @@ ui <- fluidPage(
           // Totales Semanales por cada Variedad en el Footer
           octx.textAlign = 'right';
           tableVars.forEach((vObj, vIdx) => {
-            const vx = tableX + dayColW + vIdx * singleVarW;
+            const vx = tableX + leftColsW + vIdx * singleVarW;
             const vHaW = singleVarW * 0.45;
             
             octx.fillStyle = vObj.ha > 0 ? '#0284C7' : '#94A3B8';
@@ -4731,9 +4989,16 @@ ui <- fluidPage(
           octx.font = 'bold ' + (totFontPx + 2) + 'px Inter, -apple-system, sans-serif';
           octx.fillText(`${fmtMiles(totalKgSemana)} kg`, tableX + tableW - 24, footTextY);
           
-          // E. Líneas divisorias verticales para separar bloques de Variedad, subcolumnas (ha | kg) y Totales
+          // E. Líneas divisorias verticales para separar DÍA | FECHA, bloques de Variedad, subcolumnas (ha | kg) y Totales
+          octx.strokeStyle = '#CBD5E1';
+          octx.lineWidth = 1.5;
+          octx.beginPath();
+          octx.moveTo(tableX + dayColW, thY);
+          octx.lineTo(tableX + dayColW, footY);
+          octx.stroke();
+          
           tableVars.forEach((vObj, vIdx) => {
-            const vx = tableX + dayColW + vIdx * singleVarW;
+            const vx = tableX + leftColsW + vIdx * singleVarW;
             const vHaW = singleVarW * 0.45;
             
             // Separador fuerte al inicio de cada bloque de variedad
@@ -4770,6 +5035,165 @@ ui <- fluidPage(
           octx.stroke();
           
           octx.restore(); // Fin contenedor único cuadro de resumen
+          
+          // -------------------------------------------------------------
+          // 5B. CUADRO ADICIONAL DE RECTIFICACIONES AL COSTADO DEL RESUMEN GENERAL
+          // -------------------------------------------------------------
+          if (hasRectBox) {
+            const rx = tableX + tableW + rectBoxGap;
+            const ry = tableY;
+            const rw = rectBoxW;
+            const rh = rectBoxH;
+            
+            octx.save();
+            octx.fillStyle = '#FFFFFF';
+            octx.strokeStyle = '#F59E0B';
+            octx.lineWidth = 2.5;
+            drawRoundRect(octx, rx, ry, rw, rh, 18);
+            octx.fill();
+            octx.stroke();
+            
+            // Barra Superior del Cuadro de Rectificaciones
+            octx.fillStyle = '#FFFBEB';
+            drawRoundRect(octx, rx, ry, rw, barTopH, 18);
+            octx.fill();
+            octx.strokeStyle = '#FCD34D';
+            octx.lineWidth = 2;
+            octx.beginPath();
+            octx.moveTo(rx, ry + barTopH);
+            octx.lineTo(rx + rw, ry + barTopH);
+            octx.stroke();
+            
+            const totRectHa = rectRows.reduce((acc, r) => acc + r.ha, 0);
+            const totRectKg = rectRows.reduce((acc, r) => acc + r.kg, 0);
+            
+            octx.textAlign = 'left';
+            octx.textBaseline = 'middle';
+            octx.fillStyle = '#92400E';
+            octx.font = 'bold 24px Inter, -apple-system, sans-serif';
+            octx.fillText('🛠️ DETALLE DE RECTIFICACIONES', rx + 24, ry + barTopH / 2);
+            
+            octx.textAlign = 'right';
+            octx.fillStyle = '#B45309';
+            octx.font = 'bold 21px Inter, -apple-system, sans-serif';
+            octx.fillText(`${rectRows.length} reg. (${fmtHa(totRectHa)} ha)`, rx + rw - 24, ry + barTopH / 2);
+            
+            // Encabezados de Columnas: DÍA | FECHA | VÁLVULA | % RECT. (HA) | KILOS
+            const c1W = 185; // DÍA
+            const c2W = 175; // FECHA
+            const c3W = 215; // VÁLVULA
+            const c4W = 195; // % (HA)
+            const c5W = rw - c1W - c2W - c3W - c4W; // KILOS
+            
+            const rThY = ry + barTopH;
+            const rThH = 74;
+            octx.fillStyle = '#F8FAFC';
+            octx.fillRect(rx, rThY, rw, rThH);
+            octx.strokeStyle = '#CBD5E1';
+            octx.lineWidth = 2;
+            octx.beginPath();
+            octx.moveTo(rx, rThY + rThH);
+            octx.lineTo(rx + rw, rThY + rThH);
+            octx.stroke();
+            
+            octx.fillStyle = '#334155';
+            octx.font = 'bold 19px Inter, -apple-system, sans-serif';
+            octx.textAlign = 'left';
+            octx.fillText('DÍA', rx + 22, rThY + rThH / 2);
+            octx.textAlign = 'center';
+            octx.fillText('FECHA', rx + c1W + c2W / 2, rThY + rThH / 2);
+            octx.fillText('VÁLVULA', rx + c1W + c2W + c3W / 2, rThY + rThH / 2);
+            octx.textAlign = 'right';
+            octx.fillText('% (ÁREA)', rx + c1W + c2W + c3W + c4W - 14, rThY + rThH / 2);
+            octx.fillText('KILOS', rx + rw - 20, rThY + rThH / 2);
+            
+            // Filas de válvulas rectificadas
+            const rRowStartY = rThY + rThH;
+            const rFootY = ry + rh - footH;
+            const rFontPx = rectRows.length <= 8 ? 20 : 17;
+            
+            rectRows.forEach((rr, idx) => {
+              const rowY = rRowStartY + idx * rectRowH;
+              if (rowY + rectRowH > rFootY + 2) return;
+              
+              octx.fillStyle = (idx % 2 === 0) ? '#FFFFFF' : '#FFFBEB';
+              octx.fillRect(rx, rowY, rw, rectRowH);
+              octx.strokeStyle = '#E2E8F0';
+              octx.lineWidth = 1.5;
+              octx.beginPath();
+              octx.moveTo(rx, rowY + rectRowH);
+              octx.lineTo(rx + rw, rowY + rectRowH);
+              octx.stroke();
+              
+              const ty = rowY + rectRowH / 2;
+              // 1. DÍA
+              octx.textAlign = 'left';
+              octx.fillStyle = rr.dayColor;
+              octx.beginPath();
+              octx.arc(rx + 28, ty, 10, 0, Math.PI * 2);
+              octx.fill();
+              octx.fillStyle = '#0F172A';
+              octx.font = 'bold ' + rFontPx + 'px Inter, -apple-system, sans-serif';
+              octx.fillText(rr.dayName.toUpperCase(), rx + 46, ty);
+              
+              // 2. FECHA
+              octx.textAlign = 'center';
+              octx.fillStyle = '#334155';
+              octx.font = '600 ' + (rFontPx - 1) + 'px Inter, -apple-system, sans-serif';
+              octx.fillText(getIsoWeekDayDateStr(semNum, rr.dayIdx), rx + c1W + c2W / 2, ty);
+              
+              // 3. VÁLVULA (T-V)
+              octx.fillStyle = '#0F172A';
+              octx.font = 'bold ' + rFontPx + 'px Inter, -apple-system, sans-serif';
+              octx.fillText(rr.codigoTV, rx + c1W + c2W + c3W / 2, ty);
+              
+              // 4. % RECT. (HA)
+              octx.textAlign = 'right';
+              octx.fillStyle = '#B45309';
+              octx.font = 'bold ' + rFontPx + 'px Inter, -apple-system, sans-serif';
+              octx.fillText(`${rr.pct}% (${fmtHa(rr.ha)} ha)`, rx + c1W + c2W + c3W + c4W - 14, ty);
+              
+              // 5. KILOS
+              octx.fillStyle = rr.kg > 0 ? '#D97706' : '#94A3B8';
+              octx.fillText(rr.kg > 0 ? `${fmtMiles(rr.kg)} kg` : '0 kg', rx + rw - 20, ty);
+            });
+            
+            // Footer de Total Rectificado
+            octx.fillStyle = '#FFFBEB';
+            drawRoundRect(octx, rx, rFootY, rw, footH, 18);
+            octx.fill();
+            octx.strokeStyle = '#92400E';
+            octx.lineWidth = 2.5;
+            octx.beginPath();
+            octx.moveTo(rx, rFootY);
+            octx.lineTo(rx + rw, rFootY);
+            octx.stroke();
+            
+            const rFootTy = rFootY + footH / 2;
+            octx.textAlign = 'left';
+            octx.fillStyle = '#92400E';
+            octx.font = 'bold 21px Inter, -apple-system, sans-serif';
+            octx.fillText(`TOTAL RECTIFICADO (${rectRows.length} válv.)`, rx + 22, rFootTy);
+            
+            octx.textAlign = 'right';
+            octx.fillStyle = '#B45309';
+            octx.font = 'bold 22px Inter, -apple-system, sans-serif';
+            octx.fillText(`${fmtHa(totRectHa)} ha`, rx + c1W + c2W + c3W + c4W - 14, rFootTy);
+            octx.fillStyle = '#D97706';
+            octx.fillText(`${fmtMiles(totRectKg)} kg`, rx + rw - 20, rFootTy);
+            
+            // Líneas divisorias verticales del cuadro de rectificaciones
+            [rx + c1W, rx + c1W + c2W, rx + c1W + c2W + c3W, rx + c1W + c2W + c3W + c4W].forEach((divX, dIdx) => {
+              octx.strokeStyle = dIdx >= 2 ? '#94A3B8' : '#CBD5E1';
+              octx.lineWidth = dIdx >= 2 ? 2 : 1.5;
+              octx.beginPath();
+              octx.moveTo(divX, rThY);
+              octx.lineTo(divX, dIdx >= 2 ? (ry + rh) : rFootY);
+              octx.stroke();
+            });
+            
+            octx.restore();
+          }
           
           // -------------------------------------------------------------
           // 6. DESCARGA AUTOMÁTICA DEL ARCHIVO PNG EN ALTA DEFINICIÓN
@@ -5115,20 +5539,7 @@ ui <- fluidPage(
             return false;
           }
           saveSnapshotForUndo();
-          for (let i = 0; i < 10; i++) {
-            if (cells[i] === targetDay) {
-              cells[i] = '';
-              if (slot.cellFractions && slot.cellFractions[i] !== undefined) {
-                delete slot.cellFractions[i];
-              }
-            }
-          }
-          slot.ranges = buildRangesFromCells(slot);
-          slot.align = detectAlignFromCells(slot.cells, slot.cellFractions);
-          for (let d of DAY_KEYS) slot.counts[d] = 0;
-          for (let r of slot.ranges) {
-            slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
-          }
+          applyRangesToSlot(slot, getSlotRanges(slot).filter(r => r.day !== targetDay));
           recomputeValveSlotCounts(v, key);
           changed = true;
           requestRender();
@@ -5147,27 +5558,18 @@ ui <- fluidPage(
         }
         
         const c = cellIndexAt(v, wx, wy);
-        if (cells[c] === '') {
-          return false;
-        }
-        if (cells[c] !== targetDay) {
-          if (!strokeChanged) {
+        const eS = c * 10, eE = (c + 1) * 10;
+        const rangesE = getSlotRanges(slot);
+        const tieneDiaEnCuadro = rangesE.some(r => r.day === targetDay && Math.min(r.end, eE) - Math.max(r.start, eS) > 0.01);
+        if (!tieneDiaEnCuadro) {
+          if (cells[c] && cells[c] !== targetDay && !strokeChanged) {
             showMapToast(`🔒 Cuadro ${c + 1} pertenece a ${DAY_NAMES[cells[c]]}. Solo puedes borrar cuadros de ${DAY_NAMES[targetDay]} (día activo).`);
           }
           return false;
         }
         
         saveSnapshotForUndo();
-        cells[c] = '';
-        if (slot.cellFractions && slot.cellFractions[c] !== undefined) {
-          delete slot.cellFractions[c];
-        }
-        slot.ranges = buildRangesFromCells(slot);
-        slot.align = detectAlignFromCells(slot.cells, slot.cellFractions);
-        for (let d of DAY_KEYS) slot.counts[d] = 0;
-        for (let r of slot.ranges) {
-          slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
-        }
+        applyRangesToSlot(slot, subtractFromRanges(rangesE, targetDay, eS, eE));
         recomputeValveSlotCounts(v, key);
         changed = true;
         marcarCambiosPendientes(true);
@@ -5181,12 +5583,27 @@ ui <- fluidPage(
       // PINTAR DÍA ACTIVO
       // -----------------------------------------------------------------------
       const dayVal = activeDay;
-      const otherSlot = getOtherPassSlot(v);
-      const otherPassLabel = activePass === 1 ? '2ª Pasada' : '1ª Pasada';
-      
-      if ((otherSlot.counts[dayVal] || 0) > 0) {
-        showMapToast(`⚠️ Válvula ${v.codigo} ya tiene ${DAY_NAMES[dayVal]} en la ${otherPassLabel}`);
-        return false;
+      if (activeMode === 'Rectificacion') {
+        const baseCampoSlot = v.slots['CosechaCampo_' + activePass];
+        const baseProySlot  = v.slots['Proyeccion_' + activePass];
+        let tieneBasePrevia = false;
+        for (let d of DAY_KEYS) {
+          if (((baseCampoSlot && baseCampoSlot.counts[d]) || 0) > 0 || ((baseProySlot && baseProySlot.counts[d]) || 0) > 0) {
+            tieneBasePrevia = true;
+            break;
+          }
+        }
+        if (!tieneBasePrevia) {
+          showMapToast(`⚠️ V-${v.codigo} debe estar pintada previamente en Cosecha Campo (${activePass}ª Pasada) para poder rectificarla.`);
+          return false;
+        }
+      } else {
+        const otherSlot = getOtherPassSlot(v);
+        const otherPassLabel = activePass === 1 ? '2ª Pasada' : '1ª Pasada';
+        if ((otherSlot.counts[dayVal] || 0) > 0) {
+          showMapToast(`⚠️ Válvula ${v.codigo} ya tiene ${DAY_NAMES[dayVal]} en la ${otherPassLabel}`);
+          return false;
+        }
       }
       
       // Porcentaje ocupado por los DEMÁS días en esta pasada
@@ -5212,21 +5629,12 @@ ui <- fluidPage(
         }
         
         saveSnapshotForUndo();
-        // Asignar todos los cuadros libres al día activo
-        for (let i = 0; i < 10; i++) {
-          if (cells[i] === '' || cells[i] === dayVal) {
-            cells[i] = dayVal;
-            if (slot.cellFractions && slot.cellFractions[i] !== undefined) {
-              delete slot.cellFractions[i];
-            }
-          }
-        }
-        slot.ranges = buildRangesFromCells(slot);
-        slot.align = detectAlignFromCells(slot.cells, slot.cellFractions);
-        for (let d of DAY_KEYS) slot.counts[d] = 0;
-        for (let r of slot.ranges) {
-          slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
-        }
+        // Asignar al día activo TODOS los espacios libres exactos (sea a la izquierda, a la derecha o a ambos lados
+        // si el día anterior se pintó desde el centro). Los demás días conservan su posición: no quedan franjas blancas.
+        const rangosOtros = getSlotRanges(slot).filter(r => r.day !== dayVal && r.pct > 0.001);
+        const libres100 = computeFreeIntervals(rangosOtros);
+        const segsDia = libres100.map(fi => ({ day: dayVal, start: fi.start, end: fi.end }));
+        applyRangesToSlot(slot, rangosOtros.concat(segsDia));
         recomputeValveSlotCounts(v, key);
         changed = true;
         
@@ -5236,20 +5644,25 @@ ui <- fluidPage(
         showMapToast(`⚡ V-${v.codigo}: ${totalAsig}% (${haAsig} ha) asignado a ${DAY_NAMES[dayVal]}. Total: 100%.`);
       } else if (paintTool === 'cells') {
         const c = cellIndexAt(v, wx, wy);
-        
-        // Si el cuadro ya está pintado con el día activo, no hacer nada (evita re-pintado continuo al arrastrar)
-        if (cells[c] === dayVal) {
-          return false;
+        const cS = c * 10, cE = (c + 1) * 10;
+        const rangosAct = getSlotRanges(slot).filter(r => r.pct > 0.001);
+        const libresAct = computeFreeIntervals(rangosAct);
+        const nuevos = [];
+        for (const fi of libresAct) {
+          const s = Math.max(fi.start, cS), e = Math.min(fi.end, cE);
+          if (e - s > 0.01) nuevos.push({ day: dayVal, start: s, end: e });
         }
         
-        // Si el cuadro pertenece a otro día
-        if (cells[c] !== '') {
-          if (!strokeChanged) {
-            showMapToast(`🔒 Cuadro ${c + 1} pertenece a ${DAY_NAMES[cells[c]]}. Haz clic en un espacio libre para pintar ${DAY_NAMES[dayVal]}.`);
+        if (nuevos.length === 0) {
+          // Cuadro sin espacio libre: si es del día activo no hacer nada (evita re-pintado al arrastrar)
+          const esDeOtroDia = rangosAct.some(r => r.day !== dayVal && Math.min(r.end, cE) - Math.max(r.start, cS) > 0.01);
+          if (esDeOtroDia && !strokeChanged) {
+            const dOtro = cells[c] && cells[c] !== dayVal ? cells[c] : (rangosAct.find(r => r.day !== dayVal && Math.min(r.end, cE) - Math.max(r.start, cS) > 0.01) || {}).day;
+            showMapToast(`🔒 Cuadro ${c + 1} pertenece a ${DAY_NAMES[dOtro] || 'otro día'}. Haz clic en un espacio libre para pintar ${DAY_NAMES[dayVal]}.`);
           }
           return false;
         }
-        
+
         const curDayPct = Number(slot.counts[dayVal]) || 0;
         const remainingForDay = Math.max(0, Math.round((maxAvailablePct - curDayPct) * 100) / 100);
         if (remainingForDay <= 0) {
@@ -5259,17 +5672,8 @@ ui <- fluidPage(
           return false;
         }
         
-        saveSnapshotForUndo();
-        cells[c] = dayVal;
-        if (slot.cellFractions && slot.cellFractions[c] !== undefined) {
-          delete slot.cellFractions[c];
-        }
-        slot.ranges = buildRangesFromCells(slot);
-        slot.align = detectAlignFromCells(slot.cells, slot.cellFractions);
-        for (let d of DAY_KEYS) slot.counts[d] = 0;
-        for (let r of slot.ranges) {
-          slot.counts[r.day] = Math.round(((slot.counts[r.day] || 0) + r.pct) * 100) / 100;
-        }
+        let rangosNuevos = rangosAct.concat(nuevos);
+        applyRangesToSlot(slot, rangosNuevos);
         recomputeValveSlotCounts(v, key);
         changed = true;
         
@@ -5292,6 +5696,7 @@ ui <- fluidPage(
     let valveSeleccionadaModal = null;
     let targetPctModal = 0;
     let modalPaintDirection = 'start';
+    let modalInputMode = 'ha'; // 'ha' o 'pct': indica cuál fue el último campo editado en el modal
 
     function seleccionarDireccionModal(dir) {
       modalPaintDirection = dir;
@@ -5363,7 +5768,7 @@ ui <- fluidPage(
       }
       
       const passTxt = activePass === 1 ? '1ª Pasada' : '2ª Pasada';
-      const modoTxt = activeMode === 'Proyeccion' ? '📋 Proyección' : '🚜 Cosecha Campo';
+      const modoTxt = activeMode === 'Proyeccion' ? '📋 Proyección' : (activeMode === 'Rectificacion' ? '🛠️ Rectificaciones' : '🚜 Cosecha Campo');
       const dayColor = DAY_COLORS[activeDay] || '#007AFF';
       const dayName = DAY_NAMES[activeDay] || activeDay;
       
@@ -5399,6 +5804,7 @@ ui <- fluidPage(
         inpPct.max = maxAvailablePct;
         inpPct.value = targetPctModal > 0 ? targetPctModal.toFixed(2) : '';
       }
+      modalInputMode = 'ha';
       
       modalPaintDirection = detectSlotAlign(slot, true) || slot.align || 'start';
       
@@ -5474,6 +5880,7 @@ ui <- fluidPage(
 
     function onInputModalArea(val) {
       if (!valveSeleccionadaModal) return;
+      modalInputMode = 'ha';
       const totalHa = parseFloat(valveSeleccionadaModal.Área) || 0;
       const inpHa = document.getElementById('input_asignar_ha');
       const inpPct = document.getElementById('input_asignar_pct');
@@ -5496,7 +5903,9 @@ ui <- fluidPage(
         return;
       }
       
-      const valHa = parseFloat(val);
+      // Permitir tanto punto como coma decimal durante la escritura
+      const cleanVal = String(val).replace(',', '.');
+      const valHa = parseFloat(cleanVal);
       if (isNaN(valHa) || valHa <= 0) {
         targetPctModal = 0;
         if (inpPct) inpPct.value = '';
@@ -5505,19 +5914,21 @@ ui <- fluidPage(
         return;
       }
       
-      if (valHa > maxAvailableHa + 0.001) {
-        targetPctModal = maxAvailablePct;
+      if (valHa > maxAvailableHa + 0.005) {
+        // NO sobreescribir inpHa.value a 100% mientras el usuario escribe (ej. si escribe '2' antes de '.05' o se equivoca de dígito),
+        // para evitar que se guarde 100% por accidente. Solo alertar y mantener vista previa en 0 hasta que corrija el valor.
+        targetPctModal = 0;
         if (inpHa) {
-          inpHa.value = maxAvailableHa.toFixed(2);
           inpHa.style.borderColor = '#FF3B30';
           inpHa.style.boxShadow = '0 0 0 3px rgba(255, 59, 48, 0.2)';
         }
         if (inpPct) {
-          inpPct.value = maxAvailablePct.toFixed(2);
+          inpPct.value = '';
         }
-        mostrarAlertaModal(`⚠️ No puedes ingresar más de ${maxAvailableHa.toFixed(2)} ha (${maxAvailablePct.toFixed(2)}%), que es el espacio libre restante.`);
+        mostrarAlertaModal(`⚠️ El valor ingresado (${valHa} ha) supera el área libre disponible de esta válvula (${maxAvailableHa.toFixed(2)} ha / ${maxAvailablePct.toFixed(2)}%). Corrige el valor antes de aplicar.`);
       } else {
-        targetPctModal = totalHa > 0 ? Math.round((valHa / totalHa) * 10000) / 100 : 0;
+        const rawPct = totalHa > 0 ? (valHa / totalHa) * 100 : 0;
+        targetPctModal = Math.min(maxAvailablePct, Math.round(rawPct * 100) / 100);
         if (inpPct) inpPct.value = targetPctModal > 0 ? targetPctModal.toFixed(2) : '';
         ocultarAlertaModal();
       }
@@ -5527,6 +5938,7 @@ ui <- fluidPage(
 
     function onInputModalPct(val) {
       if (!valveSeleccionadaModal) return;
+      modalInputMode = 'pct';
       const totalHa = parseFloat(valveSeleccionadaModal.Área) || 0;
       const inpPct = document.getElementById('input_asignar_pct');
       const inpHa = document.getElementById('input_asignar_ha');
@@ -5549,7 +5961,8 @@ ui <- fluidPage(
         return;
       }
       
-      const valPct = parseFloat(val);
+      const cleanVal = String(val).replace(',', '.');
+      const valPct = parseFloat(cleanVal);
       if (isNaN(valPct) || valPct <= 0) {
         targetPctModal = 0;
         if (inpHa) inpHa.value = '';
@@ -5558,17 +5971,16 @@ ui <- fluidPage(
         return;
       }
       
-      if (valPct > maxAvailablePct) {
-        targetPctModal = maxAvailablePct;
+      if (valPct > maxAvailablePct + 0.01) {
+        targetPctModal = 0;
         if (inpPct) {
-          inpPct.value = maxAvailablePct.toFixed(2);
           inpPct.style.borderColor = '#FF3B30';
           inpPct.style.boxShadow = '0 0 0 3px rgba(255, 59, 48, 0.2)';
         }
         if (inpHa) {
-          inpHa.value = maxAvailableHa;
+          inpHa.value = '';
         }
-        mostrarAlertaModal(`⚠️ No puedes asignar más de ${maxAvailablePct.toFixed(2)}% (${maxAvailableHa} ha). Espacio libre superado.`);
+        mostrarAlertaModal(`⚠️ No puedes asignar más de ${maxAvailablePct.toFixed(2)}% (${maxAvailableHa} ha). Corrige el porcentaje antes de aplicar.`);
       } else {
         targetPctModal = Math.round(valPct * 100) / 100;
         if (inpHa) inpHa.value = targetPctModal > 0 ? ((targetPctModal / 100) * totalHa).toFixed(2) : '';
@@ -5580,6 +5992,7 @@ ui <- fluidPage(
 
     function fijarPorcentajeModal(pct) {
       if (!valveSeleccionadaModal) return;
+      modalInputMode = 'pct';
       const totalHa = parseFloat(valveSeleccionadaModal.Área) || 0;
       const inpHa = document.getElementById('input_asignar_ha');
       const inpPct = document.getElementById('input_asignar_pct');
@@ -5774,25 +6187,44 @@ ui <- fluidPage(
       const dayVal = activeDay;
       const isHoriz = isHorizontalValve(v);
       
-      saveSnapshotForUndo();
-      
       let otherDaysPct = 0;
       for (let d of DAY_KEYS) {
         if (d !== dayVal) otherDaysPct += (Number(slot.counts[d]) || 0);
       }
       otherDaysPct = Math.round(otherDaysPct * 100) / 100;
       const maxPct = Math.max(0, 100 - otherDaysPct);
+      const maxAvailableHa = (totalHa * (maxPct / 100));
       
       const inpHa = document.getElementById('input_asignar_ha');
       const inpPct = document.getElementById('input_asignar_pct');
+      const valHaRaw = inpHa && inpHa.value !== '' ? parseFloat(String(inpHa.value).replace(',', '.')) : NaN;
+      const valPctRaw = inpPct && inpPct.value !== '' ? parseFloat(String(inpPct.value).replace(',', '.')) : NaN;
+      
+      // Validar que no haya un exceso pendiente en los inputs antes de aplicar
+      if (modalInputMode === 'ha' && !isNaN(valHaRaw) && valHaRaw > maxAvailableHa + 0.005) {
+        mostrarAlertaModal(`⚠️ El área ingresada (${valHaRaw} ha) supera el máximo disponible (${maxAvailableHa.toFixed(2)} ha). Corrígela antes de aplicar.`);
+        return;
+      }
+      if (modalInputMode === 'pct' && !isNaN(valPctRaw) && valPctRaw > maxPct + 0.01) {
+        mostrarAlertaModal(`⚠️ El porcentaje ingresado (${valPctRaw}%) supera el máximo disponible (${maxPct.toFixed(2)}%). Corrígelo antes de aplicar.`);
+        return;
+      }
+      
+      saveSnapshotForUndo();
+      
       let pct = targetPctModal;
-      if (inpPct && inpPct.value !== '' && !isNaN(parseFloat(inpPct.value))) {
-        pct = parseFloat(inpPct.value);
-      } else if (inpHa && inpHa.value !== '' && !isNaN(parseFloat(inpHa.value)) && totalHa > 0) {
-        pct = (parseFloat(inpHa.value) / totalHa) * 100;
+      if (modalInputMode === 'ha' && !isNaN(valHaRaw) && totalHa > 0) {
+        pct = (valHaRaw / totalHa) * 100;
+      } else if (modalInputMode === 'pct' && !isNaN(valPctRaw)) {
+        pct = valPctRaw;
+      } else if (!isNaN(valHaRaw) && totalHa > 0) {
+        pct = (valHaRaw / totalHa) * 100;
+      } else if (!isNaN(valPctRaw)) {
+        pct = valPctRaw;
       }
       pct = Math.min(Math.max(0, pct), maxPct);
-      if (Math.abs(pct - maxPct) < 0.15) {
+      // Solo redondear al máximo si la diferencia es por redondeo flotante ínfimo (< 0.02%)
+      if (Math.abs(pct - maxPct) < 0.02) {
         pct = maxPct;
       }
       pct = Math.round(pct * 100) / 100;
@@ -5870,6 +6302,11 @@ ui <- fluidPage(
             if (v) abrirModalAsignarArea(v);
             return;
           }
+          // Si es el segundo clic de un doble clic (e.detail >= 2), no pintar un segundo +10%
+          // porque el evento dblclick abrirá inmediatamente el modal de Asignar Área (ha)
+          if (e.detail >= 2) {
+            return;
+          }
           saveSnapshotForUndo();
           isDrawing = true;
           strokeChanged = false;
@@ -5887,16 +6324,19 @@ ui <- fluidPage(
           return;
         }
         
-        const pos = screenToWorld(e.clientX, e.clientY);
-        const v = findValveAt(pos.x, pos.y);
-        
         if (isDrawing) {
+          const pos = screenToWorld(e.clientX, e.clientY);
+          const v = findValveAt(pos.x, pos.y);
           if (v && applyPaint(v, pos.x, pos.y)) {
             strokeChanged = true;
             syncStateToShiny(false);
           }
-        } else {
+        } else if (window.USER_PERMISOS && (window.USER_PERMISOS.es_visualizador || window.USER_PERMISOS.es_admin)) {
+          const pos = screenToWorld(e.clientX, e.clientY);
+          const v = findValveAt(pos.x, pos.y);
           updateTooltip(v, e.clientX, e.clientY);
+        } else if (tooltip && tooltip.style.display !== 'none') {
+          tooltip.style.display = 'none';
         }
       });
       
@@ -6073,8 +6513,8 @@ ui <- fluidPage(
     }
     
     function updateTooltip(v, clientX, clientY) {
-      if (!v) {
-        tooltip.style.display = 'none';
+      if (!window.USER_PERMISOS || (!window.USER_PERMISOS.es_visualizador && !window.USER_PERMISOS.es_admin) || !v) {
+        if (tooltip) tooltip.style.display = 'none';
         return;
       }
       const rect = wrapper.getBoundingClientRect();
@@ -6083,6 +6523,8 @@ ui <- fluidPage(
       let modoLabel = '📋 PROYECCIÓN';
       if (activeMode === 'CosechaCampo' || activeMode === 'Cosecha') {
         modoLabel = '🚜 COSECHA CAMPO';
+      } else if (activeMode === 'Rectificacion') {
+        modoLabel = '🛠️ RECTIFICACIONES';
       } else if (activeMode === 'CosechaOficial') {
         modoLabel = '🏛️ COSECHA OFICIAL 🔒';
       }
@@ -6107,41 +6549,47 @@ ui <- fluidPage(
     }
     
     let syncTimeout = null;
+    function buildProgramacionPayload() {
+      const payload = [];
+      const combos = [
+        { mode: 'Proyeccion',    pass: 1, key: 'Proyeccion_1' },
+        { mode: 'Proyeccion',    pass: 2, key: 'Proyeccion_2' },
+        { mode: 'CosechaCampo',  pass: 1, key: 'CosechaCampo_1' },
+        { mode: 'CosechaCampo',  pass: 2, key: 'CosechaCampo_2' },
+        { mode: 'Rectificacion', pass: 1, key: 'Rectificacion_1' },
+        { mode: 'Rectificacion', pass: 2, key: 'Rectificacion_2' }
+      ];
+      
+      for (let i = 0; i < VALVES_DATA.length; i++) {
+        const v = VALVES_DATA[i];
+        for (let cb of combos) {
+          const s = v.slots[cb.key];
+          let totPct = 0;
+          for (let d of DAY_KEYS) totPct += (s.counts[d] || 0);
+          if (totPct > 0) {
+            payload.push({
+              id:            v.id,
+              Tipo_Registro: cb.mode,
+              Num_Pasada:    cb.pass,
+              lunes:         s.counts['lunes'] || 0,
+              martes:        s.counts['martes'] || 0,
+              miercoles:     s.counts['miercoles'] || 0,
+              jueves:        s.counts['jueves'] || 0,
+              viernes:       s.counts['viernes'] || 0,
+              sabado:        s.counts['sabado'] || 0,
+              cells_str:     s.cells.join(',')
+            });
+          }
+        }
+      }
+      return payload;
+    }
+    
     function syncStateToShiny(immediate = false) {
       if (syncTimeout) clearTimeout(syncTimeout);
       
       const doSync = function() {
-        const payload = [];
-        const combos = [
-          { mode: 'Proyeccion',   pass: 1, key: 'Proyeccion_1' },
-          { mode: 'Proyeccion',   pass: 2, key: 'Proyeccion_2' },
-          { mode: 'CosechaCampo', pass: 1, key: 'CosechaCampo_1' },
-          { mode: 'CosechaCampo', pass: 2, key: 'CosechaCampo_2' }
-        ];
-        
-        for (let i = 0; i < VALVES_DATA.length; i++) {
-          const v = VALVES_DATA[i];
-          for (let cb of combos) {
-            const s = v.slots[cb.key];
-            let totPct = 0;
-            for (let d of DAY_KEYS) totPct += (s.counts[d] || 0);
-            if (totPct > 0) {
-              payload.push({
-                id:            v.id,
-                Tipo_Registro: cb.mode,
-                Num_Pasada:    cb.pass,
-                lunes:         s.counts['lunes'] || 0,
-                martes:        s.counts['martes'] || 0,
-                miercoles:     s.counts['miercoles'] || 0,
-                jueves:        s.counts['jueves'] || 0,
-                viernes:       s.counts['viernes'] || 0,
-                sabado:        s.counts['sabado'] || 0,
-                cells_str:     s.cells.join(',')
-              });
-            }
-          }
-        }
-        
+        const payload = buildProgramacionPayload();
         if (window.Shiny && window.Shiny.setInputValue) {
           Shiny.setInputValue('mapa_programacion_json', JSON.stringify(payload), { priority: 'event' });
         }
@@ -6277,6 +6725,26 @@ ui <- fluidPage(
           ctx.fillText(badgeText, v.x + v.w - bw / 2 - 3, v.y + 3 + bh / 2);
         }
         
+        // Indicador visual 'RECT' en Cosecha Campo cuando la válvula tiene rectificación registrada
+        if (activeMode !== 'Rectificacion' && scale > 0.16 && v.w >= 22) {
+          const rSlot = v.slots && v.slots['Rectificacion_' + activePass];
+          let hasRect = false;
+          if (rSlot && rSlot.counts) {
+            for (let d of DAY_KEYS) { if ((rSlot.counts[d] || 0) > 0) { hasRect = true; break; } }
+          }
+          if (hasRect) {
+            const rbw = Math.min(32, v.w * 0.34);
+            const rbh = Math.min(14, v.h * 0.22);
+            ctx.fillStyle = '#D97706';
+            ctx.fillRect(v.x + 3, v.y + 3, rbw, rbh);
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = 'bold ' + Math.max(6.5, Math.floor(rbh * 0.68)) + 'px Inter, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('RECT', v.x + 3 + rbw / 2, v.y + 3 + rbh / 2);
+          }
+        }
+        
         if (scale > 0.12 && v.w >= 18) {
           ctx.save();
           ctx.textAlign = 'center';
@@ -6291,19 +6759,26 @@ ui <- fluidPage(
           const ry2 = isTriangle ? 0.74 : (isSlopedTop ? (v.pts[0][1] < 0.80 ? 0.64 : 0.60) : 0.55);
           const ry3 = isTriangle ? 0.88 : (isSlopedTop ? (v.pts[0][1] < 0.80 ? 0.85 : 0.83) : 0.81);
           
+          let codeLabel = v.codigo || '';
+          if (v.Turno && v.Válvula) {
+            codeLabel = 'T' + v.Turno + '-V' + v.Válvula;
+          } else {
+            codeLabel = codeLabel.replace(/^M[0-9]+-/, '');
+          }
+          
           if (scale > 0.20) {
             let fSizeCode = Math.min(19, Math.max(8, Math.floor(v.w * 0.13)));
             if (v.w < 90) fSizeCode = Math.min(10.5, fSizeCode);
             ctx.font = 'bold ' + fSizeCode + 'px Inter, sans-serif';
-            let codeW = ctx.measureText(v.codigo).width;
+            let codeW = ctx.measureText(codeLabel).width;
             if (codeW > maxTextW) {
               fSizeCode = Math.max(7, Math.floor(fSizeCode * (maxTextW / codeW)));
               ctx.font = 'bold ' + fSizeCode + 'px Inter, sans-serif';
             }
             ctx.lineWidth = Math.min(Math.max(2.4 / scale, 1.2), Math.max(1.1, fSizeCode * 0.22));
             const y1 = v.y + v.h * ry1;
-            ctx.strokeText(v.codigo, cx, y1);
-            ctx.fillText(v.codigo, cx, y1);
+            ctx.strokeText(codeLabel, cx, y1);
+            ctx.fillText(codeLabel, cx, y1);
             
             let fSizeVar = Math.min(13, Math.max(6.5, Math.round(fSizeCode * 0.68)));
             ctx.font = '600 ' + fSizeVar + 'px Inter, sans-serif';
@@ -6334,15 +6809,15 @@ ui <- fluidPage(
           } else {
             let fSizeZoom = Math.min(21, Math.max(8, Math.floor(v.w * 0.15)));
             ctx.font = 'bold ' + fSizeZoom + 'px Inter, sans-serif';
-            let zW = ctx.measureText(v.codigo).width;
+            let zW = ctx.measureText(codeLabel).width;
             if (zW > maxTextW) {
               fSizeZoom = Math.max(7, Math.floor(fSizeZoom * (maxTextW / zW)));
               ctx.font = 'bold ' + fSizeZoom + 'px Inter, sans-serif';
             }
             ctx.lineWidth = Math.min(Math.max(2.8 / scale, 1.4), Math.max(1.3, fSizeZoom * 0.25));
             const midY = isTriangle ? 0.72 : (isSlopedTop ? 0.62 : 0.50);
-            ctx.strokeText(v.codigo, cx, v.y + v.h * midY);
-            ctx.fillText(v.codigo, cx, v.y + v.h * midY);
+            ctx.strokeText(codeLabel, cx, v.y + v.h * midY);
+            ctx.fillText(codeLabel, cx, v.y + v.h * midY);
           }
           ctx.restore();
         } else if (scale > 0.35 && v.w >= 3 && v.w < 18) {
@@ -6488,6 +6963,8 @@ ui <- fluidPage(
               'Proyeccion_2':     createEmptySlot(),
               'CosechaCampo_1':   createEmptySlot(),
               'CosechaCampo_2':   createEmptySlot(),
+              'Rectificacion_1':  createEmptySlot(),
+              'Rectificacion_2':  createEmptySlot(),
               'CosechaOficial_1': createEmptySlot(),
               'CosechaOficial_2': createEmptySlot()
             };
@@ -6504,6 +6981,8 @@ ui <- fluidPage(
             let mode = 'Proyeccion';
             if (r.Tipo_Registro === 'Cosecha' || r.Tipo_Registro === 'CosechaCampo') {
               mode = 'CosechaCampo';
+            } else if (r.Tipo_Registro === 'Rectificacion') {
+              mode = 'Rectificacion';
             } else if (r.Tipo_Registro === 'CosechaOficial') {
               mode = 'CosechaOficial';
             }
@@ -6757,6 +7236,10 @@ ui <- fluidPage(
         
         Shiny.addCustomMessageHandler('limpiar_cambios_pendientes', function(message) {
           marcarCambiosPendientes(false);
+        });
+        
+        Shiny.addCustomMessageHandler('marcar_cambios_pendientes', function(message) {
+          marcarCambiosPendientes(true);
         });
         
         Shiny.addCustomMessageHandler('forzar_cambio_semana', function(data) {
@@ -7150,7 +7633,7 @@ server <- function(input, output, session) {
   
   esquema_base_semana <- function() {
     expand_grid(
-      Tipo_Registro = c("Proyeccion", "CosechaCampo", "CosechaOficial"),
+      Tipo_Registro = c("Proyeccion", "CosechaCampo", "Rectificacion", "CosechaOficial"),
       Num_Pasada    = c(1, 2),
       id            = df_valvulas$id
     ) %>%
@@ -7162,6 +7645,21 @@ server <- function(input, output, session) {
   }
   
   programacion_semana <- reactiveVal(esquema_base_semana())
+  # Snapshot de lo que tiene el navegador cargado como línea base de la semana activa,
+  # para detectar con exactitud qué válvulas modificó este usuario frente a lo que vio en pantalla
+  base_cliente_semana_rv <- reactiveVal(esquema_base_semana())
+  # Registro acumulativo de válvulas (por clave "semana|modo") que este usuario ha modificado en la sesión actual,
+  # garantizando que múltiples guardados seguidos o cambios de filtro NUNCA borren cambios previos de la misma sesión
+  ids_modificados_sesion_rv <- reactiveVal(list())
+  
+  limpiar_modificados_semana <- function(sem_num) {
+    mods <- isolate(ids_modificados_sesion_rv())
+    if (length(mods) > 0) {
+      pref <- paste0(sem_num, "|")
+      keys_keep <- names(mods)[!startsWith(names(mods), pref)]
+      ids_modificados_sesion_rv(mods[keys_keep])
+    }
+  }
   
   # Función que recalcula automáticamente los Kilos Proyectados de cada válvula desde la Hoja Cálculo
   recalcular_kg_proyeccion <- function(df_prog) {
@@ -7350,7 +7848,7 @@ server <- function(input, output, session) {
         }
         if (nrow(df_sheets) > 0 || es_entorno_nube) {
           df_total <- rutas_disco_rv() %>%
-            filter(!(Campaña == "2026" & Semana == sem_num & Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha"))) %>%
+            filter(!(Campaña == "2026" & Semana == sem_num & Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha", "Rectificacion"))) %>%
             bind_rows(df_hist)
           guardar_rutas_disco(df_total)
           rutas_disco_rv(df_total)
@@ -7399,6 +7897,8 @@ server <- function(input, output, session) {
     }
     # Respetar los kilos guardados para Proyección y Cosecha Campo sin sobreescribir automáticamente
     programacion_semana(base)
+    base_cliente_semana_rv(base)
+    limpiar_modificados_semana(sem_num)
     
     filas_activas <- base %>%
       filter((Lunes + Martes + Miércoles + Jueves + Viernes + Sábado) > 0) %>%
@@ -7410,6 +7910,10 @@ server <- function(input, output, session) {
     cambios_pendientes_rv(FALSE)
     session$sendCustomMessage("limpiar_cambios_pendientes", list())
   }, ignoreInit = FALSE)
+  
+  # Pasadas cuyo último envío a Google Sheets FALLÓ (clave "semana|modo|pasada" -> ids de válvulas pendientes).
+  # Mientras exista la marca, el siguiente "Guardar Ruta" reenvía esa pasada aunque no tenga cambios nuevos.
+  sheets_pendientes_rv <- reactiveVal(list())
   
   persistir_semana_actual <- function(df_prog_semana, modo = NULL, pasada = NULL, mostrar_notif = FALSE, sincronizar_sheets = FALSE, ids_scope = NULL) {
     sem_num <- as.numeric(isolate(semana_activa_rv()))
@@ -7442,7 +7946,7 @@ server <- function(input, output, session) {
     
     # Solo persistir rutas editables (Proyección y Cosecha Campo), sin sobreescribir Cosecha Oficial
     df_guardar_sem <- df_prog_semana %>%
-      filter(Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha")) %>%
+      filter(Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha", "Rectificacion")) %>%
       mutate(Tipo_Registro = as.character(ifelse(Tipo_Registro == "Cosecha", "CosechaCampo", Tipo_Registro))) %>%
       filter((Lunes + Martes + Miércoles + Jueves + Viernes + Sábado) > 0) %>%
       select(-any_of(c("Área", "Área.x", "Área.y", "codigo", "Grupo", "Sector", "Módulo", "Turno", "Variedad"))) %>%
@@ -7468,58 +7972,118 @@ server <- function(input, output, session) {
         cells_str, Fecha_Actualizacion
       )
     
-    # ALCANCE DE ENVÍO (solo lo propio): válvulas que este usuario puede/ha modificado. Se limita siempre a sus módulos
-    # permitidos, de modo que NUNCA se envíen ni se pisen válvulas de otros usuarios (aunque su sesión tenga copias antiguas).
+    # ALCANCE DE ENVÍO Y PROTECCIÓN MULTI-CAMBIO:
+    # Detectamos todas las válvulas modificadas por el usuario comparando contra:
+    # 1) base_cliente_semana_rv() (lo que el usuario tenía en pantalla antes de editar)
+    # 2) rutas_disco_rv() (lo último persistido en disco local)
+    # Y las acumulamos en ids_modificados_sesion_rv para que si el usuario guarda varias veces seguidas
+    # (o cambia de filtro entre guardados), NUNCA se borren sus cambios previos al fusionar con Google Sheets.
     if (!exists("ids_usuario", inherits = FALSE)) ids_usuario <- df_valvulas$id
+    
+    base_cli <- isolate(base_cliente_semana_rv()) %>%
+      filter(Tipo_Registro == m_act, Num_Pasada %in% p_acts) %>%
+      select(id, Num_Pasada, Lunes_c = Lunes, Martes_c = Martes, Miercoles_c = Miércoles, Jueves_c = Jueves, Viernes_c = Viernes, Sabado_c = Sábado,
+             Kg_Lun_c = Kg_Lunes, Kg_Mar_c = Kg_Martes, Kg_Mie_c = Kg_Miércoles, Kg_Jue_c = Kg_Jueves, Kg_Vie_c = Kg_Viernes, Kg_Sab_c = Kg_Sábado,
+             cells_str_c = cells_str)
+    
+    diff_cliente <- df_prog_semana %>%
+      filter(Tipo_Registro == m_act, Num_Pasada %in% p_acts) %>%
+      left_join(base_cli, by = c("id", "Num_Pasada")) %>%
+      mutate(
+        across(c(Lunes_c, Martes_c, Miercoles_c, Jueves_c, Viernes_c, Sabado_c,
+                 Kg_Lun_c, Kg_Mar_c, Kg_Mie_c, Kg_Jue_c, Kg_Vie_c, Kg_Sab_c), ~ coalesce(as.numeric(.), 0)),
+        cells_str_c = coalesce(as.character(cells_str_c), "")
+      ) %>%
+      filter(
+        abs(Lunes - Lunes_c) > 0.01 | abs(Martes - Martes_c) > 0.01 | abs(Miércoles - Miercoles_c) > 0.01 |
+        abs(Jueves - Jueves_c) > 0.01 | abs(Viernes - Viernes_c) > 0.01 | abs(Sábado - Sabado_c) > 0.01 |
+        abs(Kg_Lunes - Kg_Lun_c) > 0.01 | abs(Kg_Martes - Kg_Mar_c) > 0.01 | abs(Kg_Miércoles - Kg_Mie_c) > 0.01 |
+        abs(Kg_Jueves - Kg_Jue_c) > 0.01 | abs(Kg_Viernes - Kg_Vie_c) > 0.01 | abs(Kg_Sábado - Kg_Sab_c) > 0.01 |
+        coalesce(as.character(cells_str), "") != cells_str_c
+      )
+    
+    prev_disco <- isolate(rutas_disco_rv()) %>%
+      filter(Campaña == "2026", Semana == sem_num, Tipo_Registro == m_act, Num_Pasada %in% p_acts) %>%
+      select(id, Num_Pasada, Lunes_p = Lunes, Martes_p = Martes, Miercoles_p = Miércoles, Jueves_p = Jueves, Viernes_p = Viernes, Sabado_p = Sábado,
+             Kg_Lun_p = Kg_Lunes, Kg_Mar_p = Kg_Martes, Kg_Mie_p = Kg_Miércoles, Kg_Jue_p = Kg_Jueves, Kg_Vie_p = Kg_Viernes, Kg_Sab_p = Kg_Sábado,
+             cells_str_p = cells_str)
+    
+    act_modo <- df_prog_semana %>%
+      filter(Tipo_Registro == m_act, Num_Pasada %in% p_acts) %>%
+      left_join(prev_disco, by = c("id", "Num_Pasada")) %>%
+      mutate(
+        across(c(Lunes_p, Martes_p, Miercoles_p, Jueves_p, Viernes_p, Sabado_p,
+                 Kg_Lun_p, Kg_Mar_p, Kg_Mie_p, Kg_Jue_p, Kg_Vie_p, Kg_Sab_p), ~ coalesce(as.numeric(.), 0)),
+        cells_str_p = coalesce(as.character(cells_str_p), "")
+      ) %>%
+      filter(
+        abs(Lunes - Lunes_p) > 0.01 | abs(Martes - Martes_p) > 0.01 | abs(Miércoles - Miercoles_p) > 0.01 |
+        abs(Jueves - Jueves_p) > 0.01 | abs(Viernes - Viernes_p) > 0.01 | abs(Sábado - Sabado_p) > 0.01 |
+        abs(Kg_Lunes - Kg_Lun_p) > 0.01 | abs(Kg_Martes - Kg_Mar_p) > 0.01 | abs(Kg_Miércoles - Kg_Mie_p) > 0.01 |
+        abs(Kg_Jueves - Kg_Jue_p) > 0.01 | abs(Kg_Viernes - Kg_Vie_p) > 0.01 | abs(Kg_Sábado - Kg_Sab_p) > 0.01 |
+        coalesce(as.character(cells_str), "") != cells_str_p
+      )
+    
+    ids_tocados_ahora <- intersect(unique(c(diff_cliente$id, act_modo$id)), ids_usuario)
+    
+    # Acumular en el historial de modificados de la sesión para esta semana y modo
+    key_mod_sem <- paste(sem_num, m_act, sep = "|")
+    mods_actuales <- isolate(ids_modificados_sesion_rv())
+    ids_sesion_modo <- unique(c(as.character(mods_actuales[[key_mod_sem]]), ids_tocados_ahora))
+    ids_sesion_modo <- intersect(ids_sesion_modo, ids_usuario)
+    mods_actuales[[key_mod_sem]] <- ids_sesion_modo
+    ids_modificados_sesion_rv(mods_actuales)
+    
+    # Si un mismo código de válvula tiene múltiples sub-polígonos/variedades (codigos_multi),
+    # incluir todos los ids que comparten el mismo código de válvula para que eliminarCodigosPrevios
+    # en Google Sheets reciba el conjunto completo de esa válvula y no borre su otra variedad.
+    expandir_por_codigo <- function(ids_vec) {
+      if (length(ids_vec) == 0) return(character(0))
+      cods <- unique(df_valvulas$codigo[df_valvulas$id %in% ids_vec])
+      intersect(df_valvulas$id[df_valvulas$codigo %in% cods], ids_usuario)
+    }
+    
+    ids_sesion_modo_exp <- expandir_por_codigo(ids_sesion_modo)
+    ids_tocados_exp     <- expandir_por_codigo(ids_tocados_ahora)
+    ids_alcance_exp     <- expandir_por_codigo(ids_alcance)
+    
     ids_scope_envio <- NULL
-    ids_protegidos_locales <- ids_alcance
-    if (sincronizar_sheets && hay_filtro_activo) {
-      prev_disco <- isolate(rutas_disco_rv()) %>%
-        filter(Campaña == "2026", Semana == sem_num, Tipo_Registro == m_act, Num_Pasada %in% p_acts) %>%
-        select(id, Num_Pasada, Lunes_p = Lunes, Martes_p = Martes, Miercoles_p = Miércoles, Jueves_p = Jueves, Viernes_p = Viernes, Sabado_p = Sábado,
-               Kg_Lun_p = Kg_Lunes, Kg_Mar_p = Kg_Martes, Kg_Mie_p = Kg_Miércoles, Kg_Jue_p = Kg_Jueves, Kg_Vie_p = Kg_Viernes, Kg_Sab_p = Kg_Sábado,
-               cells_str_p = cells_str)
-      act_modo <- df_prog_semana %>%
-        filter(Tipo_Registro == m_act, Num_Pasada %in% p_acts) %>%
-        left_join(prev_disco, by = c("id", "Num_Pasada")) %>%
-        mutate(
-          across(c(Lunes_p, Martes_p, Miercoles_p, Jueves_p, Viernes_p, Sabado_p,
-                   Kg_Lun_p, Kg_Mar_p, Kg_Mie_p, Kg_Jue_p, Kg_Vie_p, Kg_Sab_p), ~ coalesce(as.numeric(.), 0)),
-          cells_str_p = coalesce(as.character(cells_str_p), "")
-        ) %>%
-        filter(
-          abs(Lunes - Lunes_p) > 0.01 | abs(Martes - Martes_p) > 0.01 | abs(Miércoles - Miercoles_p) > 0.01 |
-          abs(Jueves - Jueves_p) > 0.01 | abs(Viernes - Viernes_p) > 0.01 | abs(Sábado - Sabado_p) > 0.01 |
-          abs(Kg_Lunes - Kg_Lun_p) > 0.01 | abs(Kg_Martes - Kg_Mar_p) > 0.01 | abs(Kg_Miércoles - Kg_Mie_p) > 0.01 |
-          abs(Kg_Jueves - Kg_Jue_p) > 0.01 | abs(Kg_Viernes - Kg_Vie_p) > 0.01 | abs(Kg_Sábado - Kg_Sab_p) > 0.01 |
-          coalesce(as.character(cells_str), "") != cells_str_p
-        )
-      # MERGE MULTI-USUARIO COOPERATIVO (2 o más personas en el mismo grupo/sector):
-      # Si el usuario no aplicó un subfiltro específico, protegemos solo las válvulas que realmente
-      # modificó en esta sesión (act_modo$id) para no pisar las que su compañero del mismo sector guardó.
+    ids_protegidos_locales <- unique(c(ids_alcance_exp, ids_sesion_modo_exp))
+    
+    if (sincronizar_sheets) {
       filtro_es_especifico <- length(ids_alcance) < length(ids_usuario)
       ids_protegidos_locales <- if (filtro_es_especifico) {
-        unique(c(ids_alcance, intersect(act_modo$id, ids_usuario)))
+        unique(c(ids_alcance_exp, ids_sesion_modo_exp))
       } else {
-        if (length(act_modo$id) > 0) intersect(act_modo$id, ids_usuario) else ids_alcance
+        if (length(ids_sesion_modo_exp) > 0) ids_sesion_modo_exp else ids_alcance_exp
       }
       ids_protegidos_locales <- intersect(ids_protegidos_locales, ids_usuario)
       
       # ALCANCE DEL ENVÍO AL WEBHOOK DE GOOGLE SHEETS:
-      # Si el usuario tiene un filtro específico activo (ej. Módulo 13), el paquete de envío
-      # debe ser EXCLUSIVAMENTE las válvulas de dicho filtro (ids_alcance).
-      # NUNCA se deben enviar ni sobreescribir válvulas de otros módulos fuera del filtro activo.
-      ids_scope_envio <- if (filtro_es_especifico) {
-        ids_alcance
+      # Enviar siempre como actualización parcial focalizada en las válvulas que realmente cambiaron
+      # (o las pendientes de reenvío), evitando borrar o pisar válvulas de otros turnos/módulos.
+      ids_scope_envio <- if (length(ids_tocados_exp) > 0) {
+        ids_tocados_exp
+      } else if (filtro_es_especifico) {
+        ids_alcance_exp
       } else {
-        ids_protegidos_locales
+        ids_sesion_modo_exp
+      }
+      
+      # Reincluir válvulas cuyo envío anterior a Google Sheets falló (para que se reenvíen con su valor local)
+      pend_all <- isolate(sheets_pendientes_rv())
+      ids_pend <- unique(as.character(unlist(pend_all[paste(sem_num, m_act, p_acts, sep = "|")], use.names = FALSE)))
+      ids_pend <- intersect(ids_pend[ids_pend != "__pendiente__"], ids_usuario)
+      if (length(ids_pend) > 0) {
+        ids_pend_exp <- expandir_por_codigo(ids_pend)
+        ids_protegidos_locales <- unique(c(ids_protegidos_locales, ids_pend_exp))
+        ids_scope_envio <- unique(c(ids_scope_envio, ids_pend_exp))
       }
     }
     
-    # MERGE MULTI-USUARIO: Si vamos a sincronizar con Google Sheets y el usuario tiene un filtro activo
-    # (ej. solo su Grupo/Módulo/Turno/Válvula), descargar el estado remoto actual de la semana para no pisar otros grupos
-    # que otro usuario haya guardado hace unos minutos, pero conservando SIEMPRE tanto el filtro activo como
-    # cualquier válvula que este usuario haya editado previamente en la sesión actual (ej. al prorratear kilos por grupos de válvulas).
+    # MERGE MULTI-USUARIO: Al sincronizar con Google Sheets, descargar el estado remoto actual de la semana
+    # para no pisar otros grupos/módulos que otro usuario haya guardado, pero conservando SIEMPRE intactas
+    # todas las válvulas protegidas localmente (tanto el filtro activo como todas las válvulas editadas en esta sesión).
     if (sincronizar_sheets) {
       df_remoto <- obtener_rutas_google_sheets(sem_num)
       if (!is.null(df_remoto) && nrow(df_remoto) > 0) {
@@ -7545,7 +8109,7 @@ server <- function(input, output, session) {
           mutate(
             cells_str = ifelse(!is.na(cells_str) & nzchar(cells_str), cells_str, generar_cells_str_vec(Lunes, Martes, Miércoles, Jueves, Viernes, Sábado))
           )
-        if (hay_filtro_activo) {
+        if (length(ids_protegidos_locales) > 0) {
           # Conservar de Google Sheets: (a) otros modos/pasadas, y (b) en el mismo modo/pasada, las válvulas que este usuario NO tocó
           remoto_conservar <- df_remoto %>%
             filter(!(Tipo_Registro == m_act & Num_Pasada %in% p_acts & id %in% ids_protegidos_locales))
@@ -7553,7 +8117,7 @@ server <- function(input, output, session) {
             filter(Tipo_Registro == m_act, Num_Pasada %in% p_acts, id %in% ids_protegidos_locales)
           df_guardar_sem <- bind_rows(remoto_conservar, local_alcance)
         } else {
-          # Sin filtro activo: conservar otros modos/pasadas de Google Sheets y actualizar este modo/pasada completo
+          # Sin filtro ni ediciones específicas: conservar otros modos/pasadas de Google Sheets y actualizar este modo/pasada completo
           remoto_otros <- df_remoto %>%
             filter(!(Tipo_Registro == m_act & Num_Pasada %in% p_acts))
           local_modo <- df_guardar_sem %>%
@@ -7563,13 +8127,22 @@ server <- function(input, output, session) {
       }
     }
     
+    # Asegurar unicidad por (Campaña, Semana, Tipo_Registro, Num_Pasada, id) quedándose siempre con la versión local más reciente
+    df_guardar_sem <- df_guardar_sem %>%
+      group_by(Campaña, Semana, Tipo_Registro, Num_Pasada, id) %>%
+      slice_tail(n = 1) %>%
+      ungroup()
+    
     df_total <- rutas_disco_rv() %>%
-      filter(!(Campaña == "2026" & Semana == sem_num & Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha"))) %>%
+      filter(!(Campaña == "2026" & Semana == sem_num & Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha", "Rectificacion"))) %>%
       bind_rows(df_guardar_sem)
     
     ok <- guardar_rutas_disco(df_total)
     if (ok) {
       rutas_disco_rv(df_total)
+      # Actualizar la línea base del cliente con el estado recién guardado para que el próximo guardado
+      # compare exactamente contra este punto sin perder las válvulas acumuladas en ids_modificados_sesion_rv
+      base_cliente_semana_rv(df_prog_semana)
       ultimo_guardado_rv(formatear_hora_peru(Sys.time(), "%H:%M:%S"))
       if (mostrar_notif) {
         showNotification(sprintf("✓ Ruta de Semana %02d guardada en disco.", sem_num), type = "message", duration = 3)
@@ -7578,53 +8151,85 @@ server <- function(input, output, session) {
     
     # Sincronización con Google Sheets Webhook (sincroniza inserciones, modificaciones y eliminaciones)
     if (sincronizar_sheets) {
-      modo_label_sheet <- if (m_act == "Proyeccion") "Proyección" else "Cosecha Campo"
+      modo_label_sheet <- if (m_act == "Proyeccion") "Proyección" else if (m_act == "Rectificacion") "Rectificación" else "Cosecha Campo"
       
       construir_rutas_json <- function(df_r) {
-        lista_rutas_json <- vector("list", nrow(df_r))
-        if (nrow(df_r) > 0) {
-          for (i in seq_len(nrow(df_r))) {
-            rm <- df_r[i, ]
-            lista_rutas_json[[i]] <- list(
-              id          = coalesce(as.character(rm$id), ""),
-              grupo       = coalesce(as.character(rm$Grupo), ""),
-              sector      = coalesce(as.character(rm$Sector), ""),
-              modulo      = coalesce(as.character(rm$Módulo), ""),
-              turno       = coalesce(as.character(rm$Turno), ""),
-              codigo      = coalesce(as.character(rm$codigo), ""),
-              variedad    = coalesce(as.character(rm$Variedad), ""),
-              area_fisica = coalesce(as.numeric(rm$Área), 0),
-              pct_lun     = coalesce(as.numeric(rm$Lunes), 0),
-              ha_lun      = coalesce(as.numeric(rm$Ha_Lunes), 0),
-              kg_lun      = coalesce(as.numeric(rm$Kg_Lunes), 0),
-              pct_mar     = coalesce(as.numeric(rm$Martes), 0),
-              ha_mar      = coalesce(as.numeric(rm$Ha_Martes), 0),
-              kg_mar      = coalesce(as.numeric(rm$Kg_Martes), 0),
-              pct_mie     = coalesce(as.numeric(rm$Miércoles), 0),
-              ha_mie      = coalesce(as.numeric(rm$Ha_Miércoles), 0),
-              kg_mie      = coalesce(as.numeric(rm$Kg_Miércoles), 0),
-              pct_jue     = coalesce(as.numeric(rm$Jueves), 0),
-              ha_jue      = coalesce(as.numeric(rm$Ha_Jueves), 0),
-              kg_jue      = coalesce(as.numeric(rm$Kg_Jueves), 0),
-              pct_vie     = coalesce(as.numeric(rm$Viernes), 0),
-              ha_vie      = coalesce(as.numeric(rm$Ha_Viernes), 0),
-              kg_vie      = coalesce(as.numeric(rm$Kg_Viernes), 0),
-              pct_sab     = coalesce(as.numeric(rm$Sábado), 0),
-              ha_sab      = coalesce(as.numeric(rm$Ha_Sábado), 0),
-              kg_sab      = coalesce(as.numeric(rm$Kg_Sábado), 0),
-              pct_total   = coalesce(as.numeric(rm$Lunes + rm$Martes + rm$Miércoles + rm$Jueves + rm$Viernes + rm$Sábado), 0),
-              ha_total    = coalesce(as.numeric(rm$Ha_Total_Prog), 0),
-              kg_total    = coalesce(as.numeric(rm$Kg_Total_Prog), 0),
-              cells_str   = coalesce(as.character(rm$cells_str), "")
-            )
-          }
+        # Versión vectorizada: construye todas las filas de una sola vez (mucho más rápido que un bucle por fila)
+        if (is.null(df_r) || nrow(df_r) == 0) return(list())
+        n_r <- nrow(df_r)
+        num_c <- function(col) {
+          x <- if (col %in% names(df_r)) suppressWarnings(as.numeric(df_r[[col]])) else rep(NA_real_, n_r)
+          coalesce(x, 0)
         }
-        lista_rutas_json
+        chr_c <- function(col) {
+          x <- if (col %in% names(df_r)) as.character(df_r[[col]]) else rep(NA_character_, n_r)
+          coalesce(x, "")
+        }
+        data.frame(
+          id          = chr_c("id"),
+          grupo       = chr_c("Grupo"),
+          sector      = chr_c("Sector"),
+          modulo      = chr_c("Módulo"),
+          turno       = chr_c("Turno"),
+          codigo      = chr_c("codigo"),
+          variedad    = chr_c("Variedad"),
+          area_fisica = num_c("Área"),
+          pct_lun     = num_c("Lunes"),
+          ha_lun      = num_c("Ha_Lunes"),
+          kg_lun      = num_c("Kg_Lunes"),
+          pct_mar     = num_c("Martes"),
+          ha_mar      = num_c("Ha_Martes"),
+          kg_mar      = num_c("Kg_Martes"),
+          pct_mie     = num_c("Miércoles"),
+          ha_mie      = num_c("Ha_Miércoles"),
+          kg_mie      = num_c("Kg_Miércoles"),
+          pct_jue     = num_c("Jueves"),
+          ha_jue      = num_c("Ha_Jueves"),
+          kg_jue      = num_c("Kg_Jueves"),
+          pct_vie     = num_c("Viernes"),
+          ha_vie      = num_c("Ha_Viernes"),
+          kg_vie      = num_c("Kg_Viernes"),
+          pct_sab     = num_c("Sábado"),
+          ha_sab      = num_c("Ha_Sábado"),
+          kg_sab      = num_c("Kg_Sábado"),
+          pct_total   = num_c("Lunes") + num_c("Martes") + num_c("Miércoles") + num_c("Jueves") + num_c("Viernes") + num_c("Sábado"),
+          ha_total    = num_c("Ha_Total_Prog"),
+          kg_total    = num_c("Kg_Total_Prog"),
+          cells_str   = chr_c("cells_str"),
+          fecha_hora  = if ("Fecha_Actualizacion" %in% names(df_r)) formatear_hora_peru(df_r[["Fecha_Actualizacion"]], "%Y-%m-%d %H:%M:%S") else rep(formatear_hora_peru(Sys.time(), "%Y-%m-%d %H:%M:%S"), n_r),
+          stringsAsFactors = FALSE
+        )
       }
       
-      es_parcial <- !is.null(ids_scope_envio)
+      es_parcial <- !is.null(ids_scope_envio) && length(ids_scope_envio) > 0
       
       for (p_act in p_acts) {
+        # Identificar qué válvulas cambiaron específicamente en esta pasada p_act
+        ids_cambiados_pasada <- character(0)
+        if (exists("diff_cliente", inherits = FALSE) && !is.null(diff_cliente) && nrow(diff_cliente) > 0) {
+          ids_cambiados_pasada <- union(ids_cambiados_pasada, diff_cliente$id[diff_cliente$Num_Pasada == p_act])
+        }
+        if (exists("act_modo", inherits = FALSE) && !is.null(act_modo) && nrow(act_modo) > 0) {
+          ids_cambiados_pasada <- union(ids_cambiados_pasada, act_modo$id[act_modo$Num_Pasada == p_act])
+        }
+        ids_cambiados_pasada <- expandir_por_codigo(intersect(ids_cambiados_pasada, ids_usuario))
+        
+        key_pend <- paste(sem_num, m_act, p_act, sep = "|")
+        pend_pasada <- isolate(sheets_pendientes_rv())[[key_pend]]
+        es_pendiente <- !is.null(pend_pasada)
+        if (es_pendiente) {
+          ids_pend_p <- expandir_por_codigo(intersect(as.character(pend_pasada[pend_pasada != "__pendiente__"]), ids_usuario))
+          ids_cambiados_pasada <- union(ids_cambiados_pasada, ids_pend_p)
+        }
+        
+        # Si esta pasada no tiene ninguna válvula modificada ni envíos pendientes, omitir su POST
+        if (!es_pendiente && length(ids_cambiados_pasada) == 0) {
+          next
+        }
+        
+        ids_envio_pasada <- if (length(ids_cambiados_pasada) > 0) ids_cambiados_pasada else ids_scope_envio
+        es_parcial_pasada <- length(ids_envio_pasada) > 0
+        
         rutas_modo <- if (nrow(df_guardar_sem) > 0) {
           df_guardar_sem %>% filter(Tipo_Registro == m_act, Num_Pasada == p_act)
         } else {
@@ -7634,14 +8239,12 @@ server <- function(input, output, session) {
         lista_rutas_json <- construir_rutas_json(rutas_modo)
         
         rutas_usuario_df <- rutas_modo
-        if (es_parcial && nrow(rutas_modo) > 0) {
-          rutas_usuario_df <- rutas_modo %>% filter(id %in% ids_scope_envio)
+        if (es_parcial_pasada && nrow(rutas_modo) > 0) {
+          rutas_usuario_df <- rutas_modo %>% filter(id %in% ids_envio_pasada)
         }
-        n_envio <- if (es_parcial) nrow(rutas_usuario_df) else nrow(rutas_modo)
+        n_envio <- if (es_parcial_pasada) nrow(rutas_usuario_df) else nrow(rutas_modo)
         
-        if (es_parcial && n_envio == 0 && (!hay_filtro_activo || length(ids_scope_envio) == 0)) {
-          next
-        }
+        ids_marcar_pend <- if (es_parcial_pasada) as.character(ids_envio_pasada) else character(0)
         
         payload <- list(
           campana   = "2026",
@@ -7651,9 +8254,9 @@ server <- function(input, output, session) {
           evaluador = if (!is.null(usr)) usr$nombre else Sys.getenv("USERNAME", "Evaluador"),
           rutas     = lista_rutas_json
         )
-        if (es_parcial) {
+        if (es_parcial_pasada) {
           payload$parcial         <- TRUE
-          payload$alcance_codigos <- as.list(unique(as.character(df_valvulas$codigo[df_valvulas$id %in% ids_scope_envio])))
+          payload$alcance_codigos <- as.list(unique(as.character(df_valvulas$codigo[df_valvulas$id %in% ids_envio_pasada])))
           payload$rutas_usuario   <- construir_rutas_json(rutas_usuario_df)
         }
         
@@ -7664,24 +8267,40 @@ server <- function(input, output, session) {
             httr::content_type_json(),
             httr::timeout(35)
           )
-          if (httr::status_code(res) == 200) {
-            resp_txt <- httr::content(res, as = "text", encoding = "UTF-8")
-            resp_json <- tryCatch(jsonlite::fromJSON(resp_txt), error = function(e) NULL)
+          resp_txt_chk <- if (httr::status_code(res) == 200) httr::content(res, as = "text", encoding = "UTF-8") else ""
+          resp_json_chk <- tryCatch(jsonlite::fromJSON(resp_txt_chk), error = function(e) NULL)
+          envio_ok <- httr::status_code(res) == 200 &&
+            !(is.list(resp_json_chk) && identical(as.character(resp_json_chk$status), "error"))
+          if (envio_ok) {
+            pend_tmp <- isolate(sheets_pendientes_rv())
+            pend_tmp[[key_pend]] <- NULL
+            sheets_pendientes_rv(pend_tmp)
+          } else {
+            pend_tmp <- isolate(sheets_pendientes_rv())
+            pend_tmp[[key_pend]] <- unique(c(as.character(pend_tmp[[key_pend]]), ids_marcar_pend, "__pendiente__"))
+            sheets_pendientes_rv(pend_tmp)
+          }
+          if (envio_ok) {
+            resp_txt <- resp_txt_chk
+            resp_json <- resp_json_chk
             v_tag <- if (!is.null(resp_json$version)) resp_json$version else "OK"
             if (mostrar_notif) {
               if (n_envio > 0) {
-                showNotification(sprintf("☁️ Google Sheets actualizado (%s - Pasada %d - %s - %d válvulas%s).", modo_label_sheet, p_act, v_tag, n_envio, if (es_parcial) " propias" else ""), type = "message", duration = 4)
+                showNotification(sprintf("☁️ Google Sheets actualizado (%s - Pasada %d - %s - %d válvulas%s).", modo_label_sheet, p_act, v_tag, n_envio, if (es_parcial_pasada) " propias" else ""), type = "message", duration = 4)
               } else {
                 showNotification(sprintf("☁️ Google Sheets actualizado (%s - Pasada %d).", modo_label_sheet, p_act), type = "message", duration = 4)
               }
             }
           } else {
-            showNotification(sprintf("⚠️ Error Sheets (HTTP %d)", httr::status_code(res)), type = "warning", duration = 4)
+            showNotification(sprintf("⚠️ No se sincronizó con Google Sheets (%s - Pasada %d, HTTP %d). Se guardó en disco. Vuelve a presionar 'Guardar Ruta'.",
+                                     modo_label_sheet, p_act, httr::status_code(res)), type = "warning", duration = 8)
           }
         }, error = function(e) {
-          if (mostrar_notif) {
-            showNotification("⚠️ No se pudo conectar con Google Sheets (se guardó en disco local).", type = "warning", duration = 4)
-          }
+          pend_tmp <- isolate(sheets_pendientes_rv())
+          pend_tmp[[key_pend]] <- unique(c(as.character(pend_tmp[[key_pend]]), ids_marcar_pend, "__pendiente__"))
+          sheets_pendientes_rv(pend_tmp)
+          showNotification(sprintf("⚠️ No se sincronizó con Google Sheets (%s - Pasada %d). Se guardó en disco. Vuelve a presionar 'Guardar Ruta'.",
+                                   modo_label_sheet, p_act), type = "warning", duration = 8)
         })
       }
     }
@@ -7689,14 +8308,9 @@ server <- function(input, output, session) {
     ok
   }
   
-  # Recibir trazos desde el Canvas JS y conservar/recalcular Kilos
-  observeEvent(input$mapa_programacion_json, {
-    req(input$mapa_programacion_json)
-    usr <- usuario_autenticado_rv()
-    if (!is.null(usr) && usr$rol == "Visualizador") return()
-    raw_json <- trimws(as.character(input$mapa_programacion_json))
-    
-    prev_state <- programacion_semana()
+  # Función auxiliar para aplicar un JSON de programación del cliente sobre el estado actual de la semana
+  aplicar_json_a_programacion <- function(raw_json, prev_state) {
+    raw_json <- trimws(as.character(raw_json))
     base <- esquema_base_semana() %>% select(Tipo_Registro, Num_Pasada, id)
     
     if (nzchar(raw_json) && raw_json != "[]" && raw_json != "null") {
@@ -7713,7 +8327,8 @@ server <- function(input, output, session) {
           Viernes       = coalesce(as.numeric(parsed$viernes), 0),
           Sábado        = coalesce(as.numeric(parsed$sabado), 0),
           cells_str     = coalesce(as.character(parsed$cells_str), "")
-        )
+        ) %>%
+          distinct(Tipo_Registro, Num_Pasada, id, .keep_all = TRUE)
         base <- base %>%
           left_join(clean_items, by = c("Tipo_Registro", "Num_Pasada", "id"))
       }
@@ -7727,7 +8342,7 @@ server <- function(input, output, session) {
     base$cells_str <- coalesce(as.character(base$cells_str), "")
     
     # Conservar Kg previos de cada válvula (si una celda fue borrada a 0%, poner su Kg en 0;
-    # si el área disminuyó, reducir Kg proporcionalmente; las nuevas válvulas pintadas inician en 0 kg)
+    # si el área disminuyó significativamente (>0.05%), reducir Kg proporcionalmente; las nuevas válvulas pintadas inician en 0 kg)
     base <- base %>%
       left_join(
         prev_state %>% select(
@@ -7741,51 +8356,55 @@ server <- function(input, output, session) {
       mutate(
         Kg_Lunes = case_when(
           Lunes <= 0 ~ 0,
-          !is.na(Prev_Lun) & Prev_Lun > 0 & Lunes < Prev_Lun ~ round(coalesce(Kg_Lunes, 0) * (Lunes / Prev_Lun), 2),
+          !is.na(Prev_Lun) & Prev_Lun > 0 & (Prev_Lun - Lunes) > 0.05 ~ round(coalesce(Kg_Lunes, 0) * (Lunes / Prev_Lun), 2),
           TRUE ~ coalesce(Kg_Lunes, 0)
         ),
         Kg_Martes = case_when(
           Martes <= 0 ~ 0,
-          !is.na(Prev_Mar) & Prev_Mar > 0 & Martes < Prev_Mar ~ round(coalesce(Kg_Martes, 0) * (Martes / Prev_Mar), 2),
+          !is.na(Prev_Mar) & Prev_Mar > 0 & (Prev_Mar - Martes) > 0.05 ~ round(coalesce(Kg_Martes, 0) * (Martes / Prev_Mar), 2),
           TRUE ~ coalesce(Kg_Martes, 0)
         ),
         Kg_Miércoles = case_when(
           Miércoles <= 0 ~ 0,
-          !is.na(Prev_Mie) & Prev_Mie > 0 & Miércoles < Prev_Mie ~ round(coalesce(Kg_Miércoles, 0) * (Miércoles / Prev_Mie), 2),
+          !is.na(Prev_Mie) & Prev_Mie > 0 & (Prev_Mie - Miércoles) > 0.05 ~ round(coalesce(Kg_Miércoles, 0) * (Miércoles / Prev_Mie), 2),
           TRUE ~ coalesce(Kg_Miércoles, 0)
         ),
         Kg_Jueves = case_when(
           Jueves <= 0 ~ 0,
-          !is.na(Prev_Jue) & Prev_Jue > 0 & Jueves < Prev_Jue ~ round(coalesce(Kg_Jueves, 0) * (Jueves / Prev_Jue), 2),
+          !is.na(Prev_Jue) & Prev_Jue > 0 & (Prev_Jue - Jueves) > 0.05 ~ round(coalesce(Kg_Jueves, 0) * (Jueves / Prev_Jue), 2),
           TRUE ~ coalesce(Kg_Jueves, 0)
         ),
         Kg_Viernes = case_when(
           Viernes <= 0 ~ 0,
-          !is.na(Prev_Vie) & Prev_Vie > 0 & Viernes < Prev_Vie ~ round(coalesce(Kg_Viernes, 0) * (Viernes / Prev_Vie), 2),
+          !is.na(Prev_Vie) & Prev_Vie > 0 & (Prev_Vie - Viernes) > 0.05 ~ round(coalesce(Kg_Viernes, 0) * (Viernes / Prev_Vie), 2),
           TRUE ~ coalesce(Kg_Viernes, 0)
         ),
         Kg_Sábado = case_when(
           Sábado <= 0 ~ 0,
-          !is.na(Prev_Sab) & Prev_Sab > 0 & Sábado < Prev_Sab ~ round(coalesce(Kg_Sábado, 0) * (Sábado / Prev_Sab), 2),
+          !is.na(Prev_Sab) & Prev_Sab > 0 & (Prev_Sab - Sábado) > 0.05 ~ round(coalesce(Kg_Sábado, 0) * (Sábado / Prev_Sab), 2),
           TRUE ~ coalesce(Kg_Sábado, 0)
         )
       ) %>%
       select(-starts_with("Prev_"))
     
     # Cosecha Oficial es inmutable desde el mapa (solo lectura, proveniente de balanza packing).
-    # La preservamos intacta desde el estado previo para que el canvas de dibujo nunca la sobreescriba a cero.
     oficial_prev <- prev_state %>% filter(Tipo_Registro == "CosechaOficial")
     
     base_editables <- base %>%
-      filter(Tipo_Registro %in% c("Proyeccion", "CosechaCampo"))
+      filter(Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Rectificacion"))
     
-    # Asegurar que base_completa tenga exactamente las mismas columnas limpias sin residuos de Área
-    base_completa <- bind_rows(
+    bind_rows(
       base_editables,
       oficial_prev %>% select(any_of(names(base_editables)))
     )
-    # En Proyección y Cosecha Campo el trazado en canvas define el avance/hectáreas,
-    # mientras que los kilos se asignan o prorratean al ingresar el valor por día y dar Enter.
+  }
+  
+  # Recibir trazos desde el Canvas JS y conservar/recalcular Kilos
+  observeEvent(input$mapa_programacion_json, {
+    req(input$mapa_programacion_json)
+    usr <- usuario_autenticado_rv()
+    if (!is.null(usr) && usr$rol == "Visualizador") return()
+    base_completa <- aplicar_json_a_programacion(input$mapa_programacion_json, programacion_semana())
     programacion_semana(base_completa)
   })
   
@@ -7825,7 +8444,7 @@ server <- function(input, output, session) {
     if (tot_ha_dia <= 0 && kg_val > 0) {
       showNotification(
         sprintf("⚠️ Primero pinta al menos una válvula en %s dentro del filtro actual (%s) para repartir los kilos.",
-                dia_col, if (m_act == "Proyeccion") "Proyección" else "Cosecha Campo"),
+                dia_col, if (m_act == "Proyeccion") "Proyección" else if (m_act == "Rectificacion") "Rectificaciones" else "Cosecha Campo"),
         type = "warning", duration = 4
       )
       return()
@@ -7834,20 +8453,19 @@ server <- function(input, output, session) {
     kgs_lista <- list()
     kgs_lista[[dia_col]] <- kg_val
     
-    if (m_act %in% c("CosechaCampo", "Proyeccion")) {
+    if (m_act %in% c("CosechaCampo", "Proyeccion", "Rectificacion")) {
       df_prog <- recalcular_kg_cosecha_campo(df_prog, kgs_dias = kgs_lista, modo = m_act, pasada = c(1, 2), ids_alcance = ids_filtro)
     }
     
     programacion_semana(df_prog)
     
-    # Persistir inmediatamente en disco y Google Sheets para que los evaluadores no pierdan su avance
-    persistir_semana_actual(df_prog, modo = m_act, pasada = c(1, 2), mostrar_notif = FALSE, sincronizar_sheets = TRUE, ids_scope = ids_filtro)
-    cambios_pendientes_rv(FALSE)
-    session$sendCustomMessage("limpiar_cambios_pendientes", list())
+    # OPTIMIZACIÓN: el Enter solo prorratea en memoria (instantáneo, sin bloquear la UI).
+    # La escritura en disco (G:/D:) y el envío a Google Sheets se hacen juntos al presionar "Guardar Ruta".
+    cambios_pendientes_rv(TRUE)
     
     n_valvs_pintadas <- length(unique(sub_dia$id[sub_dia$Ha_Dia > 0]))
     showNotification(
-      sprintf("✓ %s kg prorrateados en %s (1ª y 2ª pasada) entre %d válvula(s) (%s ha) y guardados.",
+      sprintf("✓ %s kg prorrateados en %s (1ª y 2ª pasada) entre %d válvula(s) (%s ha). Presiona 'Guardar Ruta' para sincronizar.",
               format(round(kg_val), big.mark = ","), dia_col, n_valvs_pintadas, round(tot_ha_dia, 2)),
       type = "message", duration = 3
     )
@@ -7867,6 +8485,13 @@ server <- function(input, output, session) {
     showNotification("⏳ Guardando y sincronizando con Google Sheets...", type = "message", duration = 2)
     
     df_prog <- programacion_semana()
+    # Si el paquete de guardado incluye la instantánea más reciente de programación del cliente,
+    # aplicarla antes de persistir para evitar cualquier desfase por el debounce de 80ms
+    if (!is.null(info_kg) && !is.null(info_kg$programacion_str) && nzchar(as.character(info_kg$programacion_str))) {
+      df_prog <- aplicar_json_a_programacion(info_kg$programacion_str, df_prog)
+      programacion_semana(df_prog)
+    }
+    
     m_act   <- if (!is.null(info_kg$modo)) {
       m <- as.character(info_kg$modo)
       if (m == "Cosecha") "CosechaCampo" else m
@@ -7876,22 +8501,22 @@ server <- function(input, output, session) {
     
     ids_filtro <- if (!is.null(catalogo_filtrado())) catalogo_filtrado()$id else NULL
     
-    # Si estamos en Cosecha Campo o Proyección y el usuario modificó algún input diario antes de dar Guardar,
-    # prorratear únicamente los días cuyo valor cambió (o donde haya válvulas pintadas con 0 kg) dentro del filtro activo
-    if (m_act %in% c("CosechaCampo", "Proyeccion") && !is.null(info_kg) && !is.null(info_kg$kgs)) {
+    # Si estamos en Cosecha Campo o Proyección y el usuario modificó explícitamente algún input diario de kilos
+    # antes de dar Guardar (kgs_edited[[d]] == TRUE), prorratear únicamente ese día dentro del filtro activo.
+    # NO re-prorratear automáticamente cuando el usuario solo modificó hectáreas/trazos sin editar el input de kilos,
+    # porque eso sobreescribiría los kilos de las demás válvulas del turno/sector.
+    if (m_act %in% c("CosechaCampo", "Proyeccion", "Rectificacion") && !is.null(info_kg) && !is.null(info_kg$kgs)) {
       sub_f <- df_prog %>%
         filter(Tipo_Registro == m_act, Num_Pasada %in% c(1, 2), id %in% ids_filtro)
       
       kgs_cambiados <- list()
       for (d in c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")) {
-        if (!is.null(info_kg$kgs[[d]])) {
+        fue_editado_kg <- !is.null(info_kg$kgs_edited) && isTRUE(info_kg$kgs_edited[[d]])
+        if (fue_editado_kg && !is.null(info_kg$kgs[[d]])) {
           val_in   <- max(0, suppressWarnings(as.numeric(info_kg$kgs[[d]])), na.rm = TRUE)
-          col_pct  <- d
           col_kg   <- paste0("Kg_", d)
           val_act  <- sum(sub_f[[col_kg]], na.rm = TRUE)
-          hay_valvs_sin_kg <- sum(coalesce(as.numeric(sub_f[[col_pct]]), 0) > 0 & coalesce(as.numeric(sub_f[[col_kg]]), 0) == 0) > 0
-          
-          if (abs(val_in - round(val_act)) >= 1 || (val_in > 0 && hay_valvs_sin_kg)) {
+          if (abs(val_in - round(val_act)) >= 1) {
             kgs_cambiados[[d]] <- val_in
           }
         }
@@ -7903,9 +8528,17 @@ server <- function(input, output, session) {
     }
     
     persistir_semana_actual(df_prog, modo = m_act, pasada = c(1, 2), mostrar_notif = TRUE, sincronizar_sheets = TRUE, ids_scope = ids_filtro)
-    cambios_pendientes_rv(FALSE)
-    session$sendCustomMessage("limpiar_cambios_pendientes", list())
+    sem_g <- suppressWarnings(as.numeric(isolate(semana_activa_rv())))
+    claves_g <- paste(sem_g, m_act, c(1, 2), sep = "|")
+    quedan_pend <- any(claves_g %in% names(isolate(sheets_pendientes_rv())))
     session$sendCustomMessage("ocultar_loader", list())
+    if (quedan_pend) {
+      cambios_pendientes_rv(TRUE)
+      session$sendCustomMessage("marcar_cambios_pendientes", list())
+    } else {
+      cambios_pendientes_rv(FALSE)
+      session$sendCustomMessage("limpiar_cambios_pendientes", list())
+    }
   }
   
   observeEvent(input$guardar_ruta_con_kilos, {
@@ -7958,7 +8591,7 @@ server <- function(input, output, session) {
         
         # Reemplazar las rutas de esa semana en disco y memoria
         df_total <- rutas_disco_rv() %>%
-          filter(!(Campaña == "2026" & Semana == sem_num & Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha"))) %>%
+          filter(!(Campaña == "2026" & Semana == sem_num & Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha", "Rectificacion"))) %>%
           bind_rows(df_sheets)
         
         guardar_rutas_disco(df_total)
@@ -7984,6 +8617,8 @@ server <- function(input, output, session) {
         
         # Respetar los kilos descargados desde Google Sheets sin sobreescribir automáticamente
         programacion_semana(base)
+        base_cliente_semana_rv(base)
+        limpiar_modificados_semana(sem_num)
         
         filas_activas <- base %>%
           filter((Lunes + Martes + Miércoles + Jueves + Viernes + Sábado) > 0) %>%
@@ -8001,7 +8636,7 @@ server <- function(input, output, session) {
       } else {
         # Si Google Sheets está vacío para esta semana (ej. se borró la ruta en Sheets):
         df_total <- rutas_disco_rv() %>%
-          filter(!(Campaña == "2026" & Semana == sem_num & Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha")))
+          filter(!(Campaña == "2026" & Semana == sem_num & Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha", "Rectificacion")))
         
         guardar_rutas_disco(df_total)
         rutas_disco_rv(df_total)
@@ -8023,6 +8658,8 @@ server <- function(input, output, session) {
         }
         
         programacion_semana(base)
+        base_cliente_semana_rv(base)
+        limpiar_modificados_semana(sem_num)
         
         filas_activas <- base %>%
           filter((Lunes + Martes + Miércoles + Jueves + Viernes + Sábado) > 0) %>%
@@ -8404,7 +9041,7 @@ server <- function(input, output, session) {
       showNotification("🔒 En Cosecha Oficial los datos son oficiales de balanza y no se pueden modificar.", type = "warning", duration = 4)
       return()
     }
-    m_act <- if (m_val == "Proyeccion") "Proyección" else "Cosecha Campo"
+    m_act <- if (m_val == "Proyeccion") "Proyección" else if (m_val == "Rectificacion") "Rectificaciones" else "Cosecha Campo"
     p_act <- pasada_activa()
     n_valvs_f <- nrow(catalogo_filtrado())
     
@@ -8450,7 +9087,7 @@ server <- function(input, output, session) {
       showNotification("🔒 No se puede reiniciar la Cosecha Oficial (datos oficiales de packing).", type = "warning", duration = 4)
       return()
     }
-    m_act <- if (m_val == "Proyeccion") "Proyección" else "Cosecha Campo"
+    m_act <- if (m_val == "Proyeccion") "Proyección" else if (m_val == "Rectificacion") "Rectificaciones" else "Cosecha Campo"
     p_act <- pasada_activa()
     showModal(modalDialog(
       title = sprintf("⚠️ Confirmar reinicio (%s • %dª Pasada)", m_act, p_act),
@@ -8493,6 +9130,7 @@ server <- function(input, output, session) {
     m_lbl <- case_when(
       modo_activo() == "Proyeccion"     ~ "Proy.",
       modo_activo() == "CosechaCampo"   ~ "Cosecha Campo",
+      modo_activo() == "Rectificacion"  ~ "Rectificaciones",
       modo_activo() == "CosechaOficial" ~ "Cosecha Oficial 🔒",
       TRUE ~ "Proy."
     )
@@ -8608,6 +9246,7 @@ server <- function(input, output, session) {
     m_act <- case_when(
       modo_activo() == "Proyeccion"     ~ "Proyección",
       modo_activo() == "CosechaCampo"   ~ "Cosecha Campo",
+      modo_activo() == "Rectificacion"  ~ "Rectificaciones",
       modo_activo() == "CosechaOficial" ~ "Cosecha Oficial",
       TRUE ~ "Proyección"
     )

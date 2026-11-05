@@ -1306,6 +1306,7 @@ if (nzchar(ruta_rdata_cargada) && file.exists(ruta_rdata_cargada)) {
         filter(!is.na(Semana), nzchar(Codigo_Valvula)) %>%
         mutate(
           Tipo_Registro = case_when(
+            grepl("rectif", Modo_Raw, ignore.case = TRUE) ~ "Rectificacion",
             grepl("cosecha.*campo|cosecha", Modo_Raw, ignore.case = TRUE) ~ "CosechaCampo",
             grepl("oficial", Modo_Raw, ignore.case = TRUE) ~ "CosechaOficial",
             TRUE ~ "Proyeccion"
@@ -1401,7 +1402,7 @@ if (nzchar(ruta_rdata_cargada) && file.exists(ruta_rdata_cargada)) {
                   select(-any_of("cells_str_prev"))
               }
               df_act <- df_existente %>%
-                filter(!(Campaña == "2026" & Semana == as.numeric(sem_key) & Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha"))) %>%
+                filter(!(Campaña == "2026" & Semana == as.numeric(sem_key) & Tipo_Registro %in% c("Proyeccion", "CosechaCampo", "Cosecha", "Rectificacion"))) %>%
                 bind_rows(df_rem_save)
               tryCatch(saveRDS(df_act, r_guardar), error = function(e) NULL)
             }
@@ -1422,6 +1423,374 @@ if (nzchar(ruta_rdata_cargada) && file.exists(ruta_rdata_cargada)) {
     return(NULL)
   }
   
+  # ==============================================================================
+  # MOTOR CENTRAL DE CONCILIACIÓN Y RECONCILIACIÓN DE COSECHA (CAMPO VS SAP)
+  # Reglas operativas:
+  # 1. SAP sin Ruta: excluido de cálculos operativos y pintado de mapa.
+  # 2. Desfase de Día: suma kilos contiguos y asigna al día con más kilos si coincide con Campo.
+  # 3. Ruta sin SAP: asigna kilos de ruta provisoriamente, manteniéndolo en reporte de incidencias.
+  # ==============================================================================
+  obtener_cosecha_conciliada_semana <- function(sem_num, campana_sel = "2026") {
+    sem_num <- as.numeric(sem_num)
+    campana_sel <- as.character(campana_sel)
+    
+    fecha_hoy        <- Sys.Date()
+    sem_actual_num   <- lubridate::isoweek(fecha_hoy)
+    wday_hoy         <- lubridate::wday(fecha_hoy, week_start = 1)
+    es_semana_actual <- (sem_num == sem_actual_num)
+    dias_cols        <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
+    
+    dias_cerrados_nom <- if (es_semana_actual) {
+      if (wday_hoy > 1) dias_cols[1:min(wday_hoy - 1, 6)] else character(0)
+    } else if (sem_num < sem_actual_num) {
+      dias_cols
+    } else {
+      character(0)
+    }
+    
+    extraer_num_col_segura <- function(df, pref, dia_til, dia_sin) {
+      c1 <- paste0(pref, dia_til); c2 <- paste0(pref, dia_sin)
+      if (c1 %in% names(df)) suppressWarnings(as.numeric(df[[c1]]))
+      else if (c2 %in% names(df)) suppressWarnings(as.numeric(df[[c2]]))
+      else rep(0, nrow(df))
+    }
+    
+    # 1. Rutas de Campo (en vivo desde Google Sheets o fallback en disco)
+    rc_raw <- tryCatch(obtener_rutas_campo_en_vivo(sem_num), error = function(e) NULL)
+    if (is.null(rc_raw) || !is.data.frame(rc_raw) || nrow(rc_raw) == 0) {
+      rc_raw <- tryCatch(cargar_rutas_cosecha(), error = function(e) NULL)
+      if (!is.null(rc_raw) && "Semana" %in% names(rc_raw)) {
+        rc_raw <- rc_raw %>% filter(as.numeric(Semana) == sem_num)
+      }
+    }
+    
+    df_campo <- if (!is.null(rc_raw) && is.data.frame(rc_raw) && nrow(rc_raw) > 0) {
+      col_cod <- intersect(c("Codigo_Valvula", "codigo", "Codigo_Valv"), names(rc_raw))[1]
+      
+      ha_lun <- coalesce(extraer_num_col_segura(rc_raw, "Ha_", "Lunes", "Lunes"), 0)
+      ha_mar <- coalesce(extraer_num_col_segura(rc_raw, "Ha_", "Martes", "Martes"), 0)
+      ha_mie <- coalesce(extraer_num_col_segura(rc_raw, "Ha_", "Miércoles", "Miercoles"), 0)
+      ha_jue <- coalesce(extraer_num_col_segura(rc_raw, "Ha_", "Jueves", "Jueves"), 0)
+      ha_vie <- coalesce(extraer_num_col_segura(rc_raw, "Ha_", "Viernes", "Viernes"), 0)
+      ha_sab <- coalesce(extraer_num_col_segura(rc_raw, "Ha_", "Sábado", "Sabado"), 0)
+      
+      pct_lun <- pmin(100, coalesce(extraer_num_col_segura(rc_raw, "", "Lunes", "Lunes"), 0))
+      pct_mar <- pmin(100, coalesce(extraer_num_col_segura(rc_raw, "", "Martes", "Martes"), 0))
+      pct_mie <- pmin(100, coalesce(extraer_num_col_segura(rc_raw, "", "Miércoles", "Miercoles"), 0))
+      pct_jue <- pmin(100, coalesce(extraer_num_col_segura(rc_raw, "", "Jueves", "Jueves"), 0))
+      pct_vie <- pmin(100, coalesce(extraer_num_col_segura(rc_raw, "", "Viernes", "Viernes"), 0))
+      pct_sab <- pmin(100, coalesce(extraer_num_col_segura(rc_raw, "", "Sábado", "Sabado"), 0))
+      
+      kg_p_lun <- coalesce(extraer_num_col_segura(rc_raw, "Kg_", "Lunes", "Lunes"), 0)
+      kg_p_mar <- coalesce(extraer_num_col_segura(rc_raw, "Kg_", "Martes", "Martes"), 0)
+      kg_p_mie <- coalesce(extraer_num_col_segura(rc_raw, "Kg_", "Miércoles", "Miercoles"), 0)
+      kg_p_jue <- coalesce(extraer_num_col_segura(rc_raw, "Kg_", "Jueves", "Jueves"), 0)
+      kg_p_vie <- coalesce(extraer_num_col_segura(rc_raw, "Kg_", "Viernes", "Viernes"), 0)
+      kg_p_sab <- coalesce(extraer_num_col_segura(rc_raw, "Kg_", "Sábado", "Sabado"), 0)
+      
+      cells_vec <- if ("cells_str" %in% names(rc_raw)) as.character(rc_raw$cells_str) else rep("", nrow(rc_raw))
+      
+      tibble(
+        codigo_norm       = norm_codigo_valvula(rc_raw[[col_cod]]),
+        Pasada_rc         = if ("Num_Pasada" %in% names(rc_raw)) as.character(rc_raw$Num_Pasada) else "1",
+        Ha_Lunes_rc       = ha_lun,
+        Ha_Martes_rc      = ha_mar,
+        Ha_Miercoles_rc   = ha_mie,
+        Ha_Jueves_rc      = ha_jue,
+        Ha_Viernes_rc     = ha_vie,
+        Ha_Sabado_rc      = ha_sab,
+        Ha_Total_rc       = ha_lun + ha_mar + ha_mie + ha_jue + ha_vie + ha_sab,
+        Pct_Lunes_rc      = pct_lun,
+        Pct_Martes_rc     = pct_mar,
+        Pct_Miercoles_rc  = pct_mie,
+        Pct_Jueves_rc     = pct_jue,
+        Pct_Viernes_rc    = pct_vie,
+        Pct_Sabado_rc     = pct_sab,
+        cells_str_rc      = cells_vec,
+        Kg_Prog_Lunes     = kg_p_lun,
+        Kg_Prog_Martes    = kg_p_mar,
+        Kg_Prog_Miercoles = kg_p_mie,
+        Kg_Prog_Jueves    = kg_p_jue,
+        Kg_Prog_Viernes   = kg_p_vie,
+        Kg_Prog_Sabado    = kg_p_sab,
+        Kg_Prog_Total     = kg_p_lun + kg_p_mar + kg_p_mie + kg_p_jue + kg_p_vie + kg_p_sab
+      ) %>%
+        filter(!is.na(codigo_norm), nzchar(codigo_norm), Ha_Total_rc > 0) %>%
+        group_by(codigo_norm) %>%
+        summarise(
+          Pasada_rc         = first(Pasada_rc),
+          Ha_Lunes_rc       = sum(Ha_Lunes_rc, na.rm = TRUE),
+          Ha_Martes_rc      = sum(Ha_Martes_rc, na.rm = TRUE),
+          Ha_Miercoles_rc   = sum(Ha_Miercoles_rc, na.rm = TRUE),
+          Ha_Jueves_rc      = sum(Ha_Jueves_rc, na.rm = TRUE),
+          Ha_Viernes_rc     = sum(Ha_Viernes_rc, na.rm = TRUE),
+          Ha_Sabado_rc      = sum(Ha_Sabado_rc, na.rm = TRUE),
+          Ha_Total_rc       = sum(Ha_Total_rc, na.rm = TRUE),
+          Pct_Lunes_rc      = pmin(100, sum(Pct_Lunes_rc, na.rm = TRUE)),
+          Pct_Martes_rc     = pmin(100, sum(Pct_Martes_rc, na.rm = TRUE)),
+          Pct_Miercoles_rc  = pmin(100, sum(Pct_Miercoles_rc, na.rm = TRUE)),
+          Pct_Jueves_rc     = pmin(100, sum(Pct_Jueves_rc, na.rm = TRUE)),
+          Pct_Viernes_rc    = pmin(100, sum(Pct_Viernes_rc, na.rm = TRUE)),
+          Pct_Sabado_rc     = pmin(100, sum(Pct_Sabado_rc, na.rm = TRUE)),
+          cells_str_rc      = {
+            cs <- na.omit(cells_str_rc[nzchar(trimws(cells_str_rc))])
+            if (length(cs) > 0) cs[1] else ""
+          },
+          Kg_Prog_Lunes     = sum(Kg_Prog_Lunes, na.rm = TRUE),
+          Kg_Prog_Martes    = sum(Kg_Prog_Martes, na.rm = TRUE),
+          Kg_Prog_Miercoles = sum(Kg_Prog_Miercoles, na.rm = TRUE),
+          Kg_Prog_Jueves    = sum(Kg_Prog_Jueves, na.rm = TRUE),
+          Kg_Prog_Viernes   = sum(Kg_Prog_Viernes, na.rm = TRUE),
+          Kg_Prog_Sabado    = sum(Kg_Prog_Sabado, na.rm = TRUE),
+          Kg_Prog_Total     = sum(Kg_Prog_Total, na.rm = TRUE),
+          .groups           = "drop"
+        )
+    } else {
+      tibble(codigo_norm = character(), Pasada_rc = character(), Ha_Lunes_rc = numeric(), Ha_Martes_rc = numeric(), Ha_Miercoles_rc = numeric(),
+             Ha_Jueves_rc = numeric(), Ha_Viernes_rc = numeric(), Ha_Sabado_rc = numeric(), Ha_Total_rc = numeric(),
+             Pct_Lunes_rc = numeric(), Pct_Martes_rc = numeric(), Pct_Miercoles_rc = numeric(), Pct_Jueves_rc = numeric(), Pct_Viernes_rc = numeric(), Pct_Sabado_rc = numeric(), cells_str_rc = character(),
+             Kg_Prog_Lunes = numeric(), Kg_Prog_Martes = numeric(), Kg_Prog_Miercoles = numeric(), Kg_Prog_Jueves = numeric(), Kg_Prog_Viernes = numeric(), Kg_Prog_Sabado = numeric(), Kg_Prog_Total = numeric())
+    }
+    
+    # 2. SAP oficial (df_hist_oficial_wide)
+    df_sap <- if (exists("df_hist_oficial_wide") && is.data.frame(df_hist_oficial_wide) && nrow(df_hist_oficial_wide) > 0) {
+      sub_w <- df_hist_oficial_wide %>% filter(as.numeric(Semana) == sem_num)
+      if (nrow(sub_w) > 0) {
+        kg_lun <- coalesce(extraer_num_col_segura(sub_w, "Kg_", "Lunes", "Lunes"), 0)
+        kg_mar <- coalesce(extraer_num_col_segura(sub_w, "Kg_", "Martes", "Martes"), 0)
+        kg_mie <- coalesce(extraer_num_col_segura(sub_w, "Kg_", "Miércoles", "Miercoles"), 0)
+        kg_jue <- coalesce(extraer_num_col_segura(sub_w, "Kg_", "Jueves", "Jueves"), 0)
+        kg_vie <- coalesce(extraer_num_col_segura(sub_w, "Kg_", "Viernes", "Viernes"), 0)
+        kg_sab <- coalesce(extraer_num_col_segura(sub_w, "Kg_", "Sábado", "Sabado"), 0)
+        
+        tibble(
+          codigo_norm      = norm_codigo_valvula(sub_w$Codigo_Valv),
+          Variedad_sap     = as.character(sub_w$Variedad),
+          Pasada_sap       = if ("Pasada" %in% names(sub_w)) as.character(sub_w$Pasada) else "1",
+          Kg_Lunes_sap     = kg_lun,
+          Kg_Martes_sap    = kg_mar,
+          Kg_Miercoles_sap = kg_mie,
+          Kg_Jueves_sap    = kg_jue,
+          Kg_Viernes_sap   = kg_vie,
+          Kg_Sabado_sap    = kg_sab,
+          Kg_Total_sap     = round(kg_lun + kg_mar + kg_mie + kg_jue + kg_vie + kg_sab, 2)
+        ) %>%
+          filter(!is.na(codigo_norm), nzchar(codigo_norm), Kg_Total_sap > 0) %>%
+          group_by(codigo_norm) %>%
+          summarise(
+            Variedad_sap     = first(na.omit(Variedad_sap)),
+            Pasada_sap       = first(Pasada_sap),
+            Kg_Lunes_sap     = sum(Kg_Lunes_sap, na.rm = TRUE),
+            Kg_Martes_sap    = sum(Kg_Martes_sap, na.rm = TRUE),
+            Kg_Miercoles_sap = sum(Kg_Miercoles_sap, na.rm = TRUE),
+            Kg_Jueves_sap    = sum(Kg_Jueves_sap, na.rm = TRUE),
+            Kg_Viernes_sap   = sum(Kg_Viernes_sap, na.rm = TRUE),
+            Kg_Sabado_sap    = sum(Kg_Sabado_sap, na.rm = TRUE),
+            Kg_Total_sap     = sum(Kg_Total_sap, na.rm = TRUE),
+            .groups          = "drop"
+          )
+      } else {
+        tibble(codigo_norm = character(), Variedad_sap = character(), Pasada_sap = character(),
+               Kg_Lunes_sap = numeric(), Kg_Martes_sap = numeric(), Kg_Miercoles_sap = numeric(),
+               Kg_Jueves_sap = numeric(), Kg_Viernes_sap = numeric(), Kg_Sabado_sap = numeric(), Kg_Total_sap = numeric())
+      }
+    } else {
+      tibble(codigo_norm = character(), Variedad_sap = character(), Pasada_sap = character(),
+             Kg_Lunes_sap = numeric(), Kg_Martes_sap = numeric(), Kg_Miercoles_sap = numeric(),
+             Kg_Jueves_sap = numeric(), Kg_Viernes_sap = numeric(), Kg_Sabado_sap = numeric(), Kg_Total_sap = numeric())
+    }
+    
+    todos_codigos <- unique(c(df_campo$codigo_norm, df_sap$codigo_norm))
+    if (length(todos_codigos) == 0) return(tibble())
+    
+    # Cruce preliminar
+    df_rec <- tibble(codigo_norm = todos_codigos) %>%
+      left_join(df_campo, by = "codigo_norm") %>%
+      left_join(df_sap, by = "codigo_norm") %>%
+      mutate(
+        across(starts_with("Ha_"), ~ coalesce(.x, 0)),
+        across(starts_with("Kg_"), ~ coalesce(.x, 0)),
+        across(starts_with("Pct_"), ~ coalesce(.x, 0)),
+        cells_str_rc = coalesce(cells_str_rc, ""),
+        Tiene_Campo  = Ha_Total_rc > 0,
+        Tiene_SAP    = Kg_Total_sap > 0
+      )
+    
+    # Integrar catastro para georreferenciación y agrupación
+    catastro <- if (exists("df_valvulas") && is.data.frame(df_valvulas) && nrow(df_valvulas) > 0) {
+      df_valvulas %>%
+        mutate(codigo_norm = norm_codigo_valvula(codigo)) %>%
+        distinct(codigo_norm, .keep_all = TRUE) %>%
+        select(codigo_norm, Sector, Módulo, Turno, Válvula, Variedad_cat = Variedad, Area_ha = Área)
+    } else {
+      tibble(codigo_norm = character(), Sector = character(), Módulo = character(), Turno = character(), Válvula = character(), Variedad_cat = character(), Area_ha = numeric())
+    }
+    
+    df_rec <- df_rec %>%
+      left_join(catastro, by = "codigo_norm") %>%
+      mutate(
+        Sector           = coalesce(Sector, sub(".*S0*([0-9]+).*", "\\1", codigo_norm)),
+        Módulo           = coalesce(as.character(Módulo), sub("^M0*([0-9]+).*", "\\1", codigo_norm)),
+        Turno            = coalesce(as.character(Turno), sub(".*-T0*([0-9]+).*", "\\1", codigo_norm)),
+        Válvula          = coalesce(as.character(Válvula), sub(".*-V0*([0-9]+)$", "\\1", codigo_norm)),
+        Variedad         = coalesce(Variedad_sap, Variedad_cat, "Desconocida"),
+        Area_ha          = coalesce(Area_ha, 0),
+        
+        Kg_Lunes_rec     = Kg_Lunes_sap,
+        Kg_Martes_rec    = Kg_Martes_sap,
+        Kg_Miercoles_rec = Kg_Miercoles_sap,
+        Kg_Jueves_rec    = Kg_Jueves_sap,
+        Kg_Viernes_rec   = Kg_Viernes_sap,
+        Kg_Sabado_rec    = Kg_Sabado_sap,
+        Kg_Total_rec     = Kg_Total_sap,
+        Kg_Desfase       = 0,
+        
+        Estado_Concil        = "Conciliado OK",
+        Tipo_Alerta          = "conciliado",
+        Diagnostico          = "Campo y SAP coinciden plenamente.",
+        Es_Valido_Operativo  = TRUE
+      )
+    
+    for (i in seq_len(nrow(df_rec))) {
+      r <- df_rec[i, ]
+      
+      # REGLA 1: SAP sin Ruta -> Excluir de cálculos y pintado
+      if (!r$Tiene_Campo && r$Tiene_SAP) {
+        df_rec$Estado_Concil[i]        <- "Kilos SAP sin Ruta"
+        df_rec$Tipo_Alerta[i]          <- "inconsistencia"
+        df_rec$Diagnostico[i]          <- sprintf("Pesado en SAP (%s kg), pero no programado en ruta de campo. Excluido de mapa y cálculos.", format(round(r$Kg_Total_sap, 0), big.mark = ","))
+        df_rec$Es_Valido_Operativo[i]  <- FALSE
+        df_rec$Kg_Lunes_rec[i]         <- 0
+        df_rec$Kg_Martes_rec[i]        <- 0
+        df_rec$Kg_Miercoles_rec[i]     <- 0
+        df_rec$Kg_Jueves_rec[i]        <- 0
+        df_rec$Kg_Viernes_rec[i]       <- 0
+        df_rec$Kg_Sabado_rec[i]        <- 0
+        df_rec$Kg_Total_rec[i]         <- 0
+        next
+      }
+      
+      # REGLA 3: Ruta sin Kilos en SAP -> Mantener en incidencias; en base real SAP es 0 kg hasta edición manual
+      if (r$Tiene_Campo && !r$Tiene_SAP) {
+        dias_c <- character(0)
+        if (r$Ha_Lunes_rc > 0) dias_c <- c(dias_c, "Lunes")
+        if (r$Ha_Martes_rc > 0) dias_c <- c(dias_c, "Martes")
+        if (r$Ha_Miercoles_rc > 0) dias_c <- c(dias_c, "Miércoles")
+        if (r$Ha_Jueves_rc > 0) dias_c <- c(dias_c, "Jueves")
+        if (r$Ha_Viernes_rc > 0) dias_c <- c(dias_c, "Viernes")
+        if (r$Ha_Sabado_rc > 0) dias_c <- c(dias_c, "Sábado")
+        
+        tiene_previos <- any(dias_c %in% dias_cerrados_nom)
+        if (es_semana_actual && !tiene_previos) {
+          df_rec$Estado_Concil[i]        <- "Cosecha Hoy (D+1)"
+          df_rec$Tipo_Alerta[i]          <- "en_proceso"
+          df_rec$Diagnostico[i]          <- sprintf("Cosechado hoy (%s) en campo. Pendiente de recepción en balanza de packing mañana.", paste(dias_c, collapse = ", "))
+          df_rec$Es_Valido_Operativo[i]  <- TRUE
+          df_rec$Kg_Miercoles_rec[i]     <- 0
+          df_rec$Kg_Total_rec[i]         <- 0
+        } else {
+          df_rec$Estado_Concil[i]        <- "Ruta sin Kilos SAP"
+          df_rec$Tipo_Alerta[i]          <- "inconsistencia"
+          df_rec$Diagnostico[i]          <- sprintf("Cosechado en campo [%s], 0 kg en SAP tras cierre. En reporte de incidencias para edición manual en Excel.",
+                                                    paste(dias_c, collapse = ", "))
+          df_rec$Es_Valido_Operativo[i]  <- TRUE
+          df_rec$Kg_Lunes_rec[i]         <- 0
+          df_rec$Kg_Martes_rec[i]        <- 0
+          df_rec$Kg_Miercoles_rec[i]     <- 0
+          df_rec$Kg_Jueves_rec[i]        <- 0
+          df_rec$Kg_Viernes_rec[i]       <- 0
+          df_rec$Kg_Sabado_rec[i]        <- 0
+          df_rec$Kg_Total_rec[i]         <- 0
+        }
+        next
+      }
+      # REGLA 2: Desfase de Día -> Días cerrados donde SAP tiene kilos pero Campo no reportó cosecha
+      if (r$Tiene_Campo && r$Tiene_SAP) {
+        kg_dias <- c(Lunes = r$Kg_Lunes_sap, Martes = r$Kg_Martes_sap, Miércoles = r$Kg_Miercoles_sap,
+                     Jueves = r$Kg_Jueves_sap, Viernes = r$Kg_Viernes_sap, Sábado = r$Kg_Sabado_sap)
+        ha_dias <- c(Lunes = r$Ha_Lunes_rc, Martes = r$Ha_Martes_rc, Miércoles = r$Ha_Miercoles_rc,
+                     Jueves = r$Ha_Jueves_rc, Viernes = r$Ha_Viernes_rc, Sábado = r$Ha_Sabado_rc)
+        
+        dias_c_act <- names(ha_dias)[ha_dias > 0]
+        dias_s_act <- names(kg_dias)[kg_dias > 0]
+        
+        dias_c_cerr <- dias_c_act[dias_c_act %in% dias_cerrados_nom]
+        dias_s_cerr <- dias_s_act[dias_s_act %in% dias_cerrados_nom]
+        
+        if (es_semana_actual) {
+          dias_desfase_sap <- setdiff(dias_s_cerr, dias_c_cerr)
+          
+          if (length(dias_desfase_sap) > 0 && length(dias_c_cerr) > 0) {
+            # Hay kilos en SAP en días cerrados donde campo no reportó cosecha (jabas rezagadas / desfase)
+            kg_desfase_excl  <- round(sum(kg_dias[dias_desfase_sap]), 2)
+            kg_coincidente   <- round(sum(kg_dias[dias_c_cerr]), 2)
+            kg_sum_contiguos <- round(kg_coincidente + kg_desfase_excl, 2)
+            
+            # El usuario instruye: el desfase ahora sí cuadra, agregarlo a la fecha donde tiene más kilos
+            # que coincide con cosecha campo, y ahora es AZUL porque sí se usará.
+            dia_destino <- dias_c_cerr[1]
+            
+            df_rec$Estado_Concil[i]        <- "Desfase Reasignado"
+            df_rec$Tipo_Alerta[i]          <- "conciliado"
+            df_rec$Diagnostico[i]          <- sprintf("Desfase de %s kg en [%s] reasignado a [%s] por coincidencia con ruta de campo (Total: %s kg). Usado operativamente (Azul).",
+                                                      format(round(kg_desfase_excl, 0), big.mark = ","),
+                                                      paste(dias_desfase_sap, collapse = ", "),
+                                                      dia_destino,
+                                                      format(round(kg_sum_contiguos, 0), big.mark = ","))
+            df_rec$Es_Valido_Operativo[i]  <- TRUE
+            df_rec$Kg_Desfase[i]           <- kg_desfase_excl
+            
+            # Asignar todos los kilos al día coincidente con campo; el día desfasado queda en 0
+            for (dc in dias_desfase_sap) {
+              col_n <- paste0("Kg_", dc, "_rec")
+              df_rec[[col_n]][i] <- 0
+            }
+            col_dest <- paste0("Kg_", dia_destino, "_rec")
+            df_rec[[col_dest]][i] <- kg_sum_contiguos
+            
+            df_rec$Kg_Total_rec[i] <- round(sum(c(df_rec$Kg_Lunes_rec[i], df_rec$Kg_Martes_rec[i], df_rec$Kg_Miercoles_rec[i],
+                                                  df_rec$Kg_Jueves_rec[i], df_rec$Kg_Viernes_rec[i], df_rec$Kg_Sabado_rec[i])), 2)
+          } else if (length(dias_c_cerr) > 0 && length(dias_s_cerr) > 0 && length(dias_desfase_sap) == 0) {
+            # Coincidencia plena en todos los días cerrados (ej. cosechó Lunes y Martes y SAP tiene Lunes y Martes)
+            df_rec$Estado_Concil[i]        <- "Conciliado OK"
+            df_rec$Tipo_Alerta[i]          <- "conciliado"
+            df_rec$Diagnostico[i]          <- "Campo y SAP coinciden plenamente en válvula y días."
+            df_rec$Es_Valido_Operativo[i]  <- TRUE
+            df_rec$Kg_Desfase[i]           <- 0
+            for (dc in dias_c_cerr) {
+              col_n <- paste0("Kg_", dc, "_rec")
+              df_rec[[col_n]][i] <- round(kg_dias[dc], 2)
+            }
+            df_rec$Kg_Total_rec[i] <- round(sum(c(df_rec$Kg_Lunes_rec[i], df_rec$Kg_Martes_rec[i], df_rec$Kg_Miercoles_rec[i],
+                                                  df_rec$Kg_Jueves_rec[i], df_rec$Kg_Viernes_rec[i], df_rec$Kg_Sabado_rec[i])), 2)
+          } else {
+            df_rec$Estado_Concil[i]        <- "Desfase de Día"
+            df_rec$Tipo_Alerta[i]          <- "inconsistencia"
+            df_rec$Diagnostico[i]          <- sprintf("Desfase total: Campo [%s] vs SAP [%s]. Kilos fuera de cálculo (Rojo).",
+                                                      paste(dias_c_cerr, collapse = ", "), paste(dias_s_cerr, collapse = ", "))
+            df_rec$Es_Valido_Operativo[i]  <- FALSE
+            df_rec$Kg_Desfase[i]           <- round(sum(kg_dias[dias_s_cerr]), 2)
+            df_rec$Kg_Lunes_rec[i]         <- 0
+            df_rec$Kg_Martes_rec[i]        <- 0
+            df_rec$Kg_Miercoles_rec[i]     <- 0
+            df_rec$Kg_Jueves_rec[i]        <- 0
+            df_rec$Kg_Viernes_rec[i]       <- 0
+            df_rec$Kg_Sabado_rec[i]        <- 0
+            df_rec$Kg_Total_rec[i]         <- 0
+          }
+        } else {
+          df_rec$Estado_Concil[i]        <- "Conciliado OK"
+          df_rec$Tipo_Alerta[i]          <- "conciliado"
+          df_rec$Diagnostico[i]          <- "Semana histórica o sin desfases."
+          df_rec$Es_Valido_Operativo[i]  <- TRUE
+        }
+        next
+      }
+    }
+    
+    return(df_rec)
+  }
+  
   obtener_datos_mapa_semana <- function(sem_num, 
                                         pasada_filtro = "1",
                                         grupos_filtro = character(0),
@@ -1429,7 +1798,8 @@ if (nzchar(ruta_rdata_cargada) && file.exists(ruta_rdata_cargada)) {
                                         turnos_filtro = character(0),
                                         vars_filtro     = character(0),
                                         modo_mapa     = "real",
-                                        df_ajuste_valvs = NULL) {
+                                        df_ajuste_valvs = NULL,
+                                        df_ediciones  = NULL) {
     sem_num <- as.numeric(sem_num)
     pasada_str <- if (!is.null(pasada_filtro) && nzchar(as.character(pasada_filtro))) as.character(pasada_filtro) else "1"
     if (!exists("df_valvulas") || !is.data.frame(df_valvulas) || nrow(df_valvulas) == 0) {
@@ -1617,54 +1987,157 @@ if (nzchar(ruta_rdata_cargada) && file.exists(ruta_rdata_cargada)) {
     }
     
     # 3. Fusión Unificada: Kilos Oficiales + Ha Cosecha Campo (con fallback oficial)
-    df_merged <- df_valv_ref %>%
-      left_join(df_oficial_cruzado, by = "id") %>%
-      left_join(rc_cruzado, by = "id") %>%
-      mutate(
-        # Kilos siempre oficiales SAP
-        Kg_Lunes     = coalesce(Kg_Lunes_ofic, 0),
-        Kg_Martes    = coalesce(Kg_Martes_ofic, 0),
-        Kg_Miercoles = coalesce(Kg_Miercoles_ofic, 0),
-        Kg_Jueves    = coalesce(Kg_Jueves_ofic, 0),
-        Kg_Viernes   = coalesce(Kg_Viernes_ofic, 0),
-        Kg_Sabado    = coalesce(Kg_Sabado_ofic, 0),
-        Kg_Total     = round(Kg_Lunes + Kg_Martes + Kg_Miercoles + Kg_Jueves + Kg_Viernes + Kg_Sabado, 2),
-        
-        # Bandera: ¿Se tiene información en Ruta de Cosecha Campo?
-        tiene_campo = (!is.na(Ha_Total_rc) & Ha_Total_rc > 0) |
-          (coalesce(Pct_Lunes_rc, 0) + coalesce(Pct_Martes_rc, 0) + coalesce(Pct_Miercoles_rc, 0) +
-             coalesce(Pct_Jueves_rc, 0) + coalesce(Pct_Viernes_rc, 0) + coalesce(Pct_Sabado_rc, 0)) > 0,
-        
-        # Hectáreas: Priorizar Campo, fallback a Oficial
-        Ha_Lunes     = ifelse(tiene_campo, coalesce(Ha_Lunes_rc, 0), coalesce(Ha_Lunes_ofic, 0)),
-        Ha_Martes    = ifelse(tiene_campo, coalesce(Ha_Martes_rc, 0), coalesce(Ha_Martes_ofic, 0)),
-        Ha_Miercoles = ifelse(tiene_campo, coalesce(Ha_Miercoles_rc, 0), coalesce(Ha_Miercoles_ofic, 0)),
-        Ha_Jueves    = ifelse(tiene_campo, coalesce(Ha_Jueves_rc, 0), coalesce(Ha_Jueves_ofic, 0)),
-        Ha_Viernes   = ifelse(tiene_campo, coalesce(Ha_Viernes_rc, 0), coalesce(Ha_Viernes_ofic, 0)),
-        Ha_Sabado    = ifelse(tiene_campo, coalesce(Ha_Sabado_rc, 0), coalesce(Ha_Sabado_ofic, 0)),
-        
-        # Porcentajes diarios de dibujo: Priorizar Campo, fallback a Oficial
-        Pct_Lunes     = ifelse(tiene_campo, coalesce(Pct_Lunes_rc, 0), coalesce(Pct_Lunes_ofic, 0)),
-        Pct_Martes    = ifelse(tiene_campo, coalesce(Pct_Martes_rc, 0), coalesce(Pct_Martes_ofic, 0)),
-        Pct_Miercoles = ifelse(tiene_campo, coalesce(Pct_Miercoles_rc, 0), coalesce(Pct_Miercoles_ofic, 0)),
-        Pct_Jueves    = ifelse(tiene_campo, coalesce(Pct_Jueves_rc, 0), coalesce(Pct_Jueves_ofic, 0)),
-        Pct_Viernes   = ifelse(tiene_campo, coalesce(Pct_Viernes_rc, 0), coalesce(Pct_Viernes_ofic, 0)),
-        Pct_Sabado    = ifelse(tiene_campo, coalesce(Pct_Sabado_rc, 0), coalesce(Pct_Sabado_ofic, 0)),
-        cells_str     = ifelse(tiene_campo, coalesce(as.character(cells_str_rc), ""), ""),
-        
-        Pct_Total = pmin(100, Pct_Lunes + Pct_Martes + Pct_Miercoles + Pct_Jueves + Pct_Viernes + Pct_Sabado),
-        Ha_Cosechada = ifelse(tiene_campo, coalesce(Ha_Total_rc, Ha_Lunes + Ha_Martes + Ha_Miercoles + Ha_Jueves + Ha_Viernes + Ha_Sabado),
-                              coalesce(Ha_Total_ofic, round(Área * (Pct_Total / 100), 2)))
-      ) %>%
-      mutate(
-        Ha_Cosechada = ifelse(Ha_Cosechada <= 0 & Pct_Total > 0 & Área > 0, round(Área * (Pct_Total / 100), 2), Ha_Cosechada),
-        Pct_Total    = ifelse(Kg_Total > 0 & Pct_Total <= 0, 100, Pct_Total),
-        Ha_Cosechada = ifelse(Kg_Total > 0 & Ha_Cosechada <= 0, Área, Ha_Cosechada)
-      )
-
-  # Si la vista es "Ajustado" y hay asignaciones calculadas por el motor de ajuste:
-  if (identical(modo_mapa, "ajustado") && !is.null(df_ajuste_valvs) && is.data.frame(df_ajuste_valvs) && nrow(df_ajuste_valvs) > 0) {
-    df_aj <- df_ajuste_valvs
+    # 3. Fusión Reconciliada (Reglas: 1. SAP sin ruta excluido; 2. Desfase contiguo unificado; 3. Ruta sin SAP asignado provisorio)
+    df_concil <- tryCatch(obtener_cosecha_conciliada_semana(sem_num, "2026"), error = function(e) NULL)
+    
+    df_merged <- if (!is.null(df_concil) && nrow(df_concil) > 0) {
+      if (pasada_str %in% c("1", "2")) {
+        df_concil <- df_concil %>% filter(coalesce(as.character(Pasada_rc), coalesce(as.character(Pasada_sap), "1")) == pasada_str)
+      }
+      df_valv_ref %>%
+        left_join(df_concil, by = "codigo_norm") %>%
+        group_by(codigo_norm) %>%
+        mutate(
+          prop_valv = if (n() > 1 && sum(Área, na.rm = TRUE) > 0) Área / sum(Área, na.rm = TRUE) else 1,
+          across(starts_with("Kg_") & ends_with("_rec"), ~ round(. * prop_valv, 2)),
+          across(starts_with("Ha_") & ends_with("_rc"), ~ round(. * prop_valv, 2))
+        ) %>%
+        ungroup() %>%
+        mutate(
+          es_valido   = coalesce(Es_Valido_Operativo, FALSE),
+          tiene_campo = coalesce(Tiene_Campo, FALSE),
+          
+          # REGLA 1: SAP sin ruta excluido por completo (kilos = 0, ha = 0, % = 0)
+          Kg_Lunes     = ifelse(es_valido, coalesce(Kg_Lunes_rec, 0), 0),
+          Kg_Martes    = ifelse(es_valido, coalesce(Kg_Martes_rec, 0), 0),
+          Kg_Miercoles = ifelse(es_valido, coalesce(Kg_Miercoles_rec, 0), 0),
+          Kg_Jueves    = ifelse(es_valido, coalesce(Kg_Jueves_rec, 0), 0),
+          Kg_Viernes   = ifelse(es_valido, coalesce(Kg_Viernes_rec, 0), 0),
+          Kg_Sabado    = ifelse(es_valido, coalesce(Kg_Sabado_rec, 0), 0),
+          Kg_Total     = round(Kg_Lunes + Kg_Martes + Kg_Miercoles + Kg_Jueves + Kg_Viernes + Kg_Sabado, 2),
+          
+          Ha_Lunes     = ifelse(es_valido & tiene_campo, coalesce(Ha_Lunes_rc, 0), 0),
+          Ha_Martes    = ifelse(es_valido & tiene_campo, coalesce(Ha_Martes_rc, 0), 0),
+          Ha_Miercoles = ifelse(es_valido & tiene_campo, coalesce(Ha_Miercoles_rc, 0), 0),
+          Ha_Jueves    = ifelse(es_valido & tiene_campo, coalesce(Ha_Jueves_rc, 0), 0),
+          Ha_Viernes   = ifelse(es_valido & tiene_campo, coalesce(Ha_Viernes_rc, 0), 0),
+          Ha_Sabado    = ifelse(es_valido & tiene_campo, coalesce(Ha_Sabado_rc, 0), 0),
+          
+          Pct_Lunes     = ifelse(es_valido & tiene_campo, coalesce(Pct_Lunes_rc, 0), 0),
+          Pct_Martes    = ifelse(es_valido & tiene_campo, coalesce(Pct_Martes_rc, 0), 0),
+          Pct_Miercoles = ifelse(es_valido & tiene_campo, coalesce(Pct_Miercoles_rc, 0), 0),
+          Pct_Jueves    = ifelse(es_valido & tiene_campo, coalesce(Pct_Jueves_rc, 0), 0),
+          Pct_Viernes   = ifelse(es_valido & tiene_campo, coalesce(Pct_Viernes_rc, 0), 0),
+          Pct_Sabado    = ifelse(es_valido & tiene_campo, coalesce(Pct_Sabado_rc, 0), 0),
+          cells_str     = ifelse(es_valido & tiene_campo, coalesce(as.character(cells_str_rc), ""), ""),
+          
+          Pct_Total    = pmin(100, Pct_Lunes + Pct_Martes + Pct_Miercoles + Pct_Jueves + Pct_Viernes + Pct_Sabado),
+          Ha_Cosechada = ifelse(es_valido & tiene_campo, coalesce(Ha_Total_rc, Ha_Lunes + Ha_Martes + Ha_Miercoles + Ha_Jueves + Ha_Viernes + Ha_Sabado), 0)
+        )
+    } else {
+      df_valv_ref %>%
+        left_join(df_oficial_cruzado, by = "id") %>%
+        left_join(rc_cruzado, by = "id") %>%
+        mutate(
+          Kg_Lunes     = coalesce(Kg_Lunes_ofic, 0),
+          Kg_Martes    = coalesce(Kg_Martes_ofic, 0),
+          Kg_Miercoles = coalesce(Kg_Miercoles_ofic, 0),
+          Kg_Jueves    = coalesce(Kg_Jueves_ofic, 0),
+          Kg_Viernes   = coalesce(Kg_Viernes_ofic, 0),
+          Kg_Sabado    = coalesce(Kg_Sabado_ofic, 0),
+          Kg_Total     = round(Kg_Lunes + Kg_Martes + Kg_Miercoles + Kg_Jueves + Kg_Viernes + Kg_Sabado, 2),
+          tiene_campo  = (!is.na(Ha_Total_rc) & Ha_Total_rc > 0),
+          Ha_Lunes     = ifelse(tiene_campo, coalesce(Ha_Lunes_rc, 0), 0),
+          Ha_Martes    = ifelse(tiene_campo, coalesce(Ha_Martes_rc, 0), 0),
+          Ha_Miercoles = ifelse(tiene_campo, coalesce(Ha_Miercoles_rc, 0), 0),
+          Ha_Jueves    = ifelse(tiene_campo, coalesce(Ha_Jueves_rc, 0), 0),
+          Ha_Viernes   = ifelse(tiene_campo, coalesce(Ha_Viernes_rc, 0), 0),
+          Ha_Sabado    = ifelse(tiene_campo, coalesce(Ha_Sabado_rc, 0), 0),
+          Pct_Lunes     = ifelse(tiene_campo, coalesce(Pct_Lunes_rc, 0), 0),
+          Pct_Martes    = ifelse(tiene_campo, coalesce(Pct_Martes_rc, 0), 0),
+          Pct_Miercoles = ifelse(tiene_campo, coalesce(Pct_Miercoles_rc, 0), 0),
+          Pct_Jueves    = ifelse(tiene_campo, coalesce(Pct_Jueves_rc, 0), 0),
+          Pct_Viernes   = ifelse(tiene_campo, coalesce(Pct_Viernes_rc, 0), 0),
+          Pct_Sabado    = ifelse(tiene_campo, coalesce(Pct_Sabado_rc, 0), 0),
+          cells_str     = ifelse(tiene_campo, coalesce(as.character(cells_str_rc), ""), ""),
+          Pct_Total    = pmin(100, Pct_Lunes + Pct_Martes + Pct_Miercoles + Pct_Jueves + Pct_Viernes + Pct_Sabado),
+          Ha_Cosechada = ifelse(tiene_campo, coalesce(Ha_Total_rc, Ha_Lunes + Ha_Martes + Ha_Miercoles + Ha_Jueves + Ha_Viernes + Ha_Sabado), 0)
+        )
+    }
+  # Incorporar ediciones manuales de celdas al mapa de ajuste
+  ed_sem_man <- if (!is.null(df_ediciones) && is.data.frame(df_ediciones) && nrow(df_ediciones) > 0) {
+    df_ediciones %>% filter(as.numeric(Semana) == sem_num)
+  } else if (exists("cargar_ediciones_disco")) {
+    tryCatch(cargar_ediciones_disco() %>% filter(as.numeric(Semana) == sem_num), error = function(e) tibble())
+  } else {
+    tibble()
+  }
+  
+  man_filas <- if (nrow(ed_sem_man) > 0) {
+    ed_sem_man %>% 
+      filter(Tipo_Edicion == "manual", Campo %in% c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"), coalesce(Valor, 0) > 0)
+  } else {
+    tibble()
+  }
+  
+  df_valvs_man <- tibble()
+  if (nrow(man_filas) > 0) {
+    valvs_man_list <- list()
+    for (i in seq_len(nrow(man_filas))) {
+      ed <- man_filas[i, ]
+      mod_e <- trimws(as.character(ed$Módulo))
+      tur_e <- trimws(as.character(ed$Turno))
+      dia_e <- trimws(as.character(ed$Campo))
+      val_e <- as.numeric(ed$Valor)
+      
+      vt <- df_valv_ref %>% 
+        filter(
+          trimws(as.character(Módulo)) == mod_e,
+          trimws(as.character(Turno))  == tur_e
+        )
+      if (nrow(vt) == 0) next
+      
+      a_tot <- sum(vt$Área, na.rm = TRUE)
+      v_man <- vt %>%
+        transmute(
+          id              = id,
+          codigo          = codigo,
+          Módulo          = mod_e,
+          Turno           = tur_e,
+          Dia_Asignado    = dia_e,
+          Kg_Asignado     = round(val_e * (Área / pmax(0.01, a_tot)), 2),
+          Ha_Asignada     = Área,
+          Num_Pasada      = 1L,
+          Tipo_Asignacion = "manual",
+          Dia_Desde       = "Miércoles",
+          Dia_Hasta       = "Sábado"
+        )
+      valvs_man_list[[length(valvs_man_list) + 1]] <- v_man
+    }
+    if (length(valvs_man_list) > 0) {
+      df_valvs_man <- bind_rows(valvs_man_list)
+    }
+  }
+  
+  # Combinar df_ajuste_valvs con df_valvs_man (las ediciones manuales sobreescriben asignaciones automáticas de ese turno y día)
+  df_aj_comb <- if (!is.null(df_ajuste_valvs) && is.data.frame(df_ajuste_valvs) && nrow(df_ajuste_valvs) > 0) {
+    if (nrow(df_valvs_man) > 0 && "Módulo" %in% names(df_ajuste_valvs) && "Turno" %in% names(df_ajuste_valvs)) {
+      claves_man <- paste(trimws(as.character(df_valvs_man$Módulo)),
+                          trimws(as.character(df_valvs_man$Turno)),
+                          trimws(as.character(df_valvs_man$Dia_Asignado)), sep = "___")
+      claves_aj <- paste(trimws(as.character(df_ajuste_valvs$Módulo)),
+                         trimws(as.character(df_ajuste_valvs$Turno)),
+                         trimws(as.character(df_ajuste_valvs$Dia_Asignado)), sep = "___")
+      bind_rows(df_ajuste_valvs %>% filter(!claves_aj %in% claves_man), df_valvs_man)
+    } else {
+      df_ajuste_valvs
+    }
+  } else {
+    df_valvs_man
+  }
+  
+  if (identical(modo_mapa, "ajustado") && nrow(df_aj_comb) > 0) {
+    df_aj <- df_aj_comb
     if (pasada_str %in% c("1", "2")) {
       df_aj <- df_aj %>% filter(coalesce(as.character(Num_Pasada), "1") == pasada_str)
     }
@@ -1817,13 +2290,45 @@ if (nzchar(ruta_rdata_cargada) && file.exists(ruta_rdata_cargada)) {
   stop("ERROR CRÍTICO: Conexión exclusiva a Google Drive falló. No se encontró datos_maestros_cosecha_2026.RData en la unidad G: ni en Google Drive nube.")
 }
 
-# Homologar EB 9-2 a MAGICA y remover tildes en la base histórica de cosecha
-df_cosecha_base <- df_cosecha %>%
-  mutate(Variedad = limpiar_variedad(Variedad))
+# Identificador canónico de registros Testblock / Incubadora / Vivero / Sector 4
+es_fila_testblock <- function(sector_vec, modulo_vec, tipo_vec = NULL, es_tb_vec = NULL) {
+  res <- trimws(as.character(sector_vec)) %in% c("4", "04", "S04", "S4") |
+         grepl("test|incub|vivero|block|^tb", as.character(modulo_vec), ignore.case = TRUE)
+  if (!is.null(tipo_vec)) {
+    res <- res | toupper(trimws(coalesce(as.character(tipo_vec), ""))) == "TESTBLOCK"
+  }
+  if (!is.null(es_tb_vec)) {
+    res <- res | coalesce(as.logical(es_tb_vec), FALSE) |
+           toupper(trimws(coalesce(as.character(es_tb_vec), ""))) %in% c("SI", "TRUE", "1")
+  }
+  coalesce(res, FALSE)
+}
 
-# 2. Pre-calcular el Área consolidada por Turno (desde el catálogo histórico)
+limpiar_hist_wide_sin_testblock <- function(df_w) {
+  if (is.null(df_w) || !is.data.frame(df_w) || nrow(df_w) == 0) return(df_w)
+  df_w %>%
+    filter(
+      !trimws(as.character(Sector)) %in% c("4", "04", "S04", "S4"),
+      !is.na(Módulo_Norm),
+      !grepl("test|incub|vivero|block|^tb|^MNA", paste(Módulo_Norm, Codigo_Valv), ignore.case = TRUE)
+    )
+}
+
+if (exists("df_hist_oficial_wide") && is.data.frame(df_hist_oficial_wide)) {
+  df_hist_oficial_wide <- limpiar_hist_wide_sin_testblock(df_hist_oficial_wide)
+}
+
+# Homologar EB 9-2 a MAGICA, remover tildes y etiquetar Testblock desde el origen
+df_cosecha_base <- df_cosecha %>%
+  mutate(
+    Variedad     = limpiar_variedad(Variedad),
+    Es_Testblock = es_fila_testblock(Sector, Módulo, if ("Tipo_Cosecha" %in% names(.)) Tipo_Cosecha else NULL, if ("Es_Testblock" %in% names(.)) Es_Testblock else NULL),
+    Tipo_Cosecha = ifelse(Es_Testblock, "Testblock", "Comercial")
+  )
+
+# 2. Pre-calcular el Área consolidada por Turno (exclusivamente lotes comerciales)
 areas_base <- df_cosecha_base %>%
-  filter(!is.na(Área), Área > 0) %>%
+  filter(!Es_Testblock, !is.na(Área), Área > 0) %>%
   distinct(Campaña, Sector, Módulo, Turno, Válvula, Variedad, Área) %>%
   mutate(
     Campaña  = trimws(as.character(Campaña)),
@@ -2016,9 +2521,9 @@ cargar_cosecha_actual <- function(ruta_raiz, campana_actual = 2026) {
       mutate(
         Fecha        = fechas_parsed[which(es_semana_actual)],
         Real         = suppressWarnings(as.numeric(gsub("[^0-9.-]", "", as.character(.data[[col_peso]])))),
-        Sector       = sec_vec,
-        Módulo       = mod_vec,
-        Turno        = tur_vec,
+        Sector       = ifelse(es_tb, 4, sec_vec),
+        Módulo       = ifelse(es_tb, "Test Block", mod_vec),
+        Turno        = ifelse(es_tb, 0, tur_vec),
         Variedad     = limpiar_variedad(sub("^.*\\|\\s*", "", as.character(.data[[col_variedad]]))),
         Semana       = semana_actual,
         Campaña      = campana_actual,
@@ -2027,8 +2532,9 @@ cargar_cosecha_actual <- function(ruta_raiz, campana_actual = 2026) {
       ) %>%
       filter(!is.na(Real), Real > 0) %>%
       mutate(
-        Sector = ifelse(Variedad == "ROCIO" & Módulo == "8", 3, Sector),
+        Sector = ifelse(!Es_Testblock & Variedad == "ROCIO" & Módulo == "8", 3, Sector),
         Módulo = case_when(
+          Es_Testblock                           ~ "Test Block",
           Módulo == "9" & between(Turno, 1, 11)  ~ "9.2",
           Módulo == "9" & Turno >= 12            ~ "9.1",
           Módulo == "11" & between(Turno, 1, 12) ~ "11.1",
@@ -2091,16 +2597,26 @@ integrar_sap_en_historico <- function(df_hist_base, ruta_raiz, campana_actual = 
       filter(!(as.character(Campaña) == as.character(campana_actual) & Semana == semana_actual_num)) %>%
       bind_rows(df_sap_actual)
   }
+  tb_f <- es_fila_testblock(df_hist_base$Sector, df_hist_base$Módulo, df_hist_base$Tipo_Cosecha, df_hist_base$Es_Testblock)
+  df_hist_base$Es_Testblock <- tb_f
+  df_hist_base$Tipo_Cosecha <- ifelse(tb_f, "Testblock", "Comercial")
   return(df_hist_base)
 }
 
-# Carga inicial al arrancar la app: si ya viene con Tipo_Cosecha en RData maestro arranca directo; si no, integra SAP
-df_cosecha_inicial <- if (exists("metadata_actualizacion") && "Tipo_Cosecha" %in% names(df_cosecha_base)) {
+# Carga inicial al arrancar la app: separar desde el inicio Comercial vs Testblock
+df_cosecha_inicial_full <- if (exists("metadata_actualizacion") && "Tipo_Cosecha" %in% names(df_cosecha_base)) {
   cat("[COSECHA INICIAL] Base cargada al día directamente desde RData maestro (Arranque ultra-rápido)\n")
   df_cosecha_base
 } else {
   integrar_sap_en_historico(df_cosecha_base, ruta_raiz_arandano, campana_actual = 2026)
 }
+tb_ini_flag <- es_fila_testblock(df_cosecha_inicial_full$Sector, df_cosecha_inicial_full$Módulo, df_cosecha_inicial_full$Tipo_Cosecha, df_cosecha_inicial_full$Es_Testblock)
+df_cosecha_inicial_full$Es_Testblock <- tb_ini_flag
+df_cosecha_inicial_full$Tipo_Cosecha <- ifelse(tb_ini_flag, "Testblock", "Comercial")
+
+# Base 100% Comercial para tabla, ajustes, frecuencias y rendimientos; Testblock aislado solo para KPI de Cosecha Real
+df_cosecha_inicial       <- df_cosecha_inicial_full %>% filter(!Es_Testblock)
+df_cosecha_testblock_ini <- df_cosecha_inicial_full %>% filter(Es_Testblock)
 
 
 # ==============================================================================
@@ -3193,9 +3709,92 @@ ui <- fluidPage(
         border: 1px solid rgba(255, 255, 255, 0.15);
       }
 
+      /* =========================================================================
+         ESTILOS CONCILIACIÓN CAMPO VS SAP
+         ========================================================================= */
+      .btn-descarga-conciliacion {
+        background: #107C41 !important;
+        color: #FFFFFF !important;
+        border: none !important;
+        border-radius: 9px !important;
+        font-size: 12px !important;
+        font-weight: 600 !important;
+        padding: 6px 14px !important;
+        box-shadow: 0 1px 3px rgba(16, 124, 65, 0.25) !important;
+        transition: all 0.15s ease !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        gap: 6px !important;
+      }
+      .btn-descarga-conciliacion:hover {
+        background: #0E6835 !important;
+        transform: translateY(-1px);
+        color: #FFFFFF !important;
+      }
+      .kpi-concil-card {
+        padding: 10px 14px;
+        border-radius: 10px;
+        border: 1px solid rgba(0, 0, 0, 0.06);
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .card-concil-ok {
+        background: rgba(52, 199, 89, 0.08);
+        border-color: rgba(52, 199, 89, 0.22);
+      }
+      .card-concil-ok .concil-card-val { color: #28A745; }
+      .card-concil-sin-sap {
+        background: rgba(255, 59, 48, 0.08);
+        border-color: rgba(255, 59, 48, 0.22);
+      }
+      .card-concil-sin-sap .concil-card-val { color: #E02424; }
+      .card-concil-sin-ruta {
+        background: rgba(0, 122, 255, 0.08);
+        border-color: rgba(0, 122, 255, 0.22);
+      }
+      .card-concil-sin-ruta .concil-card-val { color: #007AFF; }
+      .card-concil-desfase {
+        background: rgba(175, 82, 222, 0.08);
+        border-color: rgba(175, 82, 222, 0.22);
+      }
+      .card-concil-desfase .concil-card-val { color: #9333EA; }
+      .card-concil-proceso {
+        background: rgba(142, 142, 147, 0.08);
+        border-color: rgba(142, 142, 147, 0.22);
+      }
+      .card-concil-proceso .concil-card-val { color: #6B7280; }
+      .concil-card-label {
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        color: #8E8E93;
+      }
+      .concil-card-val {
+        font-size: 20px;
+        font-weight: 700;
+        line-height: 1.2;
+      }
+      .concil-card-sub {
+        font-size: 11px;
+        color: #8E8E93;
+      }
+      .badge-concil-pill {
+        display: inline-block;
+        padding: 3px 8px;
+        border-radius: 6px;
+        font-size: 11px;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+      .pill-ok { background: rgba(52, 199, 89, 0.14); color: #1E7E34; border: 1px solid rgba(52, 199, 89, 0.3); }
+      .pill-sin-sap { background: rgba(255, 59, 48, 0.14); color: #D70015; border: 1px solid rgba(255, 59, 48, 0.3); }
+      .pill-sin-ruta { background: rgba(0, 122, 255, 0.14); color: #0062CC; border: 1px solid rgba(0, 122, 255, 0.3); }
+      .pill-desfase { background: rgba(175, 82, 222, 0.14); color: #7928CA; border: 1px solid rgba(175, 82, 222, 0.3); }
+      .pill-proceso { background: rgba(142, 142, 147, 0.14); color: #4B5563; border: 1px solid rgba(142, 142, 147, 0.3); }
       .filtros-grid-container {
         display: grid;
-        grid-template-columns: 95px 95px 120px 1.3fr 1fr 1fr 1.2fr 85px;
+        grid-template-columns: 105px 105px 1.3fr 1fr 1fr 1.2fr 90px;
         gap: 12px;
         align-items: flex-end;
       }
@@ -3786,12 +4385,6 @@ ui <- fluidPage(
                   }
               ),
               div(class = "filtro-item",
-                  selectInput("filtro_tipo_cosecha", "Tipo Datos", 
-                              choices = c("Comercial" = "Comercial", "Testblock" = "Testblock", "Todos" = "Todos"),
-                              selected = "Comercial",
-                              width = "100%")
-              ),
-              div(class = "filtro-item",
                   selectizeInput("filtro_grupo", "Grupo", 
                                  choices = names(grupos_modulos), 
                                  selected = NULL,
@@ -3846,7 +4439,7 @@ ui <- fluidPage(
           div(class = "kpi-card",
               div(class = "kpi-label", "Cosecha Real"),
               div(class = "kpi-value", textOutput("kpi_kilos_real")),
-              span(class = "kpi-badge", textOutput("kpi_kilos_real_badge", inline = TRUE))
+              uiOutput("ui_kpi_real_detalle")
           ),
           div(class = "kpi-card",
               div(class = "kpi-label", "Cosecha Ajustada"),
@@ -4285,6 +4878,77 @@ ui <- fluidPage(
                      )
             ),
             # Pestaña Frecuencia (Evolución por turno & Turnos por semana)
+            # Pestaña Conciliación Campo vs SAP (Auditoría de Cruce)
+            tabPanel("Conciliación Campo vs SAP",
+                     div(style = "margin-top: 14px; display: flex; flex-direction: column; gap: 14px;",
+                         # Cabecera informativa y Regla D+1
+                         div(style = "background: #FFFFFF; border-radius: 14px; padding: 16px 20px; border: 1px solid rgba(0, 0, 0, 0.05); box-shadow: 0 2px 8px rgba(0,0,0,0.02);",
+                             div(style = "display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 12px; margin-bottom: 12px;",
+                                 div(
+                                   h3(style = "font-size: 16px; font-weight: 700; margin: 0 0 4px 0; color: #1C1C1E;", "Conciliación de Cosecha: Campo vs SAP"),
+                                   p(style = "font-size: 12px; color: #8E8E93; margin: 0;", "Cruce de trazabilidad entre rutas reportadas en campo (Google Sheets) y recepción en balanzas oficiales (SAP)")
+                                 ),
+                                 downloadButton("btn_descarga_conciliacion_excel", "Descargar Inconsistencias (Excel)", class = "btn-descarga-conciliacion")
+                             ),
+                             uiOutput("ui_alerta_regla_d1"),
+                             # Mini Cards de Resumen KPI
+                             div(style = "display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-top: 12px;",
+                                 div(class = "kpi-concil-card card-concil-ok",
+                                     div(class = "concil-card-label", "Conciliadas OK"),
+                                     div(class = "concil-card-val", textOutput("kpi_concil_ok")),
+                                     div(class = "concil-card-sub", textOutput("kpi_concil_ok_sub"))
+                                 ),
+                                 div(class = "kpi-concil-card card-concil-sin-sap",
+                                     div(class = "concil-card-label", "Ruta sin Kilos SAP"),
+                                     div(class = "concil-card-val", textOutput("kpi_concil_sin_sap")),
+                                     div(class = "concil-card-sub", textOutput("kpi_concil_sin_sap_sub"))
+                                 ),
+                                 div(class = "kpi-concil-card card-concil-sin-ruta",
+                                     div(class = "concil-card-label", "Kilos SAP sin Ruta"),
+                                     div(class = "concil-card-val", textOutput("kpi_concil_sin_ruta")),
+                                     div(class = "concil-card-sub", textOutput("kpi_concil_sin_ruta_sub"))
+                                 ),
+                                 div(class = "kpi-concil-card card-concil-desfase",
+                                     div(class = "concil-card-label", "Desfase de Día"),
+                                     div(class = "concil-card-val", textOutput("kpi_concil_desfase")),
+                                     div(class = "concil-card-sub", textOutput("kpi_concil_desfase_sub"))
+                                 ),
+                                 div(class = "kpi-concil-card card-concil-proceso",
+                                     div(class = "concil-card-label", "Cosecha Hoy (D+1)"),
+                                     div(class = "concil-card-val", textOutput("kpi_concil_proceso")),
+                                     div(class = "concil-card-sub", textOutput("kpi_concil_proceso_sub"))
+                                 )
+                             )
+                         ),
+                         # Contenedor Tabla y Filtros de Estado
+                         div(style = "background: #FFFFFF; border-radius: 14px; padding: 18px 20px; border: 1px solid rgba(0, 0, 0, 0.05); box-shadow: 0 2px 8px rgba(0,0,0,0.02);",
+                             div(style = "display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 14px;",
+                                 div(style = "display: flex; align-items: center; gap: 8px; flex-wrap: wrap;",
+                                     tags$span(style = "font-size: 11.5px; font-weight: 700; color: #8E8E93; text-transform: uppercase;", "Filtrar por Estado:"),
+                                     div(class = "ios-segmented-switch",
+                                         radioButtons(
+                                           inputId  = "filtro_estado_conciliacion",
+                                           label    = NULL,
+                                           choices  = c("Solo Inconsistencias" = "inconsistencias",
+                                                        "Ruta sin SAP" = "ruta_sin_sap",
+                                                        "SAP sin Ruta" = "sap_sin_ruta",
+                                                        "Desfase Día"  = "desfase",
+                                                        "Hoy (D+1)"    = "proceso_hoy",
+                                                        "Conciliadas"  = "conciliado",
+                                                        "Todas"        = "todas"),
+                                           selected = "inconsistencias",
+                                           inline   = TRUE
+                                         )
+                                     )
+                                 ),
+                                 div(style = "font-size: 11.5px; color: #8E8E93;",
+                                     textOutput("txt_conteo_filtro_conciliacion", inline = TRUE)
+                                 )
+                             ),
+                             DTOutput("tabla_conciliacion_campo_sap")
+                         )
+                     )
+            ),
             tabPanel("Frecuencia",
                      div(style = "margin-top: 14px; display: flex; flex-direction: column; gap: 20px;",
                          # TARJETA 1: Evolución por turno
@@ -4334,9 +4998,10 @@ ui <- fluidPage(
 # ==============================================================================
 
 server <- function(input, output, session) {
-  # Reactive Values para datos de cosecha y ediciones manuales
-  rv_cosecha         <- reactiveVal(df_cosecha_inicial)
-  ediciones_manuales <- reactiveVal(cargar_ediciones_disco())
+  # Reactive Values para datos de cosecha (Comercial aislado de Testblock) y ediciones manuales
+  rv_cosecha           <- reactiveVal(df_cosecha_inicial)
+  rv_cosecha_testblock <- reactiveVal(df_cosecha_testblock_ini)
+  ediciones_manuales   <- reactiveVal(cargar_ediciones_disco())
   rv_ajuste_valvulas <- reactiveVal(cargar_ajuste_valvulas_disco())
   trigger_refresh    <- reactiveVal(0)
   
@@ -4388,9 +5053,13 @@ server <- function(input, output, session) {
         df_cosecha_base <<- df_cosecha %>% mutate(Variedad = limpiar_variedad(Variedad))
       }
     }
+    if (exists("df_hist_oficial_wide") && is.data.frame(df_hist_oficial_wide)) {
+      df_hist_oficial_wide <<- limpiar_hist_wide_sin_testblock(df_hist_oficial_wide)
+    }
     camp_act <- if (!is.null(input$filtro_campana)) input$filtro_campana else 2026
     nuevo_df <- integrar_sap_en_historico(df_cosecha_base, ruta_raiz_arandano, campana_actual = camp_act)
-    rv_cosecha(nuevo_df)
+    rv_cosecha(nuevo_df %>% filter(!Es_Testblock))
+    rv_cosecha_testblock(nuevo_df %>% filter(Es_Testblock))
     ediciones_manuales(cargar_ediciones_disco())
     tryCatch(rm(list = ls(cache_rutas_campo), envir = cache_rutas_campo), error = function(e) NULL)
     trigger_refresh(trigger_refresh() + 1)
@@ -4434,7 +5103,6 @@ server <- function(input, output, session) {
   
   # Restablecer filtros
   observeEvent(input$btn_reset, {
-    updateSelectInput(session, "filtro_tipo_cosecha", selected = "Comercial")
     updateSelectizeInput(session, "filtro_grupo", selected = character(0))
     updateSelectizeInput(session, "filtro_modulo", selected = character(0))
     updateSelectizeInput(session, "filtro_turno", selected = character(0))
@@ -4467,42 +5135,51 @@ server <- function(input, output, session) {
       summarise(Área_Cat = sum(Área, na.rm = TRUE), .groups = "drop")
   })
   
-  # Reactive 2A: Universo Base sin ediciones manuales (Solo cambia al cambiar Campaña, Semana o Actualizar SAP)
+  # Reactive 2A: Universo Base sin ediciones manuales (100% Comercial; Testblock está separado desde origen)
   universo_base <- reactive({
     req(input$filtro_campana, input$filtro_semana)
     
-    tipo_filtro <- if (!is.null(input$filtro_tipo_cosecha)) input$filtro_tipo_cosecha else "Comercial"
     dias_semana <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo")
     es_campana_2026 <- grepl("2026|^26", as.character(input$filtro_campana))
     
-    # 1. Cosecha registrada en la semana (filtrada por Tipo de Cosecha: Comercial / Testblock / Todos)
+    # 1. Cosecha comercial registrada en la semana
     df_filtrado <- rv_cosecha() %>%
-      filter(as.character(Campaña) == as.character(input$filtro_campana), Semana == input$filtro_semana)
+      filter(
+        as.character(Campaña) == as.character(input$filtro_campana),
+        Semana == input$filtro_semana,
+        !coalesce(Es_Testblock, FALSE)
+      )
     
-    if (tipo_filtro == "Comercial") {
-      df_filtrado <- df_filtrado %>% filter(coalesce(Tipo_Cosecha, "Comercial") == "Comercial")
-    } else if (tipo_filtro == "Testblock") {
-      df_filtrado <- df_filtrado %>% filter(coalesce(Tipo_Cosecha, "Comercial") == "Testblock")
-    }
+    df_concil <- tryCatch(obtener_cosecha_conciliada_semana(input$filtro_semana, input$filtro_campana), error = function(e) NULL)
     
-    cosecha_preparada <- if (nrow(df_filtrado) > 0) {
-      df_tb_flag <- df_filtrado %>%
+    cosecha_preparada <- if (!is.null(df_concil) && nrow(df_concil) > 0) {
+      df_concil %>%
+        filter(Es_Valido_Operativo) %>%
         mutate(
-          Sector_k   = trimws(as.character(Sector)),
-          Módulo_k   = trimws(as.character(Módulo)),
-          Módulo_k   = case_when(
-            es_campana_2026 & Módulo_k %in% c("13.1", "13.2") ~ "13",
-            es_campana_2026 & Módulo_k %in% c("14.1", "14.2") ~ "14",
-            TRUE ~ Módulo_k
+          Sector   = trimws(as.character(Sector)),
+          Módulo   = trimws(as.character(Módulo)),
+          Módulo   = case_when(
+            es_campana_2026 & Módulo %in% c("13.1", "13.2") ~ "13",
+            es_campana_2026 & Módulo %in% c("14.1", "14.2") ~ "14",
+            TRUE ~ Módulo
           ),
-          Turno_k    = trimws(as.character(Turno)),
-          Variedad_k = limpiar_variedad(Variedad),
-          Es_TB      = coalesce(Es_Testblock, FALSE) | (coalesce(Tipo_Cosecha, "Comercial") == "Testblock")
+          Turno    = trimws(as.character(Turno)),
+          Variedad = limpiar_variedad(Variedad)
         ) %>%
-        group_by(Sector_k, Módulo_k, Turno_k, Variedad_k) %>%
-        summarise(Es_Testblock = any(Es_TB), .groups = "drop")
-      
-      df_dias <- df_filtrado %>%
+        group_by(Sector, Módulo, Turno, Variedad) %>%
+        summarise(
+          Lunes     = round(sum(Kg_Lunes_rec, na.rm = TRUE), 2),
+          Martes    = round(sum(Kg_Martes_rec, na.rm = TRUE), 2),
+          Miércoles = round(sum(Kg_Miercoles_rec, na.rm = TRUE), 2),
+          Jueves    = round(sum(Kg_Jueves_rec, na.rm = TRUE), 2),
+          Viernes   = round(sum(Kg_Viernes_rec, na.rm = TRUE), 2),
+          Sábado    = round(sum(Kg_Sabado_rec, na.rm = TRUE), 2),
+          Domingo   = 0,
+          .groups   = "drop"
+        ) %>%
+        mutate(Es_Testblock = FALSE)
+    } else if (nrow(df_filtrado) > 0) {
+      df_filtrado %>%
         mutate(
           Dia      = factor(dias_semana[wday(Fecha, week_start = 1)], levels = dias_semana),
           Sector   = trimws(as.character(Sector)),
@@ -4518,23 +5195,16 @@ server <- function(input, output, session) {
         group_by(Sector, Módulo, Turno, Variedad, Dia) %>%
         summarise(Kg_Dia = sum(`Kg Total`, na.rm = TRUE), .groups = "drop") %>%
         pivot_wider(names_from = Dia, values_from = Kg_Dia, values_fill = 0) %>%
-        left_join(df_tb_flag, by = c("Sector" = "Sector_k", "Módulo" = "Módulo_k", "Turno" = "Turno_k", "Variedad" = "Variedad_k"))
-      
-      df_dias
+        mutate(Es_Testblock = FALSE)
     } else {
       tibble(Sector = character(), Módulo = character(), Turno = character(), Variedad = character(), Es_Testblock = logical())
     }
-    
     for (d in dias_semana) {
       if (!d %in% names(cosecha_preparada)) cosecha_preparada[[d]] <- numeric(nrow(cosecha_preparada))
     }
     
-    # 2. Obtener proyecciones (Solo para Comercial o Todos; en vista Testblock no hay proyecciones comerciales)
-    df_proy <- if (tipo_filtro == "Testblock") {
-      tibble()
-    } else {
-      proyeccion_semanal()
-    }
+    # 2. Obtener proyecciones comerciales
+    df_proy <- proyeccion_semanal()
     
     if (nrow(cosecha_preparada) == 0 && (is.null(df_proy) || nrow(df_proy) == 0)) {
       return(tibble())
@@ -4616,11 +5286,7 @@ server <- function(input, output, session) {
       left_join(tratt_cat %>% select(Módulo_unif, Tipo_cat = Tipo), by = c("Módulo_join" = "Módulo_unif")) %>%
       mutate(
         Área = coalesce(Área_cat, Área_Cat, 0),
-        Tipo = case_when(
-          coalesce(Es_Testblock, FALSE) ~ "Testblock",
-          tipo_filtro == "Testblock"    ~ "Testblock",
-          TRUE                          ~ coalesce(Tipo_cat, "-")
-        )
+        Tipo = coalesce(Tipo_cat, "-")
       ) %>%
       select(-any_of(c("Área_cat", "Área_Cat", "Tipo_cat")))
     
@@ -4654,6 +5320,7 @@ server <- function(input, output, session) {
     rc_ha_turno <- if (nrow(rc_sem_u) > 0) {
       cols_ha_rc_exist_u <- intersect(cols_ha_prev_u, names(rc_sem_u))
       rc_sem_u %>%
+        filter(!("Tipo_Registro" %in% names(.)) | Tipo_Registro != "Rectificacion") %>%
         mutate(
           Turno_num_rc = suppressWarnings(as.numeric(Turno)),
           Módulo_rc = case_when(
@@ -5007,19 +5674,22 @@ server <- function(input, output, session) {
           TRUE ~ 0
         ),
         
+        # Kilos ajustados netos (excluyendo lo ya cosechado en real)
+        kg_aj_neto_u = pmax(0, Ajuste - coalesce(Kg_SAP_Real, 0)),
         Kg_Aj_1ra = case_when(
-          coalesce(Tiene_Detalle_Pas, FALSE) & coalesce(Kg_Aj_1ra_Ed, 0) > 0 ~ Kg_Aj_1ra_Ed,
-          coalesce(`Ha Aj. 1ª Pas`, 0) > 0 & coalesce(`Ha Aj. 2ª Pas`, 0) == 0 ~ pmax(0, Ajuste - coalesce(Kg_SAP_Real, 0)),
+          Tipo == "Testblock" ~ 0,
+          !Tiene_Dias_Ajustados ~ 0,
+          coalesce(Tiene_Detalle_Pas, FALSE) & (coalesce(Kg_Aj_1ra_Ed, 0) + coalesce(Kg_Aj_2da_Ed, 0)) > 0 ~ 
+            round(kg_aj_neto_u * (coalesce(Kg_Aj_1ra_Ed, 0) / pmax(1, coalesce(Kg_Aj_1ra_Ed, 0) + coalesce(Kg_Aj_2da_Ed, 0))), 2),
           coalesce(`Ha Aj. 1ª Pas`, 0) > 0 & coalesce(`Ha Aj. 2ª Pas`, 0) > 0 ~ 
-            round((pmax(0, Ajuste - coalesce(Kg_SAP_Real, 0))) * (`Ha Aj. 1ª Pas` / (`Ha Aj. 1ª Pas` + `Ha Aj. 2ª Pas` * 0.6)), 2),
-          coalesce(`Ha Aj. 2ª Pas`, 0) == 0 & Ajuste > coalesce(Kg_SAP_Real, 0) ~ pmax(0, Ajuste - coalesce(Kg_SAP_Real, 0)),
-          TRUE ~ 0
+            round(kg_aj_neto_u * (`Ha Aj. 1ª Pas` / pmax(0.01, `Ha Aj. 1ª Pas` + `Ha Aj. 2ª Pas` * 0.6)), 2),
+          TRUE ~ kg_aj_neto_u
         ),
         Kg_Aj_2da = case_when(
+          Tipo == "Testblock" ~ 0,
           limpiar_variedad(Variedad) != "ROCIO" ~ 0,
-          coalesce(Tiene_Detalle_Pas, FALSE) & coalesce(Kg_Aj_2da_Ed, 0) > 0 ~ Kg_Aj_2da_Ed,
-          coalesce(`Ha Aj. 2ª Pas`, 0) > 0 ~ round(pmax(0, Ajuste - coalesce(Kg_SAP_Real, 0) - Kg_Aj_1ra), 2),
-          TRUE ~ 0
+          !Tiene_Dias_Ajustados ~ 0,
+          TRUE ~ round(pmax(0, kg_aj_neto_u - Kg_Aj_1ra), 2)
         ),
         Kg_Aj_Total = round(Kg_Aj_1ra + Kg_Aj_2da, 2),
         
@@ -5329,33 +5999,122 @@ server <- function(input, output, session) {
   })
   
   # KPIs
-  # 1. Cosecha Real (SAP Oficial)
+  # Kilos de Testblock de la semana seleccionada (aislados de la tabla, mapas, frecuencias y rendimientos)
+  kg_testblock_reactivo <- reactive({
+    req(input$filtro_campana, input$filtro_semana)
+    # Si el usuario filtra por un Grupo, Módulo o Turno comercial específico, Testblock (Sector 4) es 0
+    if ((!is.null(input$filtro_grupo) && length(input$filtro_grupo) > 0) ||
+        (!is.null(input$filtro_modulo) && length(input$filtro_modulo) > 0) ||
+        (!is.null(input$filtro_turno) && length(input$filtro_turno) > 0)) {
+      return(0)
+    }
+    df_tb <- rv_cosecha_testblock()
+    if (is.null(df_tb) || !is.data.frame(df_tb) || nrow(df_tb) == 0) return(0)
+    df_tb <- df_tb %>%
+      filter(
+        as.character(Campaña) == as.character(input$filtro_campana),
+        as.numeric(Semana) == as.numeric(input$filtro_semana)
+      )
+    if (!is.null(input$filtro_variedad) && length(input$filtro_variedad) > 0) {
+      df_tb <- df_tb %>%
+        filter(limpiar_variedad(Variedad) %in% limpiar_variedad(input$filtro_variedad))
+    }
+    sum(coalesce(df_tb$`Kg Total`, 0), na.rm = TRUE)
+  })
+
+  # 1. Cosecha Real (Total = Comercial + Testblock)
   output$kpi_kilos_real <- renderText({
     df <- datos_reactivos()
-    if (nrow(df) == 0) return("0")
-    kg_real <- sum(coalesce(df$Kg_SAP_Real, 0), na.rm = TRUE)
-    format(round(kg_real, 1), big.mark = ",")
+    kg_com <- if (nrow(df) > 0) sum(coalesce(df$Kg_SAP_Real, 0), na.rm = TRUE) else 0
+    kg_tb  <- kg_testblock_reactivo()
+    kg_tot <- kg_com + kg_tb
+    if (kg_tot <= 0) return("0")
+    format(round(kg_tot, 1), big.mark = ",")
   })
 
-  output$kpi_kilos_real_badge <- renderText({
+  output$ui_kpi_real_detalle <- renderUI({
     df <- datos_reactivos()
-    if (nrow(df) == 0) return("Kg Reales SAP")
-    kg_real     <- sum(coalesce(df$Kg_SAP_Real, 0), na.rm = TRUE)
-    kg_real_1ra <- sum(coalesce(df$Kg_Real_1ra, 0), na.rm = TRUE)
-    kg_real_2da <- sum(coalesce(df$Kg_Real_2da, 0), na.rm = TRUE)
-    tot_proy    <- sum(coalesce(df$Proyección, 0), na.rm = TRUE)
+    kg_com      <- if (nrow(df) > 0) sum(coalesce(df$Kg_SAP_Real, 0), na.rm = TRUE) else 0
+    kg_tb       <- kg_testblock_reactivo()
+    kg_tot      <- kg_com + kg_tb
+    kg_real_1ra <- if (nrow(df) > 0) sum(coalesce(df$Kg_Real_1ra, 0), na.rm = TRUE) else 0
+    kg_real_2da <- if (nrow(df) > 0) sum(coalesce(df$Kg_Real_2da, 0), na.rm = TRUE) else 0
     
-    if (kg_real_2da > 0) {
-      sprintf("1ª: %s kg | 2ª: %s kg", format(round(kg_real_1ra, 0), big.mark = ","), format(round(kg_real_2da, 0), big.mark = ","))
-    } else if (kg_real > 0) {
-      pct <- if (tot_proy > 0) round((kg_real / tot_proy) * 100, 1) else 0
-      sprintf("1ª Pasada (%s%% Proy)", pct)
-    } else {
-      "Sin cosecha SAP"
+    sem_sel  <- as.numeric(input$filtro_semana)
+    camp_sel <- as.character(input$filtro_campana)
+    
+    df_concil <- tryCatch(obtener_cosecha_conciliada_semana(sem_sel, camp_sel), error = function(e) NULL)
+    kg_desfase_reasig <- 0
+    kg_sin_ruta_excl  <- 0
+    
+    if (!is.null(df_concil) && nrow(df_concil) > 0) {
+      if ("Kg_Desfase" %in% names(df_concil)) {
+        kg_desfase_reasig <- sum(coalesce(df_concil$Kg_Desfase, 0), na.rm = TRUE)
+      }
+      sin_r_mask <- !df_concil$Tiene_Campo & df_concil$Tiene_SAP
+      if (any(sin_r_mask)) {
+        kg_sin_ruta_excl <- sum(coalesce(df_concil$Kg_Total_sap[sin_r_mask], 0), na.rm = TRUE)
+      }
     }
+    
+    if (kg_tot <= 0 && kg_sin_ruta_excl <= 0) {
+      return(tags$span(
+        class = "kpi-badge",
+        style = "background: rgba(142, 142, 147, 0.12); color: #8E8E93; border: 1px solid rgba(142, 142, 147, 0.25); font-size: 11px;",
+        "Sin cosecha SAP"
+      ))
+    }
+    
+    tagList(
+      tags$div(
+        style = "display: flex; flex-direction: column; gap: 4px; margin-top: 5px;",
+        tags$div(
+          style = "display: flex; align-items: center; gap: 6px; flex-wrap: wrap;",
+          # 1. AZUL: Comercial Operativo (Kilos que SÍ usaremos con desfase reasignado)
+          tags$span(
+            class = "kpi-badge",
+            style = "background: rgba(0, 122, 255, 0.10); color: #007AFF; border: 1px solid rgba(0, 122, 255, 0.28); font-size: 11px; padding: 2px 7px; border-radius: 6px; font-weight: 600;",
+            title = "Kilos comerciales oficiales que SÍ entran a cálculo de ajuste y proyecciones",
+            sprintf("Comercial: %s kg", format(round(kg_com, 0), big.mark = ","))
+          ),
+          # 2. AZUL: Testblock (Entra al KPI pero NO a ajustes)
+          if (kg_tb > 0) {
+            tags$span(
+              class = "kpi-badge",
+              style = "background: rgba(0, 122, 255, 0.08); color: #007AFF; border: 1px solid rgba(0, 122, 255, 0.22); font-size: 11px; padding: 2px 7px; border-radius: 6px; font-weight: 600;",
+              title = "Kilos de Testblock cosechados. Entran al KPI total, pero NO al ajuste",
+              sprintf("Testblock: %s kg", format(round(kg_tb, 0), big.mark = ","))
+            )
+          },
+          # 3. AZUL: Reasig. Desfase (Kilos de desfase unificados que SÍ se usan)
+          if (kg_desfase_reasig > 0) {
+            tags$span(
+              class = "kpi-badge",
+              style = "background: rgba(0, 122, 255, 0.10); color: #007AFF; border: 1px solid rgba(0, 122, 255, 0.28); font-size: 11px; padding: 2px 7px; border-radius: 6px; font-weight: 600;",
+              title = "Kilos desfasados de días contiguos reasignados a la fecha de campo (SÍ se usan en cálculo y ajuste)",
+              sprintf("Reasig. Desfase: %s kg", format(round(kg_desfase_reasig, 0), big.mark = ","))
+            )
+          },
+          # 4. NARANJA: Sin Ruta (Posiblemente sí / Por corregir con campo)
+          if (kg_sin_ruta_excl > 0) {
+            tags$span(
+              class = "kpi-badge",
+              style = "background: rgba(255, 149, 0, 0.12); color: #D97706; border: 1px solid rgba(255, 149, 0, 0.32); font-size: 11px; padding: 2px 7px; border-radius: 6px; font-weight: 600;",
+              title = "Kilos en balanza SAP sin ruta en campo. Pendiente de corregir (debería ser 0 kg)",
+              sprintf("Sin Ruta: %s kg", format(round(kg_sin_ruta_excl, 0), big.mark = ","))
+            )
+          }
+        ),
+        if (kg_real_2da > 0) {
+          tags$span(
+            class = "kpi-badge",
+            style = "background: rgba(142, 142, 147, 0.08); color: #636366; border: 1px solid rgba(142, 142, 147, 0.20); font-size: 10.5px; padding: 1px 6px; border-radius: 5px; width: fit-content;",
+            sprintf("Pasadas Com.: 1ª: %s kg | 2ª: %s kg", format(round(kg_real_1ra, 0), big.mark = ","), format(round(kg_real_2da, 0), big.mark = ","))
+          )
+        }
+      )
+    )
   })
-
-  # 2. Cosecha Ajustada (Cuánto queda la semana con lo ajustado)
   output$kpi_kilos_cierre <- renderText({
     df <- datos_reactivos()
     if (nrow(df) == 0) return("0")
@@ -5381,9 +6140,13 @@ server <- function(input, output, session) {
       }
     })]
     
-    kg_aj_tot <- sum(coalesce(df$Kg_Aj_Total, 0), na.rm = TRUE)
-    kg_aj_1ra <- sum(coalesce(df$Kg_Aj_1ra, 0), na.rm = TRUE)
-    kg_aj_2da <- sum(coalesce(df$Kg_Aj_2da, 0), na.rm = TRUE)
+    # Kilos reales base tomados directamente de la columna Kg_SAP_Real de la tabla (Comercial oficial con reconciliaciones)
+    kg_real_base <- if (nrow(df) > 0) sum(coalesce(df$Kg_SAP_Real, 0), na.rm = TRUE) else 0
+    kg_cierre_tot <- if (nrow(df) > 0) sum(coalesce(df$Ajuste, 0), na.rm = TRUE) else 0
+    kg_aj_tot     <- pmax(0, kg_cierre_tot - kg_real_base)
+    
+    kg_aj_2da <- if (nrow(df) > 0) sum(coalesce(df$Kg_Aj_2da, 0), na.rm = TRUE) else 0
+    kg_aj_1ra <- pmax(0, kg_aj_tot - kg_aj_2da)
     
     # Si no hay ajuste activo en la semana
     if (length(dias_con_ajuste) == 0 || kg_aj_tot <= 0) {
@@ -5397,12 +6160,6 @@ server <- function(input, output, session) {
     # Días previos reales tomados como base hasta el inicio del ajuste
     idx_primer_aj <- min(match(dias_con_ajuste, dias_semana_nombres))
     dias_reales_prev <- if (idx_primer_aj > 1) dias_semana_nombres[1:(idx_primer_aj - 1)] else character(0)
-    
-    kg_real_base <- if (length(dias_reales_prev) > 0) {
-      sum(sapply(dias_reales_prev, function(d) sum(coalesce(df[[d]], 0), na.rm = TRUE)))
-    } else {
-      0
-    }
     
     # Etiquetas de rango de días
     lbl_real_dias <- if (length(dias_reales_prev) == 1) {
@@ -6845,7 +7602,7 @@ server <- function(input, output, session) {
         tibble()
       })
       
-      valv_7d_map <- tibble(codigo_norm = character(), Dia_7d = character(), Kg_Total_Ant = numeric(), Ha_Total_Ant = numeric())
+      valv_7d_map <- tibble(codigo_norm = character(), Dia_7d = character(), Dia_Rect_Ant = character(), Kg_Total_Ant = numeric(), Ha_Total_Ant = numeric())
       turno_dia_habitual <- tibble(Módulo = character(), Turno = character(), Dia_Habitual = character())
       rend_ant_turno <- tibble(Módulo = character(), Turno = character(), Variedad = character(), Kg_Ant_Turno = numeric(), Ha_Ant_Turno = numeric(), Rend_Ant_Turno = numeric(), Ultimo_Dia_Cosecha_Ant = character())
       
@@ -6869,7 +7626,8 @@ server <- function(input, output, session) {
               group_by(codigo_norm) %>%
               slice(1) %>%
               ungroup() %>%
-              select(codigo_norm, Dia_7d, Kg_Total_Ant = Kg_Total_Sem, Ha_Total_Ant = Ha_Total_Sem)
+              mutate(Dia_Rect_Ant = NA_character_) %>%
+              select(codigo_norm, Dia_7d, Dia_Rect_Ant, Kg_Total_Ant = Kg_Total_Sem, Ha_Total_Ant = Ha_Total_Sem)
             
             turno_dia_habitual <- df_ant_valvs %>%
               filter(!is.na(Dia_7d)) %>%
@@ -6957,7 +7715,53 @@ server <- function(input, output, session) {
       
       rc <- tryCatch(obtener_rutas_campo_en_vivo(sem_sel), error = function(e) cargar_rutas_cosecha())
       if (is.null(rc) || nrow(rc) == 0) rc <- tryCatch(cargar_rutas_cosecha(), error = function(e) NULL)
-      rc_sem <- if (!is.null(rc) && "Semana" %in% names(rc)) rc %>% filter(Semana == sem_sel) else tibble()
+      rc_all_disco <- tryCatch(cargar_rutas_cosecha(), error = function(e) NULL)
+      rc_sem_all <- if (!is.null(rc) && "Semana" %in% names(rc)) rc %>% filter(Semana == sem_sel) else tibble()
+      rc_sem <- if (nrow(rc_sem_all) > 0 && "Tipo_Registro" %in% names(rc_sem_all)) {
+        rc_sem_all %>% filter(Tipo_Registro != "Rectificacion")
+      } else rc_sem_all
+      rc_rectif_sem <- if (nrow(rc_sem_all) > 0 && "Tipo_Registro" %in% names(rc_sem_all)) {
+        rc_sem_all %>% filter(Tipo_Registro == "Rectificacion")
+      } else tibble()
+      
+      # Si en la semana anterior (sem_ant) hubo válvulas rectificadas, la frecuencia hacia sem_sel se cuenta desde el último día de rectificación
+      rc_ant_all <- tryCatch(obtener_rutas_campo_en_vivo(sem_ant), error = function(e) NULL)
+      if (is.null(rc_ant_all) || nrow(rc_ant_all) == 0) {
+        rc_ant_all <- if (!is.null(rc_all_disco) && "Semana" %in% names(rc_all_disco)) rc_all_disco %>% filter(Semana == sem_ant) else tibble()
+      }
+      if (!is.null(rc_ant_all) && nrow(rc_ant_all) > 0 && "Tipo_Registro" %in% names(rc_ant_all)) {
+        rc_rect_ant <- rc_ant_all %>% filter(Tipo_Registro == "Rectificacion")
+        if (nrow(rc_rect_ant) > 0 && "codigo" %in% names(rc_rect_ant)) {
+          dias_r_cols <- intersect(c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"), names(rc_rect_ant))
+          if (length(dias_r_cols) > 0) {
+            mat_r_ant <- as.matrix(rc_rect_ant[, dias_r_cols, drop = FALSE])
+            mat_r_ant[is.na(mat_r_ant)] <- 0
+            ultimo_dia_rect <- apply(mat_r_ant, 1, function(fila) {
+              idx_pos <- which(fila > 0)
+              if (length(idx_pos) > 0) dias_r_cols[max(idx_pos)] else NA_character_
+            })
+            df_rect_ant_map <- tibble(
+              codigo_norm = norm_codigo_valvula(rc_rect_ant$codigo),
+              Dia_Rect_Ant = ultimo_dia_rect
+            ) %>%
+              filter(!is.na(Dia_Rect_Ant)) %>%
+              group_by(codigo_norm) %>%
+              slice(n()) %>%
+              ungroup()
+            if (nrow(df_rect_ant_map) > 0) {
+              valv_7d_map <- valv_7d_map %>%
+                select(-any_of("Dia_Rect_Ant")) %>%
+                full_join(df_rect_ant_map, by = "codigo_norm") %>%
+                mutate(
+                  Dia_7d       = coalesce(Dia_Rect_Ant, Dia_7d),
+                  Kg_Total_Ant = coalesce(Kg_Total_Ant, 0),
+                  Ha_Total_Ant = coalesce(Ha_Total_Ant, 0)
+                ) %>%
+                select(codigo_norm, Dia_7d, Dia_Rect_Ant, Kg_Total_Ant, Ha_Total_Ant)
+            }
+          }
+        }
+      }
       
       dias_previos_nom <- if (dia_inicio_idx > 1) dias_nombres[1:(dia_inicio_idx - 1)] else character(0)
       cols_ha_prev <- paste0("Ha_", dias_previos_nom)
@@ -6981,6 +7785,11 @@ server <- function(input, output, session) {
             .groups      = "drop"
           )
       } else tibble(codigo_norm = character(), Ha_Prog = numeric(), Kg_Prog = numeric(), Ha_Lunes_Rc = numeric(), Ha_Martes_Rc = numeric())
+      
+      # Válvulas rectificadas el Martes en la semana actual (si se cosechó Lunes y se rectificó Martes, su frecuencia cuenta desde Martes)
+      rectif_martes_ids <- if (nrow(rc_rectif_sem) > 0 && "codigo" %in% names(rc_rectif_sem) && "Martes" %in% names(rc_rectif_sem)) {
+        unique(norm_codigo_valvula(rc_rectif_sem$codigo[coalesce(as.numeric(rc_rectif_sem$Martes), 0) > 0]))
+      } else character(0)
       
       # Válvulas con avance oficial en SAP para la semana actual (solo días previos a dia_inicio_nom)
       cols_ha_sap_exist <- intersect(cols_ha_prev, names(df_hist_oficial_wide))
@@ -7006,15 +7815,8 @@ server <- function(input, output, session) {
         tibble(codigo_norm = character(), Ha_Prog_Sap = numeric(), Kg_Prog_Sap = numeric(), Ha_Lunes_Sap = numeric(), Ha_Martes_Sap = numeric())
       }
       
-      tipo_filtro_ajuste <- if (!is.null(input$filtro_tipo_cosecha)) input$filtro_tipo_cosecha else "Comercial"
-      if (tipo_filtro_ajuste == "Testblock") {
-        showNotification("Los lotes de Testblock son ensayos experimentales: no se proyectan ni se ajustan automáticamente.", type = "warning", duration = 4)
-        return()
-      }
-      
       df_cosecha_sem <- rv_cosecha() %>%
-        filter(as.character(Campaña) == as.character(input$filtro_campana), Semana == sem_sel) %>%
-        filter(coalesce(Tipo_Cosecha, "Comercial") == "Comercial")
+        filter(as.character(Campaña) == as.character(input$filtro_campana), Semana == sem_sel, !coalesce(Es_Testblock, FALSE))
       
       df_cosecha_sem <- df_cosecha_sem %>%
         mutate(
@@ -7138,6 +7940,7 @@ server <- function(input, output, session) {
           Ha_Total_Ant            = coalesce(Ha_Total_Ant, 0),
           Dia_Base_Ant            = coalesce(Dia_7d, Dia_Habitual),
           Dia_Habitual_Calc       = case_when(
+            !is.na(Dia_Rect_Ant) & nzchar(Dia_Rect_Ant) ~ desplazar_dia_frecuencia(Dia_Rect_Ant, Frecuencia_Dias, dias_nombres, dia_inicio_idx, dia_inicio_nom, dia_fin_idx, dia_fin_nom),
             !is.na(Dia_Auto_Valv) & nzchar(Dia_Auto_Valv) ~ {
               idx_auto <- match(Dia_Auto_Valv, dias_nombres)
               case_when(
@@ -7523,7 +8326,8 @@ server <- function(input, output, session) {
         ) %>%
         mutate(
           Ha_2da_Corta   = Ha_Cosechada_Lunes,
-          Dia_Asignado   = as.character(desplazar_dia_frecuencia("Lunes", Frecuencia_Dias, dias_nombres, dia_inicio_idx, dia_inicio_nom, dia_fin_idx, dia_fin_nom)),
+          Dia_Base_Frec  = ifelse(codigo_norm %in% rectif_martes_ids, "Martes", "Lunes"),
+          Dia_Asignado   = as.character(desplazar_dia_frecuencia(Dia_Base_Frec, Frecuencia_Dias, dias_nombres, dia_inicio_idx, dia_inicio_nom, dia_fin_idx, dia_fin_nom)),
           Pct_Rend       = if_else(limpiar_variedad(Variedad) == "ROCIO", coalesce(Pct_Pasada_Lun, 60) / 100, 1.0),
           Kg_Asignado    = round(Ha_2da_Corta * coalesce(Rend_Turno_Aplicar, 0) * Pct_Rend, 2),
           Ha_Asignada    = Ha_2da_Corta,
@@ -7802,18 +8606,12 @@ server <- function(input, output, session) {
     ord_sel <- orden_semana_campana(sem_sel)
     es_campana_2026 <- grepl("2026|^26", as.character(input$filtro_campana))
     
-    tipo_filtro_h <- if (!is.null(input$filtro_tipo_cosecha)) input$filtro_tipo_cosecha else "Comercial"
     df_hist <- rv_cosecha() %>%
       filter(
         as.character(Campaña) == as.character(input$filtro_campana),
-        orden_semana_campana(Semana) < ord_sel
+        orden_semana_campana(Semana) < ord_sel,
+        !coalesce(Es_Testblock, FALSE)
       )
-    
-    if (tipo_filtro_h == "Comercial") {
-      df_hist <- df_hist %>% filter(coalesce(Tipo_Cosecha, "Comercial") == "Comercial")
-    } else if (tipo_filtro_h == "Testblock") {
-      df_hist <- df_hist %>% filter(coalesce(Tipo_Cosecha, "Comercial") == "Testblock")
-    }
     
     df_hist <- df_hist %>%
       mutate(
@@ -7887,15 +8685,9 @@ server <- function(input, output, session) {
       }
     }
     
-    # Cosecha física oficial real de SAP de la semana seleccionada
+    # Cosecha física oficial real de SAP de la semana seleccionada (100% Comercial)
     df_sap_actual_turno <- rv_cosecha() %>%
-      filter(as.character(Campaña) == as.character(input$filtro_campana), Semana == sem_sel)
-    
-    if (tipo_filtro_h == "Comercial") {
-      df_sap_actual_turno <- df_sap_actual_turno %>% filter(coalesce(Tipo_Cosecha, "Comercial") == "Comercial")
-    } else if (tipo_filtro_h == "Testblock") {
-      df_sap_actual_turno <- df_sap_actual_turno %>% filter(coalesce(Tipo_Cosecha, "Comercial") == "Testblock")
-    }
+      filter(as.character(Campaña) == as.character(input$filtro_campana), Semana == sem_sel, !coalesce(Es_Testblock, FALSE))
     
     df_sap_actual_turno <- df_sap_actual_turno %>%
       mutate(
@@ -8561,15 +9353,8 @@ server <- function(input, output, session) {
     es_kgha         <- identical(input$switch_unidad, "kgha")
     unidad_txt      <- if (es_kgha) "Kg/ha" else "Kg"
     
-    tipo_filtro_ant <- if (!is.null(input$filtro_tipo_cosecha)) input$filtro_tipo_cosecha else "Comercial"
     df_ant <- rv_cosecha() %>%
-      filter(as.character(Campaña) == as.character(input$filtro_campana), Semana == sem_ant)
-    
-    if (tipo_filtro_ant == "Comercial") {
-      df_ant <- df_ant %>% filter(coalesce(Tipo_Cosecha, "Comercial") == "Comercial")
-    } else if (tipo_filtro_ant == "Testblock") {
-      df_ant <- df_ant %>% filter(coalesce(Tipo_Cosecha, "Comercial") == "Testblock")
-    }
+      filter(as.character(Campaña) == as.character(input$filtro_campana), Semana == sem_ant, !coalesce(Es_Testblock, FALSE))
     
     df_ant <- df_ant %>%
       mutate(
@@ -9314,7 +10099,7 @@ server <- function(input, output, session) {
   })
 
   # Despachar datos del mapa hacia JavaScript
-  observeEvent(list(input$filtro_semana_mapa, input$filtro_pasada_mapa, input$filtro_modulo, input$filtro_grupo, input$filtro_turno, input$filtro_variedad, input$filtro_modo_mapa, input$tabs_navegacion, rv_ajuste_valvulas()), {
+  observeEvent(list(input$filtro_semana_mapa, input$filtro_pasada_mapa, input$filtro_modulo, input$filtro_grupo, input$filtro_turno, input$filtro_variedad, input$filtro_modo_mapa, input$tabs_navegacion, rv_ajuste_valvulas(), ediciones_manuales()), {
     req(input$tabs_navegacion == "Ruta de cosecha")
     
     info <- semanas_info_mapa()
@@ -9345,7 +10130,14 @@ server <- function(input, output, session) {
       tibble()
     }
     
-    if (modo_target == "ajustado" && nrow(valvs_ajuste_sem) == 0) {
+    ed_totales <- ediciones_manuales()
+    tiene_ed_manuales_sem <- !is.null(ed_totales) && nrow(ed_totales) > 0 &&
+      any(as.character(ed_totales$Campaña) == camp_target & 
+          as.numeric(ed_totales$Semana) == as.numeric(sem_target) &
+          coalesce(ed_totales$Tipo_Edicion, "") %in% c("auto", "manual") &
+          coalesce(ed_totales$Valor, 0) > 0)
+    
+    if (modo_target == "ajustado" && nrow(valvs_ajuste_sem) == 0 && !tiene_ed_manuales_sem) {
       showNotification(
         sprintf("ℹ️ No hay un ajuste calculado para la Semana %s. Se muestra la vista Real. Haz clic en 'Ajustar Semana' en Detalle Semanal para proyectar.", sem_target),
         type = "warning",
@@ -9363,7 +10155,8 @@ server <- function(input, output, session) {
       turnos_filtro   = input$filtro_turno,
       vars_filtro     = input$filtro_variedad,
       modo_mapa       = modo_target,
-      df_ajuste_valvs = valvs_ajuste_sem
+      df_ajuste_valvs = valvs_ajuste_sem,
+      df_ediciones    = ed_totales
     )
     session$sendCustomMessage("actualizar_mapa_semana", payload_mapa)
   }, ignoreInit = FALSE)
@@ -9836,6 +10629,242 @@ server <- function(input, output, session) {
 
 # Ejecutar la app
   # Badge Dinámico en Detalle Semanal cuando la vista es Ajustado
+  # ==============================================================================
+  # MÓDULO DE CONCILIACIÓN CAMPO VS SAP (AUDITORÍA DE CRUCE)
+  # ==============================================================================
+  datos_conciliacion_reactivo <- reactive({
+    req(input$filtro_campana, input$filtro_semana)
+    trigger_refresh()
+    
+    sem_sel  <- as.numeric(input$filtro_semana)
+    camp_sel <- as.character(input$filtro_campana)
+    
+    df_concil <- tryCatch(obtener_cosecha_conciliada_semana(sem_sel, camp_sel), error = function(e) NULL)
+    if (is.null(df_concil) || nrow(df_concil) == 0) return(tibble())
+    
+    obtener_dias_str <- function(lun, mar, mie, jue, vie, sab, sufijo = "") {
+      vals <- c(Lunes = lun, Martes = mar, Miércoles = mie, Jueves = jue, Viernes = vie, Sábado = sab)
+      activos <- names(vals)[vals > 0]
+      if (length(activos) == 0) return("-")
+      paste(sapply(activos, function(d) sprintf("%s (%s%s)", d, round(vals[d], 1), sufijo)), collapse = ", ")
+    }
+    
+    df_res <- df_concil %>%
+      rowwise() %>%
+      mutate(
+        Estado        = Estado_Concil,
+        Detalle_Campo = obtener_dias_str(Ha_Lunes_rc, Ha_Martes_rc, Ha_Miercoles_rc, Ha_Jueves_rc, Ha_Viernes_rc, Ha_Sabado_rc, " ha"),
+        Detalle_SAP   = obtener_dias_str(Kg_Lunes_sap, Kg_Martes_sap, Kg_Miercoles_sap, Kg_Jueves_sap, Kg_Viernes_sap, Kg_Sabado_sap, " kg")
+      ) %>%
+      ungroup()
+    
+    # Filtros globales superiores (Grupo, Módulo, Turno, Variedad)
+    if (!is.null(input$filtro_grupo) && length(input$filtro_grupo) > 0) {
+      mods_grupo <- as.character(unlist(grupos_modulos[input$filtro_grupo], use.names = FALSE))
+      df_res <- df_res %>% filter(as.character(Módulo) %in% mods_grupo | sub("\\..*", "", as.character(Módulo)) %in% mods_grupo)
+    }
+    if (!is.null(input$filtro_modulo) && length(input$filtro_modulo) > 0) {
+      df_res <- df_res %>% filter(as.character(Módulo) %in% as.character(input$filtro_modulo) | sub("\\..*", "", as.character(Módulo)) %in% as.character(input$filtro_modulo))
+    }
+    if (!is.null(input$filtro_turno) && length(input$filtro_turno) > 0) {
+      df_res <- df_res %>% filter(as.character(Turno) %in% as.character(input$filtro_turno))
+    }
+    if (!is.null(input$filtro_variedad) && length(input$filtro_variedad) > 0) {
+      df_res <- df_res %>% filter(limpiar_variedad(Variedad) %in% limpiar_variedad(input$filtro_variedad))
+    }
+    
+    df_res
+  })
+  
+  # Banner contextual de Regla D+1
+  output$ui_alerta_regla_d1 <- renderUI({
+    req(input$filtro_semana)
+    sem_sel  <- as.numeric(input$filtro_semana)
+    fecha_h  <- Sys.Date()
+    sem_act  <- lubridate::isoweek(fecha_h)
+    wday_h   <- lubridate::wday(fecha_h, week_start = 1)
+    dias_nom <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
+    dia_txt  <- if (wday_h <= 6) dias_nom[wday_h] else "Domingo"
+    
+    if (sem_sel == sem_act) {
+      div(style = "background: rgba(0, 122, 255, 0.08); border: 1px solid rgba(0, 122, 255, 0.20); border-radius: 9px; padding: 8px 12px; font-size: 11.5px; color: #004085; display: flex; align-items: center; gap: 8px;",
+          icon("circle-info", style = "color: #007AFF; font-size: 14px;"),
+          span(HTML(sprintf("<b>Semana en Curso (%d):</b> Hoy es <b>%s</b>. Las válvulas cosechadas hoy en campo se encuentran en proceso natural en packing y sus kilos se reportarán mañana (ciclo D+1). Por regla operativa, <b>no se marcan como error</b> en la lista de inconsistencias.", sem_act, dia_txt)))
+      )
+    } else if (sem_sel < sem_act) {
+      div(style = "background: rgba(52, 199, 89, 0.08); border: 1px solid rgba(52, 199, 89, 0.20); border-radius: 9px; padding: 8px 12px; font-size: 11.5px; color: #155724; display: flex; align-items: center; gap: 8px;",
+          icon("check-double", style = "color: #28A745; font-size: 14px;"),
+          span(HTML(sprintf("<b>Semana Cerrada (%d):</b> Todos los turnos y balanzas de packing ya concluyeron su reporte. Cualquier ruta sin kilos o desfase es una discrepancia definitiva a conciliar.", sem_sel)))
+      )
+    } else {
+      div(style = "background: rgba(255, 149, 0, 0.08); border: 1px solid rgba(255, 149, 0, 0.20); border-radius: 9px; padding: 8px 12px; font-size: 11.5px; color: #856404; display: flex; align-items: center; gap: 8px;",
+          icon("calendar-days", style = "color: #FF9500; font-size: 14px;"),
+          span(HTML(sprintf("<b>Semana Futura (%d):</b> Datos de proyección y programación estimada.", sem_sel)))
+      )
+    }
+  })
+  
+  # KPIs de Conciliación
+  output$kpi_concil_ok <- renderText({
+    df <- datos_conciliacion_reactivo()
+    if (nrow(df) == 0) return("0")
+    sum(df$Estado == "Conciliado OK", na.rm = TRUE)
+  })
+  output$kpi_concil_ok_sub <- renderText({
+    df <- datos_conciliacion_reactivo()
+    if (nrow(df) == 0) return("0% total")
+    pct <- round((sum(df$Estado == "Conciliado OK", na.rm = TRUE) / nrow(df)) * 100, 1)
+    sprintf("%s%% del universo", pct)
+  })
+  
+  output$kpi_concil_sin_sap <- renderText({
+    df <- datos_conciliacion_reactivo()
+    if (nrow(df) == 0) return("0")
+    sum(df$Estado == "Ruta sin Kilos SAP", na.rm = TRUE)
+  })
+  output$kpi_concil_sin_sap_sub <- renderText({
+    df <- datos_conciliacion_reactivo()
+    sub_df <- df %>% filter(Estado == "Ruta sin Kilos SAP")
+    ha_tot <- round(sum(sub_df$Ha_Total_rc, na.rm = TRUE), 1)
+    sprintf("%s ha afectadas", ha_tot)
+  })
+  
+  output$kpi_concil_sin_ruta <- renderText({
+    df <- datos_conciliacion_reactivo()
+    if (nrow(df) == 0) return("0")
+    sum(df$Estado == "Kilos SAP sin Ruta", na.rm = TRUE)
+  })
+  output$kpi_concil_sin_ruta_sub <- renderText({
+    df <- datos_conciliacion_reactivo()
+    sub_df <- df %>% filter(Estado == "Kilos SAP sin Ruta")
+    kg_tot <- round(sum(sub_df$Kg_Total_sap, na.rm = TRUE), 0)
+    sprintf("%s kg en balanza", format(kg_tot, big.mark = ","))
+  })
+  
+  output$kpi_concil_desfase <- renderText({
+    df <- datos_conciliacion_reactivo()
+    if (nrow(df) == 0) return("0")
+    sum(df$Estado %in% c("Desfase de Día", "Desfase Reasignado"), na.rm = TRUE)
+  })
+  output$kpi_concil_desfase_sub <- renderText({
+    df <- datos_conciliacion_reactivo()
+    if (nrow(df) == 0) return("0 válvulas")
+    "Fecha Campo vs SAP"
+  })
+  
+  output$kpi_concil_proceso <- renderText({
+    df <- datos_conciliacion_reactivo()
+    if (nrow(df) == 0) return("0")
+    sum(df$Estado == "Cosecha Hoy (D+1)", na.rm = TRUE)
+  })
+  output$kpi_concil_proceso_sub <- renderText({
+    df <- datos_conciliacion_reactivo()
+    sub_df <- df %>% filter(Estado == "Cosecha Hoy (D+1)")
+    ha_tot <- round(sum(sub_df$Ha_Total_rc, na.rm = TRUE), 1)
+    sprintf("%s ha en proceso", ha_tot)
+  })
+  
+  # Texto de resumen del filtro
+  output$txt_conteo_filtro_conciliacion <- renderText({
+    df <- datos_conciliacion_reactivo()
+    if (nrow(df) == 0) return("0 registros")
+    f_tipo <- if (!is.null(input$filtro_estado_conciliacion)) input$filtro_estado_conciliacion else "inconsistencias"
+    n_inconsistencias <- sum(df$Tipo_Alerta == "inconsistencia", na.rm = TRUE)
+    sprintf("Mostrando registros filtrados (Total inconsistencias: %d válvulas)", n_inconsistencias)
+  })
+  
+  # Tabla Interactiva DT
+  output$tabla_conciliacion_campo_sap <- renderDT({
+    df <- datos_conciliacion_reactivo()
+    if (is.null(df) || nrow(df) == 0) {
+      return(datatable(tibble(Mensaje = "No hay registros disponibles para los filtros seleccionados."),
+                       options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    f_tipo <- if (!is.null(input$filtro_estado_conciliacion)) input$filtro_estado_conciliacion else "inconsistencias"
+    
+    df_filtrado <- switch(
+      f_tipo,
+      "inconsistencias" = df %>% filter(Tipo_Alerta == "inconsistencia"),
+      "ruta_sin_sap"    = df %>% filter(Estado == "Ruta sin Kilos SAP"),
+      "sap_sin_ruta"    = df %>% filter(Estado == "Kilos SAP sin Ruta"),
+      "desfase"         = df %>% filter(Estado %in% c("Desfase de Día", "Desfase Reasignado")),
+      "proceso_hoy"     = df %>% filter(Estado == "Cosecha Hoy (D+1)"),
+      "conciliado"      = df %>% filter(Estado == "Conciliado OK"),
+      df
+    )
+    
+    if (nrow(df_filtrado) == 0) {
+      return(datatable(tibble(Mensaje = "No se encontraron discrepancias bajo este filtro específico."),
+                       options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    df_tabla <- df_filtrado %>%
+      mutate(
+        Estado_Pill = case_when(
+          Estado == "Conciliado OK"      ~ sprintf('<span class="badge-concil-pill pill-ok">● Conciliado OK</span>'),
+          Estado == "Ruta sin Kilos SAP" ~ sprintf('<span class="badge-concil-pill pill-sin-sap">⚠️ Ruta sin SAP</span>'),
+          Estado == "Kilos SAP sin Ruta" ~ sprintf('<span class="badge-concil-pill pill-sin-ruta">⚠️ SAP sin Ruta</span>'),
+          Estado %in% c("Desfase de Día", "Desfase Reasignado")     ~ sprintf('<span class="badge-concil-pill pill-desfase">🔄 Desfase Día</span>'),
+          Estado == "Cosecha Hoy (D+1)"  ~ sprintf('<span class="badge-concil-pill pill-proceso">⏳ Cosecha Hoy (D+1)</span>'),
+          TRUE                           ~ Estado
+        ),
+        Area_txt = format(round(Area_ha, 2), nsmall = 2)
+      ) %>%
+      select(
+        Sector, Módulo, Turno, Válvula, Variedad, `Área (ha)` = Area_txt,
+        Estado = Estado_Pill, `Cosecha Campo (Días / Ha)` = Detalle_Campo,
+        `Recepción SAP (Días / Kg)` = Detalle_SAP, `Diagnóstico y Acción Sugerida` = Diagnostico
+      )
+    
+    datatable(
+      df_tabla,
+      escape   = FALSE,
+      rownames = FALSE,
+      options  = list(
+        pageLength = 20,
+        scrollX    = TRUE,
+        dom        = "frtip",
+        language   = list(
+          url = "//cdn.datatables.net/plug-ins/1.10.11/i18n/Spanish.json",
+          search = "Buscar válvula:",
+          paginate = list(previous = "‹", `next` = "›")
+        )
+      )
+    )
+  })
+  
+  # Descargar Excel de Inconsistencias
+  output$btn_descarga_conciliacion_excel <- downloadHandler(
+    filename = function() {
+      sprintf("Inconsistencias_Campo_vs_SAP_Semana%s_%s.xlsx", input$filtro_semana, format(Sys.Date(), "%Y%m%d"))
+    },
+    content = function(file) {
+      df <- datos_conciliacion_reactivo()
+      if (is.null(df) || nrow(df) == 0) {
+        writexl::write_xlsx(tibble(Aviso = "Sin registros para descargar"), file)
+        return()
+      }
+      
+      df_exp <- df %>%
+        select(
+          Sector, Módulo, Turno, Válvula, Codigo_Valvula = codigo_norm, Variedad, Area_ha,
+          Estado, Tipo_Alerta, Cosecha_Campo = Detalle_Campo, Ha_Campo_Total = Ha_Total_rc,
+          Recepcion_SAP = Detalle_SAP, Kg_SAP_Total = Kg_Total_sap, Diagnostico
+        )
+      
+      hoja_inconsistencias <- df_exp %>% filter(Tipo_Alerta == "inconsistencia")
+      hoja_todas           <- df_exp
+      
+      writexl::write_xlsx(
+        list(
+          "Inconsistencias a Corregir" = hoja_inconsistencias,
+          "Universo Completo Semana"   = hoja_todas
+        ),
+        file
+      )
+    }
+  )
   output$ui_detalle_badge_modo <- renderUI({
     modo <- if (!is.null(input$filtro_modo_detalle)) as.character(input$filtro_modo_detalle) else "real"
     if (modo == "ajustado") {

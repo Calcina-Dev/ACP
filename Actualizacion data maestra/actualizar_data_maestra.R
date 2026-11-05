@@ -123,6 +123,20 @@ asignar_grupo_modulo <- function(mod_vec) {
   )
 }
 
+# Identificador canónico de registros Testblock / Incubadora / Vivero / Sector 4
+es_fila_testblock <- function(sector_vec, modulo_vec, tipo_vec = NULL, es_tb_vec = NULL) {
+  res <- trimws(as.character(sector_vec)) %in% c("4", "04", "S04", "S4") |
+         grepl("test|incub|vivero|block|^tb", as.character(modulo_vec), ignore.case = TRUE)
+  if (!is.null(tipo_vec)) {
+    res <- res | toupper(trimws(coalesce(as.character(tipo_vec), ""))) == "TESTBLOCK"
+  }
+  if (!is.null(es_tb_vec)) {
+    res <- res | coalesce(as.logical(es_tb_vec), FALSE) |
+           toupper(trimws(coalesce(as.character(es_tb_vec), ""))) %in% c("SI", "TRUE", "1")
+  }
+  coalesce(res, FALSE)
+}
+
 # ------------------------------------------------------------------------------
 # 2. CARGAR BASE HISTÓRICA MULTICAMPAÑA, CATÁLOGO Y CACHÉ PREVIO
 # ------------------------------------------------------------------------------
@@ -239,8 +253,17 @@ cat(sprintf("   ✔ Catálogo de válvulas cargado: %d válvulas activas\n", nro
 
 # Histórico wide previo
 ruta_hist_wide_prev <- "D:/ACP/Rutas de Cosecha/historico_oficial_wide_2026.rds"
+tb_hist_flag <- es_fila_testblock(df_cosecha$Sector, df_cosecha$Módulo, df_cosecha$Tipo_Cosecha, df_cosecha$Es_Testblock)
+df_cosecha$Es_Testblock <- tb_hist_flag
+df_cosecha$Tipo_Cosecha <- ifelse(tb_hist_flag, "Testblock", "Comercial")
+
 df_hist_oficial_wide <- if (file.exists(ruta_hist_wide_prev)) {
-  readRDS(ruta_hist_wide_prev)
+  readRDS(ruta_hist_wide_prev) %>%
+    filter(
+      !trimws(as.character(Sector)) %in% c("4", "04", "S04", "S4"),
+      !is.na(Módulo_Norm),
+      !grepl("test|incub|vivero|block|^tb|^MNA", paste(Módulo_Norm, Codigo_Valv), ignore.case = TRUE)
+    )
 } else {
   tibble()
 }
@@ -477,9 +500,9 @@ if (tiene_sap) {
     mutate(
       Fecha        = Fecha_Parsed,
       Real         = suppressWarnings(as.numeric(gsub("[^0-9.-]", "", as.character(PESONETO)))),
-      Sector       = sec_vec,
-      Módulo       = mod_vec,
-      Turno        = tur_vec,
+      Sector       = ifelse(es_tb, 4, sec_vec),
+      Módulo       = ifelse(es_tb, "Test Block", mod_vec),
+      Turno        = ifelse(es_tb, 0, tur_vec),
       Variedad     = limpiar_variedad(sub("^.*\\|\\s*", "", as.character(VARIEDAD))),
       Semana       = Semana_ISO,
       Campaña      = 2026,
@@ -488,8 +511,9 @@ if (tiene_sap) {
     ) %>%
     filter(!is.na(Real), Real > 0, !is.na(Fecha)) %>%
     mutate(
-      Sector = ifelse(Variedad == "ROCIO" & Módulo == "8", 3, Sector),
+      Sector = ifelse(!Es_Testblock & Variedad == "ROCIO" & Módulo == "8", 3, Sector),
       Módulo = case_when(
+        Es_Testblock                           ~ "Test Block",
         Módulo == "9" & between(Turno, 1, 11)  ~ "9.2",
         Módulo == "9" & Turno >= 12            ~ "9.1",
         Módulo == "11" & between(Turno, 1, 12) ~ "11.1",
@@ -509,15 +533,14 @@ if (tiene_sap) {
       .groups      = "drop"
     )
   
-  if (!"Tipo_Cosecha" %in% names(df_cosecha)) {
-    df_cosecha$Tipo_Cosecha <- "Comercial"
-    df_cosecha$Es_Testblock <- FALSE
-  }
-  
   fechas_sap_unicas <- unique(df_sap_turno$Fecha)
   df_cosecha <- df_cosecha %>%
     filter(!(Campaña == 2026 & as.Date(Fecha) %in% fechas_sap_unicas)) %>%
     bind_rows(df_sap_turno)
+  
+  tb_flag_all <- es_fila_testblock(df_cosecha$Sector, df_cosecha$Módulo, df_cosecha$Tipo_Cosecha, df_cosecha$Es_Testblock)
+  df_cosecha$Es_Testblock <- tb_flag_all
+  df_cosecha$Tipo_Cosecha <- ifelse(tb_flag_all, "Testblock", "Comercial")
   
   kg_comercial_sap <- sum(df_sap_turno$`Kg Total`[df_sap_turno$Tipo_Cosecha == "Comercial"], na.rm = TRUE)
   kg_testblock_sap <- sum(df_sap_turno$`Kg Total`[df_sap_turno$Tipo_Cosecha == "Testblock"], na.rm = TRUE)
@@ -546,6 +569,7 @@ if (tiene_sap) {
   }
   
   df_sap_valvs <- df_sap_valvs_raw %>%
+    filter(!Es_Testblock) %>%
     mutate(
       dia_col = case_when(
         Dia_Num == 1 ~ "Lunes",
