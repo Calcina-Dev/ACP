@@ -242,6 +242,7 @@ df_valvulas <- readRDS(ruta_valvs) %>%
   mutate(
     id          = as.character(id),
     codigo_norm = norm_codigo_valvula(codigo),
+    Sector      = case_when(as.character(Módulo) == "12" ~ "9", TRUE ~ as.character(Sector)),
     Módulo      = as.character(suppressWarnings(as.numeric(sub("\\..*", "", as.character(Módulo))))),
     Turno       = as.character(suppressWarnings(as.numeric(Turno))),
     Variedad    = limpiar_variedad(Variedad),

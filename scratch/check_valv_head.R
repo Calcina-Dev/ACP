@@ -1,0 +1,5 @@
+system("git show HEAD:\"Rutas de Cosecha/valvulas_normalizadas.rds\" > \"D:/ACP/scratch/valv_head.rds\"")
+v_head <- readRDS("D:/ACP/scratch/valv_head.rds")
+cat("valvulas_normalizadas.rds at HEAD unique Módulo:\n")
+print(unique(v_head$Módulo))
+print(table(as.character(v_head$Módulo), as.character(v_head$Sector)))

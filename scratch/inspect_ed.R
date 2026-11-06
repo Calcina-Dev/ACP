@@ -1,0 +1,6 @@
+library(dplyr)
+ed <- readRDS("D:/ACP/Actualizacion Semanal/ediciones_manuales_cosecha.rds")
+print(head(ed, 20))
+cat("\n--- Módulo 12 in ediciones_manuales ---\n")
+m12 <- ed %>% filter(as.character(Módulo) == "12")
+print(m12)

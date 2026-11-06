@@ -1,0 +1,5 @@
+load('D:/ACP/Actualizacion Semanal/datos_maestros_cosecha_2026.RData')
+cat('df_cosecha with Sector == 11:', sum(df_cosecha$Sector == 11, na.rm = TRUE), '\n')
+cat('df_proyecciones with Sector == 11:', sum(df_proyecciones$Sector == '11', na.rm = TRUE), '\n')
+cat('df_valvulas with Sector == 11:', sum(df_valvulas$Sector == '11', na.rm = TRUE), '\n')
+cat('df_valvulas with Sector == 9 and Modulo == 11:', sum(df_valvulas$Sector == '9' & df_valvulas$Módulo == '11', na.rm = TRUE), '\n')
