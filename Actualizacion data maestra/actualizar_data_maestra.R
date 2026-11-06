@@ -245,7 +245,8 @@ df_valvulas <- readRDS(ruta_valvs) %>%
     Sector      = case_when(as.character(Módulo) == "12" ~ "9", TRUE ~ as.character(Sector)),
     Módulo      = as.character(suppressWarnings(as.numeric(sub("\\..*", "", as.character(Módulo))))),
     Turno       = as.character(suppressWarnings(as.numeric(Turno))),
-    Variedad    = limpiar_variedad(Variedad),
+    Variedad    = ifelse(codigo_norm == "M11-T15-V74", "SEKOYA BEAUTY", limpiar_variedad(Variedad)),
+    color_base  = if ("color_base" %in% names(.)) ifelse(codigo_norm == "M11-T15-V74", "#E0F2FE", color_base) else "#E0F2FE",
     Área        = suppressWarnings(as.numeric(Área)),
     Grupo       = asignar_grupo_modulo(Módulo)
   )

@@ -280,6 +280,11 @@ refrescar_data_maestra_en_caliente <- function(forzar_nube = FALSE) {
       tryCatch({
         load(ruta_rdata_master, envir = .GlobalEnv)
         if (exists("df_valvulas", envir = .GlobalEnv) && exists("asignar_grupo_modulo", envir = .GlobalEnv)) {
+          .GlobalEnv$df_valvulas <- .GlobalEnv$df_valvulas %>%
+            mutate(
+              Variedad   = ifelse(norm_codigo_valvula(codigo) == "M11-T15-V74", "SEKOYA BEAUTY", limpiar_variedad(Variedad)),
+              color_base = if ("color_base" %in% names(.)) ifelse(norm_codigo_valvula(codigo) == "M11-T15-V74", "#E0F2FE", color_base) else "#E0F2FE"
+            )
           .GlobalEnv$df_valvulas <- aplicar_particiones_multivariedad(.GlobalEnv$df_valvulas)
           if (!"Grupo" %in% names(.GlobalEnv$df_valvulas)) {
             .GlobalEnv$df_valvulas <- .GlobalEnv$df_valvulas %>% mutate(Grupo = asignar_grupo_modulo(Módulo))
@@ -481,11 +486,12 @@ if (!exists("df_valvulas") || is.null(df_valvulas) || nrow(df_valvulas) == 0) {
 df_valvulas <- df_valvulas %>%
   filter(!grepl("^S[0-9]", codigo)) %>%
   mutate(
-    id       = as.character(id),
-    Módulo   = as.character(suppressWarnings(as.numeric(sub("\\..*", "", as.character(Módulo))))),
-    Turno    = as.character(suppressWarnings(as.numeric(Turno))),
-    Variedad = limpiar_variedad(Variedad),
-    Área     = suppressWarnings(as.numeric(Área))
+    id         = as.character(id),
+    Módulo     = as.character(suppressWarnings(as.numeric(sub("\\..*", "", as.character(Módulo))))),
+    Turno      = as.character(suppressWarnings(as.numeric(Turno))),
+    Variedad   = ifelse(norm_codigo_valvula(codigo) == "M11-T15-V74", "SEKOYA BEAUTY", limpiar_variedad(Variedad)),
+    color_base = if ("color_base" %in% names(.)) ifelse(norm_codigo_valvula(codigo) == "M11-T15-V74", "#E0F2FE", color_base) else "#E0F2FE",
+    Área       = suppressWarnings(as.numeric(Área))
   )
 
 df_valvulas <- aplicar_particiones_multivariedad(df_valvulas)
@@ -2964,6 +2970,48 @@ ui <- fluidPage(
       return v.slots[slotKey(activeMode, otherP)];
     }
     
+    // Obtiene los rangos físicos ocupados por el MISMO día (dayVal) en la OTRA pasada (1ª vs 2ª),
+    // ya que una misma porción de la válvula no puede tener 1ª y 2ª pasada el mismo día,
+    // pero el área cosechada en otros días previos (ej. Lunes en 1ª Pasada) SÍ puede recibir su 2ª pasada hoy.
+    function getOtherPassSameDayRanges(v, dayVal) {
+      if (!v || !dayVal || activeMode === 'Rectificacion' || activeMode === 'CosechaOficial') return [];
+      const otherSlot = getOtherPassSlot(v);
+      if (!otherSlot || !otherSlot.counts || (Number(otherSlot.counts[dayVal]) || 0) <= 0) return [];
+      return getSlotRanges(otherSlot).filter(r => r.day === dayVal && r.pct > 0.001);
+    }
+    
+    function getOtherPassSameDayPct(v, dayVal) {
+      if (!v || !dayVal || activeMode === 'Rectificacion' || activeMode === 'CosechaOficial') return 0;
+      const otherSlot = getOtherPassSlot(v);
+      if (!otherSlot || !otherSlot.counts) return 0;
+      return Math.round((Number(otherSlot.counts[dayVal]) || 0) * 100) / 100;
+    }
+    
+    function getEffectiveFreeIntervalsForDay(v, slot, dayVal) {
+      const currentRanges = getSlotRanges(slot);
+      const otherRanges = currentRanges.filter(r => r.day !== dayVal && (Number(slot.counts && slot.counts[r.day]) || 0) > 0 && r.pct > 0.001);
+      const sameDayOtherPassRanges = getOtherPassSameDayRanges(v, dayVal);
+      return computeFreeIntervals(otherRanges.concat(sameDayOtherPassRanges));
+    }
+    
+    function getMaxAvailablePctForDay(v, slot, dayVal) {
+      let otherDaysPct = 0;
+      if (slot && slot.counts) {
+        for (let d of DAY_KEYS) {
+          if (d !== dayVal) otherDaysPct += (Number(slot.counts[d]) || 0);
+        }
+      }
+      otherDaysPct = Math.round(otherDaysPct * 100) / 100;
+      const sameDayOtherPct = getOtherPassSameDayPct(v, dayVal);
+      const byCount = Math.max(0, Math.round((100 - otherDaysPct - sameDayOtherPct) * 100) / 100);
+      if (!v) return byCount;
+      const freeInts = getEffectiveFreeIntervalsForDay(v, slot, dayVal);
+      let freeSum = 0;
+      for (const fi of freeInts) freeSum += fi.len;
+      freeSum = Math.round(freeSum * 100) / 100;
+      return Math.min(freeSum, byCount);
+    }
+    
     function detectAlignFromCells(cells, cellFractions = null) {
       if (!cells || !Array.isArray(cells)) return null;
       let firstIdx = -1, lastIdx = -1;
@@ -3371,25 +3419,32 @@ ui <- fluidPage(
       syncCellsFromRanges(slot);
     }
     
-    function updateSlotDay(slot, targetDay, targetPct, direction = null) {
+    function updateSlotDay(slot, targetDay, targetPct, direction = null, vRef = null) {
       if (!slot) return;
       if (!slot.counts) slot.counts = emptyCounts();
       if (!slot.cells) slot.cells = Array(10).fill('');
       if (!slot.cellFractions) slot.cellFractions = {};
       
-      // 1. Rangos de los DEMÁS días (se respeta 100% su posición original)
+      const vObj = vRef || valveSeleccionadaModal || null;
+      
+      // 1. Rangos de los DEMÁS días en esta pasada (se respeta 100% su posición original)
       // OJO: leer currentRanges ANTES de cambiar slot.align para no alterar la orientación previa de los demás días
       const currentRanges = getSlotRanges(slot);
       const otherRanges = currentRanges.filter(r => r.day !== targetDay && (Number(slot.counts[r.day]) || 0) > 0 && r.pct > 0);
+      const sameDayOtherPassRanges = getOtherPassSameDayRanges(vObj, targetDay);
+      const blockedRanges = otherRanges.concat(sameDayOtherPassRanges);
       
       const dir = direction || slot.align || 'start';
       slot.align = dir;
       
-      let otherTotal = 0;
-      for (let r of otherRanges) otherTotal += r.pct;
-      otherTotal = Math.round(otherTotal * 100) / 100;
+      const freeIntervals = computeFreeIntervals(blockedRanges);
+      let maxAvailable = 0;
+      for (let fi of freeIntervals) maxAvailable += fi.len;
+      maxAvailable = Math.max(0, Math.round(maxAvailable * 100) / 100);
+      if (vObj) {
+        maxAvailable = Math.min(maxAvailable, getMaxAvailablePctForDay(vObj, slot, targetDay));
+      }
       
-      const maxAvailable = Math.max(0, Math.round((100 - otherTotal) * 100) / 100);
       let pctToAssign = Math.min(Math.max(0, targetPct), maxAvailable);
       // Evitar franjas blancas por redondeo decimal de hectáreas (snap al 100% libre si la diferencia es mínima)
       if (Math.abs(pctToAssign - maxAvailable) < 0.15) {
@@ -3403,20 +3458,6 @@ ui <- fluidPage(
         slot.ranges = otherRanges;
         syncCellsFromRanges(slot);
         return;
-      }
-      
-      // 2. Localizar intervalos LIBRES en la válvula
-      otherRanges.sort((a, b) => a.start - b.start);
-      const freeIntervals = [];
-      let cursor = 0;
-      for (let r of otherRanges) {
-        if (r.start > cursor + 0.01) {
-          freeIntervals.push({ start: cursor, end: r.start, len: r.start - cursor });
-        }
-        cursor = Math.max(cursor, r.end);
-      }
-      if (cursor < 100 - 0.01) {
-        freeIntervals.push({ start: cursor, end: 100, len: 100 - cursor });
       }
       
       if (freeIntervals.length === 0) {
@@ -5583,6 +5624,10 @@ ui <- fluidPage(
       // PINTAR DÍA ACTIVO
       // -----------------------------------------------------------------------
       const dayVal = activeDay;
+      const otherSlot = getOtherPassSlot(v);
+      const otherPassLabel = activePass === 1 ? '2ª Pasada' : '1ª Pasada';
+      const sameDayOtherPct = getOtherPassSameDayPct(v, dayVal);
+      
       if (activeMode === 'Rectificacion') {
         const baseCampoSlot = v.slots['CosechaCampo_' + activePass];
         const baseProySlot  = v.slots['Proyeccion_' + activePass];
@@ -5598,15 +5643,15 @@ ui <- fluidPage(
           return false;
         }
       } else {
-        const otherSlot = getOtherPassSlot(v);
-        const otherPassLabel = activePass === 1 ? '2ª Pasada' : '1ª Pasada';
-        if ((otherSlot.counts[dayVal] || 0) > 0) {
-          showMapToast(`⚠️ Válvula ${v.codigo} ya tiene ${DAY_NAMES[dayVal]} en la ${otherPassLabel}`);
+        // Solo bloquear por completo la válvula si la otra pasada ya ocupa el 100% en este mismo día.
+        // Si ocupa menos del 100% (ej. 78.37% en Viernes y 21.63% en Lunes), se permite pintar sobre el área restante (el 21.63% del Lunes).
+        if (sameDayOtherPct >= 99.95) {
+          showMapToast(`⚠️ Válvula ${v.codigo} ya tiene el 100% en ${DAY_NAMES[dayVal]} en la ${otherPassLabel}`);
           return false;
         }
       }
       
-      // Porcentaje ocupado por los DEMÁS días en esta pasada
+      // Porcentaje máximo disponible para dayVal descontando otros días de esta pasada y el mismo día de la otra pasada
       let otherDaysPct = 0;
       for (let d of DAY_KEYS) {
         if (d !== dayVal) {
@@ -5614,25 +5659,31 @@ ui <- fluidPage(
         }
       }
       otherDaysPct = Math.round(otherDaysPct * 100) / 100;
-      const maxAvailablePct = Math.max(0, Math.round((100 - otherDaysPct) * 100) / 100);
+      const maxAvailablePct = getMaxAvailablePctForDay(v, slot, dayVal);
       
       if (maxAvailablePct <= 0) {
-        showMapToast(`🔒 Válvula ${v.codigo} ya está al 100% con otros días. Usa 🧹 Borrar para liberar espacio.`);
+        if (sameDayOtherPct > 0) {
+          showMapToast(`🔒 Válvula ${v.codigo} no tiene espacio libre para ${DAY_NAMES[dayVal]} (${sameDayOtherPct}% ocupado en ${otherPassLabel}).`);
+        } else {
+          showMapToast(`🔒 Válvula ${v.codigo} ya está al 100% con otros días. Usa 🧹 Borrar para liberar espacio.`);
+        }
         return false;
       }
       
       if (paintTool === 'valve100') {
         const curDayPct = Number(slot.counts[dayVal]) || 0;
-        if (curDayPct >= maxAvailablePct) {
-          showMapToast(`🔒 Válvula ${v.codigo} ya está al 100% (tiene ${curDayPct}% en ${DAY_NAMES[dayVal]}).`);
+        if (curDayPct >= maxAvailablePct - 0.01) {
+          const totalHa = parseFloat(v.Área) || 0;
+          const maxHa = ((maxAvailablePct / 100) * totalHa).toFixed(2);
+          showMapToast(`🔒 Válvula ${v.codigo} ya alcanzó su máximo disponible en ${DAY_NAMES[dayVal]} (${curDayPct}% / ${maxHa} ha).`);
           return false;
         }
         
         saveSnapshotForUndo();
-        // Asignar al día activo TODOS los espacios libres exactos (sea a la izquierda, a la derecha o a ambos lados
-        // si el día anterior se pintó desde el centro). Los demás días conservan su posición: no quedan franjas blancas.
+        // Asignar al día activo TODOS los espacios libres efectivos (excluyendo otros días de esta pasada
+        // y excluyendo la franja del mismo día en la otra pasada, pintando así solo el área de otros días como Lunes).
         const rangosOtros = getSlotRanges(slot).filter(r => r.day !== dayVal && r.pct > 0.001);
-        const libres100 = computeFreeIntervals(rangosOtros);
+        const libres100 = getEffectiveFreeIntervalsForDay(v, slot, dayVal);
         const segsDia = libres100.map(fi => ({ day: dayVal, start: fi.start, end: fi.end }));
         applyRangesToSlot(slot, rangosOtros.concat(segsDia));
         recomputeValveSlotCounts(v, key);
@@ -5641,12 +5692,13 @@ ui <- fluidPage(
         const totalHa = parseFloat(v.Área) || 0;
         const totalAsig = Number(slot.counts[dayVal]) || maxAvailablePct;
         const haAsig = ((totalAsig / 100) * totalHa).toFixed(2);
-        showMapToast(`⚡ V-${v.codigo}: ${totalAsig}% (${haAsig} ha) asignado a ${DAY_NAMES[dayVal]}. Total: 100%.`);
+        showMapToast(`⚡ V-${v.codigo}: ${totalAsig}% (${haAsig} ha) asignado a ${DAY_NAMES[dayVal]} en ${activePass}ª Pasada.`);
       } else if (paintTool === 'cells') {
         const c = cellIndexAt(v, wx, wy);
         const cS = c * 10, cE = (c + 1) * 10;
         const rangosAct = getSlotRanges(slot).filter(r => r.pct > 0.001);
-        const libresAct = computeFreeIntervals(rangosAct);
+        const sameDayOtherRanges = getOtherPassSameDayRanges(v, dayVal);
+        const libresAct = computeFreeIntervals(rangosAct.concat(sameDayOtherRanges));
         const nuevos = [];
         for (const fi of libresAct) {
           const s = Math.max(fi.start, cS), e = Math.min(fi.end, cE);
@@ -5654,6 +5706,14 @@ ui <- fluidPage(
         }
         
         if (nuevos.length === 0) {
+          // Verificar si el cuadro está bloqueado porque pertenece al mismo día en la otra pasada
+          const esMismoDiaOtraPasada = sameDayOtherRanges.some(r => Math.min(r.end, cE) - Math.max(r.start, cS) > 0.01);
+          if (esMismoDiaOtraPasada && !strokeChanged) {
+            const totalHa = parseFloat(v.Área) || 0;
+            const maxHa = ((maxAvailablePct / 100) * totalHa).toFixed(2);
+            showMapToast(`⚠️ Cuadro ${c + 1} ya tiene ${DAY_NAMES[dayVal]} en la ${otherPassLabel}. Pinta sobre los cuadros libres (${maxAvailablePct}% / ${maxHa} ha).`);
+            return false;
+          }
           // Cuadro sin espacio libre: si es del día activo no hacer nada (evita re-pintado al arrastrar)
           const esDeOtroDia = rangosAct.some(r => r.day !== dayVal && Math.min(r.end, cE) - Math.max(r.start, cS) > 0.01);
           if (esDeOtroDia && !strokeChanged) {
@@ -5667,7 +5727,9 @@ ui <- fluidPage(
         const remainingForDay = Math.max(0, Math.round((maxAvailablePct - curDayPct) * 100) / 100);
         if (remainingForDay <= 0) {
           if (!strokeChanged) {
-            showMapToast(`🔒 Válvula ${v.codigo} ya no tiene más espacio libre disponible.`);
+            const totalHa = parseFloat(v.Área) || 0;
+            const maxHa = ((maxAvailablePct / 100) * totalHa).toFixed(2);
+            showMapToast(`🔒 Válvula ${v.codigo} ya alcanzó su máximo disponible para ${DAY_NAMES[dayVal]} (${maxAvailablePct}% / ${maxHa} ha).`);
           }
           return false;
         }
@@ -5742,9 +5804,10 @@ ui <- fluidPage(
       const slot = v.slots[key];
       const otherSlot = getOtherPassSlot(v);
       const otherPassLabel = activePass === 1 ? '2ª Pasada' : '1ª Pasada';
+      const sameDayOtherPct = getOtherPassSameDayPct(v, activeDay);
       
-      if ((otherSlot.counts[activeDay] || 0) > 0) {
-        showMapToast('⚠️ Válvula ' + v.codigo + ' ya tiene ' + DAY_NAMES[activeDay] + ' en la ' + otherPassLabel);
+      if (sameDayOtherPct >= 99.95) {
+        showMapToast('⚠️ Válvula ' + v.codigo + ' ya tiene el 100% de ' + DAY_NAMES[activeDay] + ' en la ' + otherPassLabel);
         return;
       }
       
@@ -5775,12 +5838,7 @@ ui <- fluidPage(
       targetPctModal = Number(slot.counts[activeDay]) || 0;
       const currentDayHa = ((targetPctModal / 100) * totalHa).toFixed(2);
       
-      let otherDaysPct = 0;
-      for (let d of DAY_KEYS) {
-        if (d !== activeDay) otherDaysPct += (Number(slot.counts[d]) || 0);
-      }
-      otherDaysPct = Math.round(otherDaysPct * 100) / 100;
-      const maxAvailablePct = Math.max(0, 100 - otherDaysPct);
+      const maxAvailablePct = getMaxAvailablePctForDay(v, slot, activeDay);
       const maxAvailableHa = ((maxAvailablePct / 100) * totalHa).toFixed(2);
       
       if (infoBox) {
@@ -5887,12 +5945,7 @@ ui <- fluidPage(
       
       const key = slotKey(activeMode, activePass);
       const slot = valveSeleccionadaModal.slots[key];
-      let otherDaysPct = 0;
-      for (let d of DAY_KEYS) {
-        if (d !== activeDay) otherDaysPct += (Number(slot.counts[d]) || 0);
-      }
-      otherDaysPct = Math.round(otherDaysPct * 100) / 100;
-      const maxAvailablePct = Math.max(0, 100 - otherDaysPct);
+      const maxAvailablePct = getMaxAvailablePctForDay(valveSeleccionadaModal, slot, activeDay);
       const maxAvailableHa = (totalHa * (maxAvailablePct / 100));
       
       if (val === '' || val === null) {
@@ -5945,12 +5998,7 @@ ui <- fluidPage(
       
       const key = slotKey(activeMode, activePass);
       const slot = valveSeleccionadaModal.slots[key];
-      let otherDaysPct = 0;
-      for (let d of DAY_KEYS) {
-        if (d !== activeDay) otherDaysPct += (Number(slot.counts[d]) || 0);
-      }
-      otherDaysPct = Math.round(otherDaysPct * 100) / 100;
-      const maxAvailablePct = Math.max(0, 100 - otherDaysPct);
+      const maxAvailablePct = getMaxAvailablePctForDay(valveSeleccionadaModal, slot, activeDay);
       const maxAvailableHa = ((maxAvailablePct / 100) * totalHa).toFixed(2);
       
       if (val === '' || val === null) {
@@ -5999,12 +6047,7 @@ ui <- fluidPage(
       
       const key = slotKey(activeMode, activePass);
       const slot = valveSeleccionadaModal.slots[key];
-      let otherDaysPct = 0;
-      for (let d of DAY_KEYS) {
-        if (d !== activeDay) otherDaysPct += (Number(slot.counts[d]) || 0);
-      }
-      otherDaysPct = Math.round(otherDaysPct * 100) / 100;
-      const maxAvailablePct = Math.max(0, 100 - otherDaysPct);
+      const maxAvailablePct = getMaxAvailablePctForDay(valveSeleccionadaModal, slot, activeDay);
       const maxAvailableHa = ((maxAvailablePct / 100) * totalHa).toFixed(2);
       
       if (pct > maxAvailablePct) {
@@ -6044,15 +6087,10 @@ ui <- fluidPage(
       const dayName = DAY_NAMES[dayVal] || dayVal;
       const isHoriz = isHorizontalValve(valveSeleccionadaModal);
       
-      let otherDaysPct = 0;
-      for (let d of DAY_KEYS) {
-        if (d !== activeDay) otherDaysPct += (Number(slot.counts[d]) || 0);
-      }
-      otherDaysPct = Math.round(otherDaysPct * 100) / 100;
-      
-      const curPct = Math.min(Math.max(0, targetPctModal), Math.max(0, 100 - otherDaysPct));
+      const maxAvailablePct = getMaxAvailablePctForDay(valveSeleccionadaModal, slot, dayVal);
+      const curPct = Math.min(Math.max(0, targetPctModal), maxAvailablePct);
       const curHa = (totalHa * (curPct / 100));
-      const librePct = Math.max(0, 100 - curPct - otherDaysPct);
+      const librePct = Math.max(0, maxAvailablePct - curPct);
       const libreHa = (totalHa * (librePct / 100));
       
       if (bar) {
@@ -6065,7 +6103,7 @@ ui <- fluidPage(
           cellFractions: Object.assign({}, slot.cellFractions || {}),
           align: modalPaintDirection || detectSlotAlign(slot, true) || 'start'
         };
-        updateSlotDay(tempSlot, dayVal, curPct, modalPaintDirection);
+        updateSlotDay(tempSlot, dayVal, curPct, modalPaintDirection, valveSeleccionadaModal);
         const tempRanges = getSlotRanges(tempSlot);
         
         // Renderizar los 10 cuadros físicos
@@ -6187,12 +6225,7 @@ ui <- fluidPage(
       const dayVal = activeDay;
       const isHoriz = isHorizontalValve(v);
       
-      let otherDaysPct = 0;
-      for (let d of DAY_KEYS) {
-        if (d !== dayVal) otherDaysPct += (Number(slot.counts[d]) || 0);
-      }
-      otherDaysPct = Math.round(otherDaysPct * 100) / 100;
-      const maxPct = Math.max(0, 100 - otherDaysPct);
+      const maxPct = getMaxAvailablePctForDay(v, slot, dayVal);
       const maxAvailableHa = (totalHa * (maxPct / 100));
       
       const inpHa = document.getElementById('input_asignar_ha');
@@ -6237,7 +6270,7 @@ ui <- fluidPage(
         slot.kg[dayVal] = 0;
       }
       
-      updateSlotDay(slot, dayVal, pct, modalPaintDirection);
+      updateSlotDay(slot, dayVal, pct, modalPaintDirection, v);
       recomputeValveSlotCounts(v, key);
       updateUndoButton();
       requestRender();
@@ -6245,7 +6278,7 @@ ui <- fluidPage(
       syncStateToShiny(true);
       
       const haAsig = ((pct / 100) * totalHa).toFixed(2);
-      const haLib = (((100 - pct - otherDaysPct) / 100) * totalHa).toFixed(2);
+      const haLib = (((maxPct - pct) / 100) * totalHa).toFixed(2);
       const dirText = modalPaintDirection === 'start' ? (isHoriz ? 'Arriba' : 'Izquierda') :
                       (modalPaintDirection === 'end' ? (isHoriz ? 'Abajo' : 'Derecha') : 'Centro');
       showMapToast(`✓ V-${v.codigo}: ${pct}% (${haAsig} ha) asignado a ${DAY_NAMES[dayVal]} desde ${dirText}. Libre: ${haLib} ha.`);

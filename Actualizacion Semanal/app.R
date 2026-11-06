@@ -5591,8 +5591,7 @@ server <- function(input, output, session) {
         col_k <- paste0("Kg_", d_prev)
         v_h   <- if (col_h %in% names(rc_temp_u)) coalesce(rc_temp_u[[col_h]], 0) else 0
         v_k   <- if (col_k %in% names(rc_temp_u)) coalesce(rc_temp_u[[col_k]], 0) else 0
-        es_ejec <- (d_prev %in% c("Lunes", "Martes"))
-        ha_prev_vec_u <- ha_prev_vec_u + ifelse(es_ejec, v_h, 0)
+        ha_prev_vec_u <- ha_prev_vec_u + v_h
       }
       rc_temp_u$Ha_Rc_Prev <- ha_prev_vec_u
       
@@ -5616,12 +5615,13 @@ server <- function(input, output, session) {
         group_by(Módulo_rc, Turno_rc, Var_rc) %>%
         summarise(
           Ha_Rc          = sum(coalesce(Ha_Rc_Prev, 0), na.rm = TRUE),
+          Ha_Rc_1ra      = sum(ifelse(coalesce(num_pas_rc, 1) == 1, coalesce(Ha_Rc_Prev, 0), 0), na.rm = TRUE),
           Ha_Rc_2da      = sum(ifelse(coalesce(num_pas_rc, 1) == 2, coalesce(Ha_Rc_Prev, 0), 0), na.rm = TRUE),
           Kg_Real_1ra_rc = sum(ifelse(num_pas_rc == 1, kg_tot_rc, 0), na.rm = TRUE),
           Kg_Real_2da_rc = sum(ifelse(num_pas_rc == 2, kg_tot_rc, 0), na.rm = TRUE),
           .groups        = "drop"
         )
-    } else tibble(Módulo_rc = character(), Turno_rc = character(), Var_rc = character(), Ha_Rc = numeric(), Ha_Rc_2da = numeric(), Kg_Real_1ra_rc = numeric(), Kg_Real_2da_rc = numeric())
+    } else tibble(Módulo_rc = character(), Turno_rc = character(), Var_rc = character(), Ha_Rc = numeric(), Ha_Rc_1ra = numeric(), Ha_Rc_2da = numeric(), Kg_Real_1ra_rc = numeric(), Kg_Real_2da_rc = numeric())
     
     # Identificar válvulas con Num_Pasada == 2 por día para asignar correctamente kilos SAP de 2ª pasada
     valvs_dias_p2_u <- list()
@@ -5703,6 +5703,7 @@ server <- function(input, output, session) {
       left_join(sap_ha_valvs_turno, by = c("Módulo_join" = "Módulo_s", "Turno_join" = "Turno_s", "Variedad_join" = "Var_s")) %>%
       mutate(
         Ha_Rc        = coalesce(Ha_Rc, 0),
+        Ha_Rc_1ra    = coalesce(Ha_Rc_1ra, Ha_Rc),
         Ha_Valvs_SAP = coalesce(Ha_Valvs_SAP, 0),
         kg_sap_act   = if (length(cols_dias_kg_u) > 0) {
           rowSums(across(all_of(cols_dias_kg_u)), na.rm = TRUE)
@@ -5713,18 +5714,18 @@ server <- function(input, output, session) {
         rend_proy_u  = ifelse(!is.na(Proyección) & Proyección > 0 & Área > 0, Proyección / Área, 1),
         es_remanente_u = (Ha_Rc == 0 & Ha_Valvs_SAP == 0) & (kg_sap_act > 0) & 
           ((!is.na(Proyección) & Proyección > 0 & (kg_sap_act / Proyección) < 0.15) | (kg_sap_act / pmax(0.1, Área)) < 50),
-        `Ha Recorrida` = case_when(
+        `Ha Real 1ª Pas` = case_when(
+          Ha_Rc_1ra > 0    ~ round(pmin(Área, Ha_Rc_1ra), 2),
           Ha_Valvs_SAP > 0 ~ round(pmin(Área, Ha_Valvs_SAP), 2),
-          Ha_Rc > 0        ~ round(pmin(Área, Ha_Rc), 2),
           es_remanente_u   ~ round(pmin(Área, kg_sap_act / pmax(1, rend_proy_u)), 2),
           kg_sap_act > 0   ~ round(pmin(Área, kg_sap_act / pmax(1, rend_proy_u)), 2),
           TRUE             ~ 0
         ),
         # Separacion de Ha Real por pasada (2a pasada solo ROCIO, segun rutas de campo)
-        `Ha Real 2ª Pas` = ifelse(limpiar_variedad(Variedad) == "ROCIO", round(pmin(`Ha Recorrida`, coalesce(Ha_Rc_2da, 0)), 2), 0),
-        `Ha Real 1ª Pas` = round(pmax(0, `Ha Recorrida` - `Ha Real 2ª Pas`), 2)
+        `Ha Real 2ª Pas` = ifelse(limpiar_variedad(Variedad) == "ROCIO", round(pmin(Área, Ha_Rc_2da), 2), 0),
+        `Ha Recorrida`   = round(`Ha Real 1ª Pas` + `Ha Real 2ª Pas`, 2)
       ) %>%
-      select(-any_of(c("Ha_Rc", "Ha_Rc_2da", "Ha_Valvs_SAP", "kg_sap_act", "rend_proy_u", "es_remanente_u")))
+      select(-any_of(c("Ha_Rc", "Ha_Rc_1ra", "Ha_Rc_2da", "Ha_Valvs_SAP", "kg_sap_act", "rend_proy_u", "es_remanente_u")))
     
     # 5. Flags iniciales de bloqueo
     universo <- universo %>%
@@ -7059,7 +7060,60 @@ server <- function(input, output, session) {
     ha_man_otros_2da <- sum(coalesce(as.numeric(ed_otros_dias$Ha_Asignada_2da), 0), na.rm = TRUE)
     
     ha_disponible_1ra <- max(0, round(area_turno - ha_real_1ra - ha_man_otros_1ra, 2))
-    ha_disponible_2da <- max(0, round(area_turno - ha_real_2da - ha_man_otros_2da, 2))
+    
+    # 2ª Pasada: Cálculo inteligente por válvula y frecuencia para el día específico
+    frec_dias_var <- if (limpiar_variedad(fila$Variedad) == "ROCIO") 3L else 7L
+    frec_df_disco <- tryCatch(cargar_frecuencias_disco(), error = function(e) NULL)
+    if (!is.null(frec_df_disco) && nrow(frec_df_disco) > 0) {
+      f_row <- frec_df_disco %>% filter(as.character(Módulo) == as.character(fila$Módulo), limpiar_variedad(Variedad) == limpiar_variedad(fila$Variedad))
+      if (nrow(f_row) > 0 && !is.na(f_row$Frecuencia_Dias[1])) frec_dias_var <- as.integer(f_row$Frecuencia_Dias[1])
+    }
+    
+    ha_valvs_2da_dia <- 0
+    if (nrow(valvs_celda) > 0 && any(coalesce(valvs_celda$Num_Pasada, 1L) == 2L)) {
+      ha_valvs_2da_dia <- sum(valvs_celda$Ha_Asignada[coalesce(valvs_celda$Num_Pasada, 1L) == 2L], na.rm = TRUE)
+    }
+    if (ha_valvs_2da_dia <= 0) {
+      rc_disco <- tryCatch(cargar_rutas_cosecha(), error = function(e) NULL)
+      if (!is.null(rc_disco) && nrow(rc_disco) > 0 && "Semana" %in% names(rc_disco)) {
+        rc_sub_2da <- rc_disco %>%
+          filter(
+            as.numeric(Semana) == as.numeric(input$filtro_semana),
+            as.character(Módulo) == as.character(fila$Módulo),
+            as.character(Turno) == as.character(fila$Turno),
+            limpiar_variedad(Variedad) == limpiar_variedad(fila$Variedad),
+            coalesce(as.integer(Num_Pasada), 1L) == 1L
+          )
+        if (nrow(rc_sub_2da) > 0) {
+          dias_semana_noms <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
+          for (iv in seq_len(nrow(rc_sub_2da))) {
+            v_area_iv <- coalesce(as.numeric(rc_sub_2da$Área[iv]), 0)
+            dias_harv <- c()
+            if (coalesce(as.numeric(rc_sub_2da$Ha_Lunes[iv]), 0) > 0) dias_harv <- c(dias_harv, "Lunes")
+            if (coalesce(as.numeric(rc_sub_2da$Ha_Martes[iv]), 0) > 0) dias_harv <- c(dias_harv, "Martes")
+            if (coalesce(as.numeric(rc_sub_2da$Ha_Miércoles[iv]), 0) > 0) dias_harv <- c(dias_harv, "Miércoles")
+            if (coalesce(as.numeric(rc_sub_2da$Ha_Jueves[iv]), 0) > 0) dias_harv <- c(dias_harv, "Jueves")
+            if (coalesce(as.numeric(rc_sub_2da$Ha_Viernes[iv]), 0) > 0) dias_harv <- c(dias_harv, "Viernes")
+            if (coalesce(as.numeric(rc_sub_2da$Ha_Sábado[iv]), 0) > 0) dias_harv <- c(dias_harv, "Sábado")
+            
+            for (dh in dias_harv) {
+              d_esp <- as.character(desplazar_dia_frecuencia(dh, frec_dias_var, dias_semana_noms, 1L, "Lunes", 6L, "Sábado"))
+              if (identical(d_esp, col_name)) {
+                ha_valvs_2da_dia <- ha_valvs_2da_dia + v_area_iv
+                break
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    ha_pool_2da_restante <- max(0, round(area_turno - ha_real_2da - ha_man_otros_2da, 2))
+    ha_disponible_2da <- if (ha_valvs_2da_dia > 0) {
+      round(min(ha_pool_2da_restante, ha_valvs_2da_dia), 2)
+    } else {
+      ha_pool_2da_restante
+    }
     
     pasada_sugerida <- if (nrow(valvs_celda) > 0 && any(valvs_celda$Num_Pasada == 2)) {
       2L
@@ -7484,7 +7538,7 @@ server <- function(input, output, session) {
     
     pasada_activa <- if (!is.null(input$modal_input_pasada)) as.integer(input$modal_input_pasada) else ctx$pasada_sug
     ha_real_pasada <- if (pasada_activa == 2L) ctx$ha_real_2da else ctx$ha_real_1ra
-    ha_pool_pasada <- max(0, round(ctx$area_turno - ha_real_pasada, 2))
+    ha_pool_pasada <- if (pasada_activa == 2L) ctx$ha_disponible_2da else max(0, round(ctx$area_turno - ha_real_pasada, 2))
     
     ed_act <- ediciones_manuales()
     if (!is.null(ed_act) && nrow(ed_act) > 0) {
@@ -7609,7 +7663,7 @@ server <- function(input, output, session) {
     modo <- input$modal_modo_ingreso
     pasada_activa <- if (!is.null(input$modal_input_pasada)) as.integer(input$modal_input_pasada) else ctx$pasada_sug
     ha_real_pasada <- if (pasada_activa == 2L) ctx$ha_real_2da else ctx$ha_real_1ra
-    ha_pool_pasada <- max(0, round(ctx$area_turno - ha_real_pasada, 2))
+    ha_pool_pasada <- if (pasada_activa == 2L) ctx$ha_disponible_2da else max(0, round(ctx$area_turno - ha_real_pasada, 2))
     
     val_final <- if (!is.null(modo) && modo == "kgha") {
       kgha <- suppressWarnings(as.numeric(input$modal_input_kgha))
@@ -7790,7 +7844,7 @@ server <- function(input, output, session) {
         }
         ha_final <- max(0, round(ha_pool_prorr - ha_acum, 2))
       } else {
-        ha_final <- round(ha_pool_prorr, 2)
+        ha_final <- if (pasada_activa == 2L) round(min(ha_pool_prorr, ctx$ha_disponible_2da), 2) else round(ha_pool_prorr, 2)
       }
     }
     
@@ -7858,6 +7912,14 @@ server <- function(input, output, session) {
       )
     }
   })
+
+  observeEvent(input$modal_input_pasada, {
+    ctx <- modal_celda_activa()
+    req(ctx)
+    p_act <- as.integer(input$modal_input_pasada)
+    ha_disp <- if (p_act == 2L) ctx$ha_disponible_2da else ctx$ha_disponible_1ra
+    updateNumericInput(session, "modal_input_ha", value = ha_disp, max = ha_disp)
+  }, ignoreInit = TRUE)
   
   observeEvent(input$modal_btn_restablecer, {
     ctx <- modal_celda_activa()
@@ -8602,6 +8664,8 @@ server <- function(input, output, session) {
   # ==============================================================================
   
   # Dataset base para el resumen (Semana Completa o Con Filtros según switch)
+  # Dataset base para el resumen (Semana Completa o Con Filtros según switch)
+  # Integra Cosecha Comercial + Testblock + Kilos SAP sin Ruta para reflejar el 100% de la fruta cosechada
   datos_resumen_base <- reactive({
     df <- if (isTRUE(input$switch_alcance_resumen == "filtrada")) {
       datos_reactivos()
@@ -8612,7 +8676,110 @@ server <- function(input, output, session) {
     
     es_campana_act <- if (!is.null(input$filtro_campana)) grepl("2026|^26", as.character(input$filtro_campana)) else TRUE
     
-    df %>%
+    # 1. Integrar Testblock al Resumen
+    df_tb_filtrado <- tibble()
+    df_tb_raw <- tryCatch(rv_cosecha_testblock(), error = function(e) NULL)
+    if (!is.null(df_tb_raw) && is.data.frame(df_tb_raw) && nrow(df_tb_raw) > 0) {
+      df_tb_sub <- df_tb_raw %>%
+        filter(
+          as.character(Campaña) == as.character(input$filtro_campana),
+          as.numeric(Semana)    == as.numeric(input$filtro_semana)
+        )
+      if (isTRUE(input$switch_alcance_resumen == "filtrada")) {
+        if (!is.null(input$filtro_variedad) && length(input$filtro_variedad) > 0) {
+          df_tb_sub <- df_tb_sub %>% filter(limpiar_variedad(Variedad) %in% limpiar_variedad(input$filtro_variedad))
+        }
+        if ((!is.null(input$filtro_modulo) && length(input$filtro_modulo) > 0 && !any(c("Test Block", "TB", "4") %in% input$filtro_modulo)) ||
+            (!is.null(input$filtro_turno) && length(input$filtro_turno) > 0 && !("0" %in% input$filtro_turno)) ||
+            (!is.null(input$filtro_grupo) && length(input$filtro_grupo) > 0)) {
+          df_tb_sub <- tibble()
+        }
+      }
+      if (nrow(df_tb_sub) > 0) {
+        dias_semana_nombres <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo")
+        df_tb_filtrado <- df_tb_sub %>%
+          mutate(
+            Dia       = factor(dias_semana_nombres[lubridate::wday(Fecha, week_start = 1)], levels = dias_semana_nombres),
+            Sector    = "4",
+            Módulo    = "Test Block",
+            Turno     = "0",
+            Variedad  = limpiar_variedad(Variedad),
+            Tipo      = "Testblock",
+            Proyección = 0,
+            Área      = 0,
+            Kg_Val    = coalesce(as.numeric(`Kg Total`), 0)
+          ) %>%
+          group_by(Sector, Módulo, Turno, Variedad, Tipo, Proyección, Área, Dia) %>%
+          summarise(Kg_Dia = sum(Kg_Val, na.rm = TRUE), .groups = "drop") %>%
+          tidyr::pivot_wider(names_from = Dia, values_from = Kg_Dia, values_fill = 0)
+        
+        for (d in c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")) {
+          if (!d %in% names(df_tb_filtrado)) df_tb_filtrado[[d]] <- 0
+        }
+        df_tb_filtrado <- df_tb_filtrado %>%
+          mutate(
+            Ajuste = Lunes + Martes + Miércoles + Jueves + Viernes + Sábado,
+            Diferencia = Ajuste - Proyección
+          )
+      }
+    }
+    
+    # 2. Integrar Kilos SAP sin Ruta al Resumen
+    df_sr_filtrado <- tibble()
+    df_concil <- tryCatch(obtener_cosecha_conciliada_semana(input$filtro_semana, input$filtro_campana), error = function(e) NULL)
+    if (!is.null(df_concil) && is.data.frame(df_concil) && nrow(df_concil) > 0) {
+      sr_mask <- (!coalesce(df_concil$Tiene_Campo, FALSE) & coalesce(df_concil$Tiene_SAP, FALSE)) |
+                 coalesce(df_concil$Estado_Concil, "") == "Kilos SAP sin Ruta"
+      if (any(sr_mask)) {
+        df_sr_sub <- df_concil[sr_mask, ]
+        if (isTRUE(input$switch_alcance_resumen == "filtrada")) {
+          if (!is.null(input$filtro_variedad) && length(input$filtro_variedad) > 0) {
+            df_sr_sub <- df_sr_sub %>% filter(limpiar_variedad(Variedad) %in% limpiar_variedad(input$filtro_variedad))
+          }
+          if (!is.null(input$filtro_modulo) && length(input$filtro_modulo) > 0) {
+            df_sr_sub <- df_sr_sub %>% filter(as.character(Módulo) %in% as.character(input$filtro_modulo))
+          }
+          if (!is.null(input$filtro_turno) && length(input$filtro_turno) > 0) {
+            df_sr_sub <- df_sr_sub %>% filter(as.character(Turno) %in% as.character(input$filtro_turno))
+          }
+        }
+        if (nrow(df_sr_sub) > 0) {
+          tb_map <- tratamientos_base %>%
+            filter(as.character(Campaña) == as.character(input$filtro_campana)) %>%
+            distinct(Módulo = as.character(Módulo), Tipo)
+          
+          df_sr_filtrado <- df_sr_sub %>%
+            left_join(tb_map, by = "Módulo") %>%
+            mutate(
+              Sector     = coalesce(as.character(Sector), "Sin Ruta"),
+              Módulo     = coalesce(as.character(Módulo), "Sin Ruta"),
+              Turno      = coalesce(as.character(Turno), "0"),
+              Variedad   = limpiar_variedad(Variedad),
+              Tipo       = coalesce(Tipo, "Orgánico"),
+              Proyección = 0,
+              Área       = 0,
+              Lunes      = coalesce(as.numeric(Kg_Lunes_sap), 0),
+              Martes     = coalesce(as.numeric(Kg_Martes_sap), 0),
+              Miércoles  = coalesce(as.numeric(Kg_Miercoles_sap), 0),
+              Jueves     = coalesce(as.numeric(Kg_Jueves_sap), 0),
+              Viernes    = coalesce(as.numeric(Kg_Viernes_sap), 0),
+              Sábado     = coalesce(as.numeric(Kg_Sabado_sap), 0),
+              Ajuste     = Lunes + Martes + Miércoles + Jueves + Viernes + Sábado,
+              Diferencia = Ajuste - Proyección
+            ) %>%
+            select(Sector, Módulo, Turno, Variedad, Tipo, Proyección, Área, Lunes, Martes, Miércoles, Jueves, Viernes, Sábado, Ajuste, Diferencia)
+        }
+      }
+    }
+    
+    # 3. Unificar comercial + Testblock + Sin Ruta para el Resumen
+    cols_comunes <- c("Sector", "Módulo", "Turno", "Variedad", "Tipo", "Proyección", "Área",
+                      "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Ajuste", "Diferencia")
+    df_base_unif <- df %>% select(any_of(cols_comunes))
+    if (nrow(df_tb_filtrado) > 0) df_base_unif <- bind_rows(df_base_unif, df_tb_filtrado %>% select(any_of(cols_comunes)))
+    if (nrow(df_sr_filtrado) > 0) df_base_unif <- bind_rows(df_base_unif, df_sr_filtrado %>% select(any_of(cols_comunes)))
+    
+    df_base_unif %>%
       mutate(
         Turno_num_res = suppressWarnings(as.numeric(Turno)),
         Módulo_Str = case_when(
@@ -10234,18 +10401,18 @@ server <- function(input, output, session) {
           col_k <- paste0("Kg_", d)
           val_h <- if (col_h %in% names(rc_temp)) coalesce(rc_temp[[col_h]], 0) else 0
           val_k <- if (col_k %in% names(rc_temp)) coalesce(rc_temp[[col_k]], 0) else 0
-          es_ejecutado <- (d %in% c("Lunes", "Martes"))
-          ha_prev_vec <- ha_prev_vec + ifelse(es_ejecutado, val_h, 0)
-          kg_prev_vec <- kg_prev_vec + ifelse(es_ejecutado, val_k, 0)
+          ha_prev_vec <- ha_prev_vec + val_h
+          kg_prev_vec <- kg_prev_vec + val_k
         }
         rc_temp$Ha_Prev_Valv <- ha_prev_vec
         rc_temp$Kg_Prev_Valv <- kg_prev_vec
         
         rc_temp %>%
+          filter(coalesce(suppressWarnings(as.numeric(Num_Pasada)), 1) == 1) %>%
           group_by(codigo_norm) %>%
           summarise(
-            Ha_Prog      = sum(coalesce(Ha_Prev_Valv, 0), na.rm = TRUE),
-            Kg_Prog      = sum(coalesce(Kg_Prev_Valv, 0), na.rm = TRUE),
+            Ha_Prog_Rc   = sum(coalesce(Ha_Prev_Valv, 0), na.rm = TRUE),
+            Kg_Prog_Rc   = sum(coalesce(Kg_Prev_Valv, 0), na.rm = TRUE),
             Ha_Lunes_Rc  = sum(coalesce(Ha_Lunes, 0), na.rm = TRUE),
             Kg_Lunes_Rc  = if ("Kg_Lunes" %in% names(.)) sum(coalesce(Kg_Lunes, 0), na.rm = TRUE) else 0,
             Ha_Martes_Rc = sum(coalesce(Ha_Martes, 0), na.rm = TRUE),
@@ -10253,7 +10420,7 @@ server <- function(input, output, session) {
             Dia_Ruta_Sem = first(na.omit(Dia_Ruta_Sem)),
             .groups      = "drop"
           )
-      } else tibble(codigo_norm = character(), Ha_Prog = numeric(), Kg_Prog = numeric(), Ha_Lunes_Rc = numeric(), Kg_Lunes_Rc = numeric(), Ha_Martes_Rc = numeric(), Kg_Martes_Rc = numeric(), Dia_Ruta_Sem = character())
+      } else tibble(codigo_norm = character(), Ha_Prog_Rc = numeric(), Kg_Prog_Rc = numeric(), Ha_Lunes_Rc = numeric(), Kg_Lunes_Rc = numeric(), Ha_Martes_Rc = numeric(), Kg_Martes_Rc = numeric(), Dia_Ruta_Sem = character())
       
       # Válvulas rectificadas el Martes en la semana actual (si se cosechó Lunes y se rectificó Martes, su frecuencia cuenta desde Martes)
       rectif_martes_ids <- if (nrow(rc_rectif_sem) > 0 && "codigo" %in% names(rc_rectif_sem) && "Martes" %in% names(rc_rectif_sem)) {
@@ -10391,17 +10558,15 @@ server <- function(input, output, session) {
         left_join(sap_valv_avance, by = "codigo_norm") %>%
         mutate(
           Ha_Prog      = case_when(
-            coalesce(Ha_Prog_Sap, 0) > 0                        ~ pmin(Área, Ha_Prog_Sap),
-            coalesce(Kg_Prog_Sap, 0) > 0                        ~ Área,
-            (dia_inicio_idx > 1 & coalesce(Ha_Lunes_Rc, 0) > 0) ~ pmin(Área, Ha_Lunes_Rc),
-            (dia_inicio_idx > 2 & coalesce(Ha_Martes_Rc, 0) > 0) ~ pmin(Área, Ha_Martes_Rc),
-            TRUE                                                ~ 0
+            coalesce(Ha_Prog_Rc, 0) > 0                                           ~ pmin(Área, Ha_Prog_Rc),
+            (is.null(rc_sem) || nrow(rc_sem) == 0) & coalesce(Ha_Prog_Sap, 0) > 0 ~ pmin(Área, Ha_Prog_Sap),
+            (is.null(rc_sem) || nrow(rc_sem) == 0) & coalesce(Kg_Prog_Sap, 0) > 0 ~ Área,
+            TRUE                                                                  ~ 0
           ),
           Kg_Prog      = case_when(
-            coalesce(Kg_Prog_Sap, 0) > 0                        ~ Kg_Prog_Sap,
-            (dia_inicio_idx > 1 & coalesce(Kg_Lunes_Rc, 0) > 0) ~ Kg_Lunes_Rc,
-            (dia_inicio_idx > 2 & coalesce(Kg_Martes_Rc, 0) > 0) ~ Kg_Martes_Rc,
-            TRUE                                                ~ 0
+            coalesce(Ha_Prog_Rc, 0) > 0  ~ coalesce(Kg_Prog_Rc, 0),
+            coalesce(Kg_Prog_Sap, 0) > 0 ~ Kg_Prog_Sap,
+            TRUE                         ~ 0
           ),
           Ha_Lunes_Rc   = pmax(coalesce(Ha_Lunes_Rc, 0), coalesce(Ha_Lunes_Sap, 0)),
           Ha_Martes_Rc  = pmax(coalesce(Ha_Martes_Rc, 0), coalesce(Ha_Martes_Sap, 0)),
