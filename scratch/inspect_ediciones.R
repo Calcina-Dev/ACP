@@ -1,0 +1,5 @@
+ed <- readRDS("D:/ACP/Actualizacion Semanal/ediciones_manuales_cosecha.rds")
+cat("Total rows in ediciones_manuales_cosecha.rds:", nrow(ed), "\n")
+print(head(ed))
+print(table(ed$Campaña, ed$Semana))
+print(table(ed$Campo, ed$Tipo_Edicion))

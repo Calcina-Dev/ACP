@@ -1,0 +1,5 @@
+ed <- readRDS("Actualizacion Semanal/ediciones_manuales_cosecha.rds")
+cat("Names of ediciones_manuales_cosecha.rds:\n")
+print(names(ed))
+cat("Head:\n")
+print(head(ed, 3))

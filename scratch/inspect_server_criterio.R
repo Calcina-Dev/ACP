@@ -1,0 +1,5 @@
+lines <- readLines("Actualizacion Semanal/app.R", encoding = "UTF-8", warn = FALSE)
+cat("--- f_crit init ---\n")
+cat(paste(lines[16825:16835], collapse = "\n"), "\n")
+cat("--- aplicar_filtros logic ---\n")
+cat(paste(lines[17015:17045], collapse = "\n"), "\n")

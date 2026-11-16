@@ -2970,9 +2970,42 @@ ui <- fluidPage(
       return v.slots[slotKey(activeMode, otherP)];
     }
     
-    // Obtiene los rangos físicos ocupados por el MISMO día (dayVal) en la OTRA pasada (1ª vs 2ª),
-    // ya que una misma porción de la válvula no puede tener 1ª y 2ª pasada el mismo día,
-    // pero el área cosechada en otros días previos (ej. Lunes en 1ª Pasada) SÍ puede recibir su 2ª pasada hoy.
+    const DAY_INDEX = {
+      lunes: 0,
+      martes: 1,
+      miercoles: 2,
+      jueves: 3,
+      viernes: 4,
+      sabado: 5
+    };
+    
+    function round2(x) { return Math.round((Number(x) || 0) * 100) / 100; }
+    
+    // Resta una lista de intervalos B de una lista de intervalos A
+    function subtractIntervals(listA, listB) {
+      let current = (listA || []).map(a => ({ start: a.start, end: a.end }));
+      for (const b of (listB || [])) {
+        const next = [];
+        for (const a of current) {
+          if (b.end <= a.start + 0.005 || b.start >= a.end - 0.005) {
+            next.push(a);
+          } else {
+            if (b.start > a.start + 0.005) {
+              next.push({ start: a.start, end: b.start });
+            }
+            if (b.end < a.end - 0.005) {
+              next.push({ start: b.end, end: a.end });
+            }
+          }
+        }
+        current = next;
+      }
+      return current
+        .map(i => ({ start: round2(i.start), end: round2(i.end), len: round2(i.end - i.start) }))
+        .filter(i => i.len > 0.005);
+    }
+    
+    // Obtiene los rangos fisicos ocupados por el MISMO dia (dayVal) en la OTRA pasada (1ª vs 2ª)
     function getOtherPassSameDayRanges(v, dayVal) {
       if (!v || !dayVal || activeMode === 'Rectificacion' || activeMode === 'CosechaOficial') return [];
       const otherSlot = getOtherPassSlot(v);
@@ -2987,29 +3020,65 @@ ui <- fluidPage(
       return Math.round((Number(otherSlot.counts[dayVal]) || 0) * 100) / 100;
     }
     
+    // Obtiene los intervalos continuos fisicos disponibles para asignar a 'dayVal'.
+    // REGLA FUNDAMENTAL AGRONOMICA:
+    // En 2ª Pasada: SOLO se puede cosechar el area que YA fue cosechada en 1ª Pasada en dias estrictamente ANTERIORES.
+    // (Ej. en Jueves de 2ª Pasada, SOLO se puede cosechar lo de Lunes/Martes/Miercoles de 1ª Pasada;
+    //  lo de Viernes o del mismo Jueves NO esta disponible porque aun no se ha cosechado en 1ª Pasada).
+    function getAvailableIntervalsForDay(v, slot, dayVal) {
+      if (!v || !slot || !dayVal) return [];
+      const curDayIdx = DAY_INDEX[dayVal];
+      if (curDayIdx === undefined) return [];
+      
+      if (activeMode === 'Rectificacion') {
+        const otherDaysRanges = getSlotRanges(slot).filter(r => r.day !== dayVal && (Number(slot.counts && slot.counts[r.day]) || 0) > 0 && r.pct > 0.001);
+        return computeFreeIntervals(otherDaysRanges);
+      }
+      
+      if (activePass === 2) {
+        const p1Slot = v.slots[slotKey(activeMode, 1)];
+        if (!p1Slot) return [];
+        const p1Ranges = getSlotRanges(p1Slot);
+        // Filtrar SOLO los rangos de 1ª Pasada cuyo dia sea estrictamente anterior al dia actual
+        const eligibleFromP1 = p1Ranges
+          .filter(r => r && r.day && DAY_INDEX[r.day] !== undefined && DAY_INDEX[r.day] < curDayIdx && r.pct > 0.001)
+          .map(r => ({ start: r.start, end: r.end }));
+        
+        if (eligibleFromP1.length === 0) return [];
+        
+        // Descontar los rangos ya ocupados por OTROS dias de la 2ª Pasada
+        const otherP2Ranges = getSlotRanges(slot)
+          .filter(r => r && r.day !== dayVal && (Number(slot.counts && slot.counts[r.day]) || 0) > 0 && r.pct > 0.001)
+          .map(r => ({ start: r.start, end: r.end }));
+        
+        return subtractIntervals(eligibleFromP1, otherP2Ranges);
+      } else {
+        // En 1ª Pasada: el espacio libre de 1ª Pasada excluyendo otros dias
+        const otherP1Ranges = getSlotRanges(slot)
+          .filter(r => r && r.day !== dayVal && (Number(slot.counts && slot.counts[r.day]) || 0) > 0 && r.pct > 0.001)
+          .map(r => ({ start: r.start, end: r.end }));
+        const freeInP1 = computeFreeIntervals(otherP1Ranges);
+        
+        // Bloquear areas donde 2ª Pasada ya fue asignada en un dia igual o anterior al dia actual
+        const p2Slot = v.slots[slotKey(activeMode, 2)];
+        const blockedByP2 = (p2Slot ? getSlotRanges(p2Slot) : [])
+          .filter(r => r && r.day && DAY_INDEX[r.day] !== undefined && DAY_INDEX[r.day] <= curDayIdx && r.pct > 0.001)
+          .map(r => ({ start: r.start, end: r.end }));
+        
+        return subtractIntervals(freeInP1, blockedByP2);
+      }
+    }
+    
     function getEffectiveFreeIntervalsForDay(v, slot, dayVal) {
-      const currentRanges = getSlotRanges(slot);
-      const otherRanges = currentRanges.filter(r => r.day !== dayVal && (Number(slot.counts && slot.counts[r.day]) || 0) > 0 && r.pct > 0.001);
-      const sameDayOtherPassRanges = getOtherPassSameDayRanges(v, dayVal);
-      return computeFreeIntervals(otherRanges.concat(sameDayOtherPassRanges));
+      return getAvailableIntervalsForDay(v, slot, dayVal);
     }
     
     function getMaxAvailablePctForDay(v, slot, dayVal) {
-      let otherDaysPct = 0;
-      if (slot && slot.counts) {
-        for (let d of DAY_KEYS) {
-          if (d !== dayVal) otherDaysPct += (Number(slot.counts[d]) || 0);
-        }
-      }
-      otherDaysPct = Math.round(otherDaysPct * 100) / 100;
-      const sameDayOtherPct = getOtherPassSameDayPct(v, dayVal);
-      const byCount = Math.max(0, Math.round((100 - otherDaysPct - sameDayOtherPct) * 100) / 100);
-      if (!v) return byCount;
-      const freeInts = getEffectiveFreeIntervalsForDay(v, slot, dayVal);
-      let freeSum = 0;
-      for (const fi of freeInts) freeSum += fi.len;
-      freeSum = Math.round(freeSum * 100) / 100;
-      return Math.min(freeSum, byCount);
+      if (!v || !slot || !dayVal) return 0;
+      const intervals = getAvailableIntervalsForDay(v, slot, dayVal);
+      let sumLen = 0;
+      for (const inv of intervals) sumLen += inv.len;
+      return Math.max(0, Math.round(sumLen * 100) / 100);
     }
     
     function detectAlignFromCells(cells, cellFractions = null) {
@@ -3431,19 +3500,13 @@ ui <- fluidPage(
       // OJO: leer currentRanges ANTES de cambiar slot.align para no alterar la orientación previa de los demás días
       const currentRanges = getSlotRanges(slot);
       const otherRanges = currentRanges.filter(r => r.day !== targetDay && (Number(slot.counts[r.day]) || 0) > 0 && r.pct > 0);
-      const sameDayOtherPassRanges = getOtherPassSameDayRanges(vObj, targetDay);
-      const blockedRanges = otherRanges.concat(sameDayOtherPassRanges);
-      
       const dir = direction || slot.align || 'start';
       slot.align = dir;
       
-      const freeIntervals = computeFreeIntervals(blockedRanges);
+      const freeIntervals = vObj ? getAvailableIntervalsForDay(vObj, slot, targetDay) : computeFreeIntervals(otherRanges);
       let maxAvailable = 0;
       for (let fi of freeIntervals) maxAvailable += fi.len;
       maxAvailable = Math.max(0, Math.round(maxAvailable * 100) / 100);
-      if (vObj) {
-        maxAvailable = Math.min(maxAvailable, getMaxAvailablePctForDay(vObj, slot, targetDay));
-      }
       
       let pctToAssign = Math.min(Math.max(0, targetPct), maxAvailable);
       // Evitar franjas blancas por redondeo decimal de hectáreas (snap al 100% libre si la diferencia es mínima)
@@ -5662,7 +5725,9 @@ ui <- fluidPage(
       const maxAvailablePct = getMaxAvailablePctForDay(v, slot, dayVal);
       
       if (maxAvailablePct <= 0) {
-        if (sameDayOtherPct > 0) {
+        if (activePass === 2) {
+          showMapToast(`🔒 Válvula ${v.codigo} no tiene área cosechada en 1ª Pasada previa a ${DAY_NAMES[dayVal]}.`);
+        } else if (sameDayOtherPct > 0) {
           showMapToast(`🔒 Válvula ${v.codigo} no tiene espacio libre para ${DAY_NAMES[dayVal]} (${sameDayOtherPct}% ocupado en ${otherPassLabel}).`);
         } else {
           showMapToast(`🔒 Válvula ${v.codigo} ya está al 100% con otros días. Usa 🧹 Borrar para liberar espacio.`);
@@ -5680,11 +5745,10 @@ ui <- fluidPage(
         }
         
         saveSnapshotForUndo();
-        // Asignar al día activo TODOS los espacios libres efectivos (excluyendo otros días de esta pasada
-        // y excluyendo la franja del mismo día en la otra pasada, pintando así solo el área de otros días como Lunes).
+        // Asignar al día activo TODOS los espacios libres disponibles para este día
         const rangosOtros = getSlotRanges(slot).filter(r => r.day !== dayVal && r.pct > 0.001);
-        const libres100 = getEffectiveFreeIntervalsForDay(v, slot, dayVal);
-        const segsDia = libres100.map(fi => ({ day: dayVal, start: fi.start, end: fi.end }));
+        const libres100 = getAvailableIntervalsForDay(v, slot, dayVal);
+        const segsDia = libres100.map(fi => ({ day: dayVal, start: fi.start, end: fi.end, pct: fi.len }));
         applyRangesToSlot(slot, rangosOtros.concat(segsDia));
         recomputeValveSlotCounts(v, key);
         changed = true;
@@ -5697,32 +5761,47 @@ ui <- fluidPage(
         const c = cellIndexAt(v, wx, wy);
         const cS = c * 10, cE = (c + 1) * 10;
         const rangosAct = getSlotRanges(slot).filter(r => r.pct > 0.001);
-        const sameDayOtherRanges = getOtherPassSameDayRanges(v, dayVal);
-        const libresAct = computeFreeIntervals(rangosAct.concat(sameDayOtherRanges));
+        const curDayRanges = rangosAct.filter(r => r.day === dayVal);
+        const availForDay = getAvailableIntervalsForDay(v, slot, dayVal);
+        const libresAct = subtractIntervals(availForDay, curDayRanges);
         const nuevos = [];
         for (const fi of libresAct) {
           const s = Math.max(fi.start, cS), e = Math.min(fi.end, cE);
-          if (e - s > 0.01) nuevos.push({ day: dayVal, start: s, end: e });
+          if (e - s > 0.01) nuevos.push({ day: dayVal, start: s, end: e, pct: round2(e - s) });
         }
         
         if (nuevos.length === 0) {
-          // Verificar si el cuadro está bloqueado porque pertenece al mismo día en la otra pasada
-          const esMismoDiaOtraPasada = sameDayOtherRanges.some(r => Math.min(r.end, cE) - Math.max(r.start, cS) > 0.01);
-          if (esMismoDiaOtraPasada && !strokeChanged) {
+          const curDayPct = Number(slot.counts[dayVal]) || 0;
+          if (curDayPct >= maxAvailablePct - 0.01 && !strokeChanged) {
             const totalHa = parseFloat(v.Área) || 0;
             const maxHa = ((maxAvailablePct / 100) * totalHa).toFixed(2);
-            showMapToast(`⚠️ Cuadro ${c + 1} ya tiene ${DAY_NAMES[dayVal]} en la ${otherPassLabel}. Pinta sobre los cuadros libres (${maxAvailablePct}% / ${maxHa} ha).`);
+            showMapToast(`🔒 Válvula ${v.codigo} ya alcanzó su máximo disponible en ${DAY_NAMES[dayVal]} (${maxAvailablePct}% / ${maxHa} ha).`);
             return false;
           }
-          // Cuadro sin espacio libre: si es del día activo no hacer nada (evita re-pintado al arrastrar)
-          const esDeOtroDia = rangosAct.some(r => r.day !== dayVal && Math.min(r.end, cE) - Math.max(r.start, cS) > 0.01);
-          if (esDeOtroDia && !strokeChanged) {
-            const dOtro = cells[c] && cells[c] !== dayVal ? cells[c] : (rangosAct.find(r => r.day !== dayVal && Math.min(r.end, cE) - Math.max(r.start, cS) > 0.01) || {}).day;
-            showMapToast(`🔒 Cuadro ${c + 1} pertenece a ${DAY_NAMES[dOtro] || 'otro día'}. Haz clic en un espacio libre para pintar ${DAY_NAMES[dayVal]}.`);
+          if (activePass === 2 && !strokeChanged) {
+            const p1Slot = v.slots[slotKey(activeMode, 1)];
+            const p1Ranges = p1Slot ? getSlotRanges(p1Slot) : [];
+            const rInCell = p1Ranges.find(r => Math.min(r.end, cE) - Math.max(r.start, cS) > 0.01);
+            if (rInCell && rInCell.day === dayVal) {
+              showMapToast(`⚠️ Cuadro ${c + 1} tiene ${DAY_NAMES[dayVal]} en 1ª Pasada. La 2ª Pasada debe ser en un día posterior.`);
+            } else if (rInCell && DAY_INDEX[rInCell.day] !== undefined && DAY_INDEX[rInCell.day] >= DAY_INDEX[dayVal]) {
+              showMapToast(`⚠️ Cuadro ${c + 1} pertenece a ${DAY_NAMES[rInCell.day]} en 1ª Pasada (posterior o igual a ${DAY_NAMES[dayVal]}). Solo puedes dar 2ª Pasada a áreas previas.`);
+            } else {
+              showMapToast(`🔒 Cuadro ${c + 1} no está disponible para ${DAY_NAMES[dayVal]} en 2ª Pasada.`);
+            }
+            return false;
+          }
+          if (!strokeChanged) {
+            const esDeOtroDia = rangosAct.find(r => r.day !== dayVal && Math.min(r.end, cE) - Math.max(r.start, cS) > 0.01);
+            if (esDeOtroDia) {
+              showMapToast(`🔒 Cuadro ${c + 1} pertenece a ${DAY_NAMES[esDeOtroDia.day]}. Haz clic en un espacio libre para pintar ${DAY_NAMES[dayVal]}.`);
+            } else {
+              showMapToast(`🔒 Cuadro ${c + 1} no está disponible para ${DAY_NAMES[dayVal]}.`);
+            }
           }
           return false;
         }
-
+        
         const curDayPct = Number(slot.counts[dayVal]) || 0;
         const remainingForDay = Math.max(0, Math.round((maxAvailablePct - curDayPct) * 100) / 100);
         if (remainingForDay <= 0) {
@@ -5741,9 +5820,9 @@ ui <- fluidPage(
         
         const totalHa = parseFloat(v.Área) || 0;
         const haAsig = ((slot.counts[dayVal] / 100) * totalHa).toFixed(2);
-        showMapToast(`+10% en cuadro ${c + 1} (${DAY_NAMES[dayVal]}) de V-${v.codigo} (Total: ${slot.counts[dayVal]}% / ${haAsig} ha).`);
+        const asigCuadro = Math.round(nuevos.reduce((acc, n) => acc + (n.end - n.start), 0) * 100) / 100;
+        showMapToast(`+${asigCuadro}% en cuadro ${c + 1} (${DAY_NAMES[dayVal]}) de V-${v.codigo} (Total: ${slot.counts[dayVal]}% / ${haAsig} ha).`);
       }
-      
       if (changed) {
         marcarCambiosPendientes(true);
         requestRender();
@@ -5808,6 +5887,16 @@ ui <- fluidPage(
       
       if (sameDayOtherPct >= 99.95) {
         showMapToast('⚠️ Válvula ' + v.codigo + ' ya tiene el 100% de ' + DAY_NAMES[activeDay] + ' en la ' + otherPassLabel);
+        return;
+      }
+      
+      const maxAvailablePctPre = getMaxAvailablePctForDay(v, slot, activeDay);
+      if (maxAvailablePctPre <= 0) {
+        if (activePass === 2) {
+          showMapToast(🔒 Válvula  no tiene área cosechada en 1ª Pasada previa a .);
+        } else {
+          showMapToast(🔒 Válvula  ya está al 100% con otros días en ª Pasada.);
+        }
         return;
       }
       

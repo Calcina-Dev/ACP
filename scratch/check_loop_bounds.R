@@ -1,0 +1,6 @@
+lines <- readLines("D:/ACP/Actualizacion Semanal/app.R", encoding = "UTF-8", warn = FALSE)
+cat("Line 1825:", lines[1825], "\n")
+cat("Line 1960:", lines[1960], "\n")
+cat("Line 1961:", lines[1961], "\n")
+cat("Line 1962:", lines[1962], "\n")
+cat("Line 1963:", lines[1963], "\n")

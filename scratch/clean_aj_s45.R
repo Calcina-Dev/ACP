@@ -1,0 +1,5 @@
+suppressPackageStartupMessages(library(dplyr))
+aj <- readRDS("Actualizacion Semanal RNA/ajuste_valvulas_semana.rds")
+aj_clean <- aj %>% filter(as.numeric(Semana) != 45)
+saveRDS(aj_clean, "Actualizacion Semanal RNA/ajuste_valvulas_semana.rds")
+cat("✔ Registros automáticos de S45 en ajuste_valvulas_semana.rds limpiados.\n")

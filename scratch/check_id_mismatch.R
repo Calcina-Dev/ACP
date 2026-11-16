@@ -1,0 +1,5 @@
+lines <- readLines("D:/ACP/Actualizacion Semanal/app.R", warn = FALSE, encoding = "UTF-8")
+cat("--- UI LINES 5500-5520 ---\n")
+cat(paste(lines[5500:5520], collapse = "\n"))
+cat("\n\n--- SERVER LINES 17460-17520 ---\n")
+cat(paste(lines[17460:17520], collapse = "\n"))

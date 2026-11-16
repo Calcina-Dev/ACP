@@ -23,3 +23,14 @@ Plataforma ejecutiva en **R Shiny** con diseño inspirado en **macOS y Apple iOS
 - **Métricas Gerenciales & Carga**: Donut de estados, distribución por módulo y carga de trabajo por colaborador.
 - **Matriz Operativa DT**: Tabla interactiva con insignias (*badges*) de estado y exportación directa a Excel.
 
+### 🧠 [Actualización Semanal RNA](./Actualizacion%20Semanal%20RNA)
+Plataforma de ajuste semanal de cosecha basada en **Machine Learning & Redes Neuronales Artificiales (Deep Bagged MLP)**:
+- **Ensemble de Redes Neuronales**: 10 redes neuronales MLP entrenadas sobre 21,400+ observaciones históricas multianuales (2021–2026).
+- **Inferencia Multivariada en Tiempo Real**: Predice rendimiento continuo (kg/ha) y desvío de incertidumbre combinando avance Lunes/Martes, lags temporales ($S-1$, $S-2$), conteos florales desfasados, meteorología de Filtrado 7/9 y atributos de lote.
+- **Precisión Validada en Test 2026**: $R^2 = 83.6\%$, correlación $0.9175$ y error relativo de $17.7\%$.
+- **Conmutador Híbrido**: Permite alternar en tiempo real entre el motor predictivo de RNA y el árbol de decisión heurístico tradicional.
+
+### 📈 [Análisis de Productividad](./Analisis%20de%20Productividad)
+Seguimiento del calendario fenológico y curvas de productividad multiescenario (Emil Kowalski / iOS craft).
+
+

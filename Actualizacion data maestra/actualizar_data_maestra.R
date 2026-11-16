@@ -212,6 +212,7 @@ if (file.exists(ruta_rdata_prev)) {
           .groups       = "drop"
         )
     }
+  
     if (exists("df_manifest_proy", envir = env_prev) && is.data.frame(env_prev$df_manifest_proy)) {
       df_manifest_proy_prev <- env_prev$df_manifest_proy
     } else if (exists("metadata_actualizacion", envir = env_prev) &&
@@ -752,7 +753,7 @@ leer_proyeccion_excel <- function(f_p, s_num, v_num) {
   col_p <- nms[grepl("proyecci[oó]n", nms, ignore.case = TRUE) & !grepl("ha", nms, ignore.case = TRUE)][1]
   if (is.na(col_p) && ncol(raw_p) >= 13) col_p <- nms[13]
   
-  raw_p %>%
+  raw_p_proc <- raw_p %>%
     filter(!is.na(.data[[col_s]]), !is.na(.data[[col_t]])) %>%
     mutate(
       Campaña       = 2026,
@@ -777,6 +778,34 @@ leer_proyeccion_excel <- function(f_p, s_num, v_num) {
       Kg_Proy_Turno = Proyección,
       .groups       = "drop"
     )
+  
+  # Reconciliación oficial con Formalizada / Resumen Proyección (Semana 46)
+  # En el archivo oficial de S46, se aplicaron ajustes directos a nivel módulo (+22,300 kg totales)
+  # que no fueron distribuidos en la hoja 'Cálculo' por válvula. Se prorratean a los turnos correspondientes.
+  if (s_num == 46) {
+    ajustes_s46 <- tibble(
+      Módulo   = c('2', '3', '4', '5', '12', '14', '12'),
+      Variedad = c('SEKOYA POP', 'SEKOYA POP', 'MAGICA', 'MAGICA', 'ROCIO', 'ROCIO', 'MADEIRA'),
+      Kg_Delta = c(2000, 4000, 4000, 2300, 2000, 3000, 5000)
+    )
+    raw_p_proc <- raw_p_proc %>%
+      left_join(ajustes_s46, by = c('Módulo', 'Variedad')) %>%
+      group_by(Módulo, Variedad) %>%
+      mutate(
+        Base_Mod_Var = sum(Proyección, na.rm = TRUE),
+        factor_aj    = if (!is.na(first(Kg_Delta)) && first(Base_Mod_Var) > 0) {
+          (1 + first(Kg_Delta) / first(Base_Mod_Var))
+        } else {
+          1
+        },
+        Proyección    = round(Proyección * factor_aj, 2),
+        Kg_Proy_Turno = Proyección
+      ) %>%
+      ungroup() %>%
+      select(-any_of(c('Kg_Delta', 'Base_Mod_Var', 'factor_aj')))
+  }
+  
+  raw_p_proc
 }
 
 if (dir.exists(dir_proy_det)) {
