@@ -1,0 +1,5 @@
+lines <- readLines("Actualizacion Semanal/app.R", encoding = "UTF-8")
+cat("Definition of calcular_factor_tendencia_floral:\n")
+idx_def <- grep("calcular_factor_tendencia_floral <- function", lines)
+print(idx_def)
+cat(paste(lines[idx_def:(idx_def + 60)], collapse = "\n"))

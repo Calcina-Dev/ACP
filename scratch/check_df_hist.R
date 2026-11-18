@@ -1,3 +1,4 @@
-load('D:/ACP/Actualizacion Semanal/datos_maestros_cosecha_2026.RData')
-library(dplyr)
-print(df_hist_oficial_wide %>% filter(grepl("M12", Codigo_Valv)) %>% distinct(Sector, Módulo_Norm) %>% head(10))
+load("data/df_hist_oficial_wide.RData")
+cat("Names in df_hist_oficial_wide:\n")
+print(names(df_hist_oficial_wide))
+cat("\nRow count:", nrow(df_hist_oficial_wide), "\n")

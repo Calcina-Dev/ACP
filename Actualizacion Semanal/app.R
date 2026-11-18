@@ -98,7 +98,10 @@ orden_programas_comercial <- c(
 )
 
 norm_codigo_valvula <- function(x) {
-  sub("^M0*([0-9]+)[-_]T0*([0-9]+)[-_]V0*([0-9]+)$", "M\\1-T\\2-V\\3", toupper(trimws(as.character(x))))
+  x_clean <- toupper(trimws(as.character(x)))
+  x_clean <- sub("^M0*([0-9]+(?:\\.[0-9]+)?)[-_]T0*([0-9]+)[-_]V0*([0-9]+)$", "M\\1-T\\2-V\\3", x_clean)
+  x_clean <- sub("^0*([0-9]+(?:\\.[0-9]+)?)[-_]0*([0-9]+)[-_]V?0*([0-9]+)$", "M\\1-T\\2-V\\3", x_clean)
+  x_clean
 }
 
 # Función para ordenar semanas cronológicamente en campañas que cruzan de año (ej. S25..S53 -> S1..S19)
@@ -435,6 +438,71 @@ ruta_frecuencias_legacy_nube      <- "frecuencias_variedad_cosecha.rds"
 ruta_modo_frec_principal <- file.path(ruta_raiz_arandano, "modo_frecuencia_cosecha.rds")
 ruta_modo_frec_nube      <- "modo_frecuencia_cosecha.rds"
 
+ruta_elasticidad_frec_principal <- file.path(ruta_raiz_arandano, "elasticidad_frecuencia_cosecha.rds")
+ruta_elasticidad_frec_nube      <- "elasticidad_frecuencia_cosecha.rds"
+
+cargar_elasticidad_frecuencia_disco <- function() {
+  val <- NULL
+  if (file.exists(ruta_elasticidad_frec_principal)) {
+    val <- tryCatch(readRDS(ruta_elasticidad_frec_principal), error = function(e) NULL)
+  } else if (file.exists(ruta_elasticidad_frec_nube)) {
+    val <- tryCatch(readRDS(ruta_elasticidad_frec_nube), error = function(e) NULL)
+  }
+  val_num <- suppressWarnings(as.numeric(val))
+  if (!is.null(val_num) && !is.na(val_num) && length(val_num) == 1 && val_num >= 0 && val_num <= 100) {
+    return(val_num)
+  }
+  return(70) # 70% por defecto (calibrado empíricamente)
+}
+
+guardar_elasticidad_frecuencia_disco <- function(val) {
+  val_num <- suppressWarnings(as.numeric(val))
+  if (is.null(val_num) || is.na(val_num) || length(val_num) != 1) return(FALSE)
+  val_num <- max(0, min(100, val_num))
+  if (dir.exists(dirname(ruta_elasticidad_frec_principal))) {
+    tryCatch(saveRDS(val_num, ruta_elasticidad_frec_principal), error = function(e) NULL)
+  }
+  tryCatch(saveRDS(val_num, ruta_elasticidad_frec_nube), error = function(e) NULL)
+  return(TRUE)
+}
+
+calcular_factor_frecuencia <- function(diff_dias, frec_base = 7, elasticidad_pct = 70) {
+  diff_dias       <- suppressWarnings(as.numeric(diff_dias))
+  frec_base       <- suppressWarnings(as.numeric(frec_base))
+  elasticidad_pct <- suppressWarnings(as.numeric(elasticidad_pct))
+  
+  if (is.na(frec_base) || frec_base <= 0) frec_base <- 7
+  if (is.na(elasticidad_pct) || elasticidad_pct < 0) elasticidad_pct <- 70
+  
+  if (is.na(diff_dias) || abs(diff_dias) < 1e-6) {
+    return(list(
+      factor      = 1.0,
+      delta_pct   = 0.0,
+      diff_dias   = 0,
+      frec_base   = frec_base,
+      dias_int    = round(frec_base, 1),
+      elasticidad = elasticidad_pct
+    ))
+  }
+  
+  alpha          <- elasticidad_pct / 100
+  delta_dias_pct <- diff_dias / frec_base
+  factor_raw     <- 1 + alpha * delta_dias_pct
+  
+  # Clamp de seguridad: máximo +/- 60% de variación por desfase de días
+  factor_clamped  <- max(0.40, min(1.60, factor_raw))
+  delta_pct_final <- (factor_clamped - 1) * 100
+  
+  list(
+    factor      = factor_clamped,
+    delta_pct   = delta_pct_final,
+    diff_dias   = diff_dias,
+    frec_base   = frec_base,
+    dias_int    = round(frec_base + diff_dias, 1),
+    elasticidad = elasticidad_pct
+  )
+}
+
 id_input_frec_mod <- function(m, v) {
   mod_clean <- gsub("[^A-Za-z0-9]", "_", trimws(as.character(m)))
   var_clean <- gsub("[^A-Za-z0-9]", "_", limpiar_variedad(v))
@@ -470,7 +538,7 @@ guardar_modo_frecuencia_disco <- function(modo) {
 desplazar_dia_frecuencia <- function(dia_base_vec, frec_vec, dias_nombres, dia_inicio_idx, dia_inicio_nom, dia_fin_idx = 6L, dia_fin_nom = "Sábado") {
   idx_base <- match(dia_base_vec, dias_nombres)
   frec_int <- as.integer(frec_vec)
-  desp <- ifelse(frec_int <= 4L, frec_int, frec_int - 7L)
+  desp <- frec_int - 7L
   idx_target <- pmin(dia_fin_idx, pmax(1L, idx_base + desp))
   dia_target <- ifelse(is.na(idx_target), dia_inicio_nom, dias_nombres[idx_target])
   dia_res <- ifelse(is.na(idx_target) | idx_target < dia_inicio_idx, dia_inicio_nom, dia_target)
@@ -1086,19 +1154,25 @@ optimizar_dias_maduracion <- function(df_cosecha, df_conteo, campana = 2026, mod
     return(list(opt_dias = 45L, r = NA_real_, sem_shift = 6L, mensaje = "Sin datos"))
   }
   
-  camp_chr <- as.character(campana)
-  camp_num <- suppressWarnings(as.numeric(camp_chr))
-  mod_chr  <- trimws(as.character(modulo))
-  tur_chr  <- trimws(as.character(turno))
+  camp_chr  <- as.character(campana)
+  camp_num  <- suppressWarnings(as.numeric(camp_chr))
+  mod_chr   <- trimws(as.character(modulo))
+  tur_chr   <- trimws(as.character(turno))
+  var_clean <- if (!is.null(variedad) && nzchar(variedad)) toupper(trimws(as.character(variedad))) else NULL
   
-  df_y <- df_cosecha %>%
+  df_y_sub <- df_cosecha %>%
     filter(
       (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
       trimws(as.character(Módulo)) == mod_chr,
       trimws(as.character(Turno)) == tur_chr,
       !coalesce(Es_Testblock, FALSE),
       `Kg Total` > 0
-    ) %>%
+    )
+  if (!is.null(var_clean)) {
+    df_y_sub <- df_y_sub %>% filter(limpiar_variedad(Variedad) == limpiar_variedad(var_clean))
+  }
+  
+  df_y <- df_y_sub %>%
     mutate(Semana_Num = suppressWarnings(as.numeric(Semana))) %>%
     filter(!is.na(Semana_Num)) %>%
     group_by(Semana_Num) %>%
@@ -1110,13 +1184,17 @@ optimizar_dias_maduracion <- function(df_cosecha, df_conteo, campana = 2026, mod
     )
   
   if (nrow(df_y) < 3) {
-    df_y <- df_cosecha %>%
+    df_y_mod <- df_cosecha %>%
       filter(
         (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
         trimws(as.character(Módulo)) == mod_chr,
         !coalesce(Es_Testblock, FALSE),
         `Kg Total` > 0
-      ) %>%
+      )
+    if (!is.null(var_clean)) {
+      df_y_mod <- df_y_mod %>% filter(limpiar_variedad(Variedad) == limpiar_variedad(var_clean))
+    }
+    df_y <- df_y_mod %>%
       mutate(Semana_Num = suppressWarnings(as.numeric(Semana))) %>%
       filter(!is.na(Semana_Num)) %>%
       group_by(Semana_Num) %>%
@@ -1128,12 +1206,17 @@ optimizar_dias_maduracion <- function(df_cosecha, df_conteo, campana = 2026, mod
       )
   }
   
-  df_c <- df_conteo %>%
+  df_c_sub <- df_conteo %>%
     filter(
       (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
       trimws(as.character(Módulo)) == mod_chr,
       trimws(as.character(Turno)) == tur_chr
-    ) %>%
+    )
+  if (!is.null(var_clean)) {
+    df_c_sub <- df_c_sub %>% filter(limpiar_variedad(Variedad) == limpiar_variedad(var_clean))
+  }
+  
+  df_c <- df_c_sub %>%
     mutate(Semana_Num = suppressWarnings(as.numeric(Semana))) %>%
     filter(!is.na(Semana_Num)) %>%
     group_by(Semana_Num) %>%
@@ -1145,11 +1228,15 @@ optimizar_dias_maduracion <- function(df_cosecha, df_conteo, campana = 2026, mod
     )
   
   if (nrow(df_c) < 3) {
-    df_c <- df_conteo %>%
+    df_c_mod <- df_conteo %>%
       filter(
         (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
         trimws(as.character(Módulo)) == mod_chr
-      ) %>%
+      )
+    if (!is.null(var_clean)) {
+      df_c_mod <- df_c_mod %>% filter(limpiar_variedad(Variedad) == limpiar_variedad(var_clean))
+    }
+    df_c <- df_c_mod %>%
       mutate(Semana_Num = suppressWarnings(as.numeric(Semana))) %>%
       filter(!is.na(Semana_Num)) %>%
       group_by(Semana_Num) %>%
@@ -1193,15 +1280,144 @@ optimizar_dias_maduracion <- function(df_cosecha, df_conteo, campana = 2026, mod
 # ==============================================================================
 # MOTOR DE FRECUENCIA AUTOMÁTICA POR VÁLVULA (HISTÓRICO 2 SEMANAS: S-2 vs S-1)
 # ==============================================================================
-calcular_frecuencias_valvula_2semanas <- function(df_cosecha, campana_sel, sem_actual) {
-  if (is.null(df_cosecha) || !is.data.frame(df_cosecha) || nrow(df_cosecha) == 0) return(tibble())
-  
-  sem_act <- as.numeric(sem_actual)
+calcular_frecuencias_valvula_2semanas <- function(df_cosecha, campana_sel, sem_actual, df_wide = NULL) {
+  sem_act <- suppressWarnings(as.numeric(sem_actual))
   if (is.na(sem_act) || sem_act <= 0) sem_act <- lubridate::isoweek(Sys.Date())
   
-  ord_sel <- orden_semana_campana(sem_act)
+  ord_sel  <- orden_semana_campana(sem_act)
   camp_chr <- as.character(campana_sel)
   camp_num <- suppressWarnings(as.numeric(camp_chr))
+  es_camp_2026 <- grepl("2026|^26", camp_chr)
+  dias_nombres <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo")
+  
+  if (is.null(df_wide) && exists("df_hist_oficial_wide")) {
+    df_wide <- df_hist_oficial_wide
+  }
+  
+  # 1. Cálculo prioritario sobre df_hist_oficial_wide (100% homologado con Codigo_Valv oficial)
+  if (!is.null(df_wide) && is.data.frame(df_wide) && nrow(df_wide) > 0 && "Codigo_Valv" %in% names(df_wide)) {
+    sems_w <- sort(unique(suppressWarnings(as.numeric(df_wide$Semana))))
+    ords_w <- orden_semana_campana(sems_w)
+    ords_prev_w <- sort(ords_w[ords_w < ord_sel], decreasing = TRUE)
+    
+    if (length(ords_prev_w) >= 1) {
+      sem_s1 <- sems_w[match(ords_prev_w[1], ords_w)]
+      sem_s2 <- if (length(ords_prev_w) >= 2) sems_w[match(ords_prev_w[2], ords_w)] else NA_real_
+      cols_kg_d <- intersect(paste0("Kg_", dias_nombres), names(df_wide))
+      
+      if (length(cols_kg_d) > 0) {
+        extraer_dias_wide <- function(df_sem) {
+          if (nrow(df_sem) == 0) return(tibble())
+          mat_k <- as.matrix(df_sem[, cols_kg_d, drop = FALSE])
+          mat_k[is.na(mat_k)] <- 0
+          dias_col_nom <- sub("^Kg_", "", cols_kg_d)
+          dias_col_idx <- match(dias_col_nom, dias_nombres)
+          
+          min_idx <- apply(mat_k, 1, function(r) {
+            pos <- which(r > 0)
+            if (length(pos) == 0) return(NA_integer_)
+            min(dias_col_idx[pos])
+          })
+          max_idx <- apply(mat_k, 1, function(r) {
+            pos <- which(r > 0)
+            if (length(pos) == 0) return(NA_integer_)
+            max(dias_col_idx[pos])
+          })
+          
+          df_sem %>%
+            mutate(
+              codigo_norm = norm_codigo_valvula(Codigo_Valv),
+              Turno_num   = suppressWarnings(as.numeric(Turno_Norm)),
+              Módulo_c    = case_when(
+                es_camp_2026 & Módulo_Norm %in% c("13.1", "13.2") ~ "13",
+                es_camp_2026 & Módulo_Norm %in% c("14.1", "14.2") ~ "14",
+                Módulo_Norm == "9" & between(Turno_num, 1, 11)  ~ "9.2",
+                Módulo_Norm == "9" & Turno_num >= 12            ~ "9.1",
+                Módulo_Norm == "11" & between(Turno_num, 1, 12) ~ "11.1",
+                Módulo_Norm == "11" & Turno_num >= 13           ~ "11.2",
+                TRUE                                            ~ trimws(as.character(Módulo_Norm))
+              ),
+              Turno_c    = trimws(as.character(Turno_Norm)),
+              Variedad_c = limpiar_variedad(Variedad),
+              Dia_Min    = min_idx,
+              Dia_Max    = max_idx
+            ) %>%
+            filter(!is.na(Dia_Max), !is.na(codigo_norm), nzchar(codigo_norm)) %>%
+            group_by(codigo_norm, Módulo_c, Turno_c, Variedad_c) %>%
+            summarise(
+              Dia_Min = min(Dia_Min, na.rm = TRUE),
+              Dia_Max = max(Dia_Max, na.rm = TRUE),
+              .groups = "drop"
+            )
+        }
+        
+        w_s1 <- extraer_dias_wide(df_wide %>% filter(as.numeric(Semana) == sem_s1)) %>%
+          rename(Dia_Min_S1 = Dia_Min, Dia_Max_S1 = Dia_Max)
+        w_s2 <- if (!is.na(sem_s2)) {
+          extraer_dias_wide(df_wide %>% filter(as.numeric(Semana) == sem_s2)) %>%
+            select(codigo_norm, Variedad_c, Dia_Max_S2 = Dia_Max)
+        } else {
+          tibble(codigo_norm = character(), Variedad_c = character(), Dia_Max_S2 = integer())
+        }
+        
+        if (nrow(w_s1) > 0) {
+          w_join <- w_s1 %>%
+            left_join(w_s2, by = c("codigo_norm", "Variedad_c")) %>%
+            mutate(
+              int_p1             = ifelse(!is.na(Dia_Max_S2), (7 - Dia_Max_S2) + Dia_Min_S1, NA_real_),
+              int_p2             = ifelse((Dia_Max_S1 - Dia_Min_S1) >= 3L, as.numeric(Dia_Max_S1 - Dia_Min_S1), NA_real_),
+              Intervalo_Real     = case_when(
+                !is.na(int_p2) & !is.na(int_p1) ~ round((int_p1 + int_p2) / 2, 1),
+                !is.na(int_p2)                  ~ int_p2,
+                TRUE                            ~ int_p1
+              ),
+              Tiene_Intervalo_2S = !is.na(Intervalo_Real) & Intervalo_Real >= 2 & Intervalo_Real <= 18
+            )
+          
+          frec_turno_fb <- w_join %>%
+            filter(Tiene_Intervalo_2S) %>%
+            group_by(Módulo_c, Turno_c, Variedad_c) %>%
+            summarise(Frec_Med_Turno = round(mean(Intervalo_Real, na.rm = TRUE), 1), .groups = "drop")
+          
+          frec_modvar_fb <- w_join %>%
+            filter(Tiene_Intervalo_2S) %>%
+            group_by(Módulo_c, Variedad_c) %>%
+            summarise(Frec_Med_ModVar = round(median(Intervalo_Real, na.rm = TRUE), 1), .groups = "drop")
+          
+          frec_var_fb <- w_join %>%
+            filter(Tiene_Intervalo_2S) %>%
+            group_by(Variedad_c) %>%
+            summarise(Frec_Med_Var = round(median(Intervalo_Real, na.rm = TRUE), 1), .groups = "drop")
+          
+          res_wide <- w_join %>%
+            left_join(frec_turno_fb, by = c("Módulo_c", "Turno_c", "Variedad_c")) %>%
+            left_join(frec_modvar_fb, by = c("Módulo_c", "Variedad_c")) %>%
+            left_join(frec_var_fb, by = "Variedad_c") %>%
+            mutate(
+              Frec_Fallback      = coalesce(Frec_Med_Turno, Frec_Med_ModVar, Frec_Med_Var, ifelse(Variedad_c == "ROCIO", 4, 7)),
+              Frec_S1_Exacta     = ifelse(Tiene_Intervalo_2S, as.numeric(Intervalo_Real), as.numeric(Frec_Fallback)),
+              Dias_Frecuencia    = as.integer(round(Frec_S1_Exacta)),
+              Dia_Nom_S1         = dias_nombres[pmin(7L, pmax(1L, Dia_Max_S1))],
+              Wday_Proy          = pmin(6L, pmax(1L, Dia_Max_S1 + Dias_Frecuencia - 7L)),
+              Dia_Proyectado_Nom = dias_nombres[Wday_Proy],
+              Fecha_S1           = as.Date(NA),
+              Fecha_S2           = as.Date(NA),
+              Metodo_Frec        = ifelse(Tiene_Intervalo_2S, "2 Semanas Histórico (Válvula)", "Mediana Módulo/Variedad S-1")
+            ) %>%
+            select(
+              codigo_norm, Módulo = Módulo_c, Turno = Turno_c, Variedad = Variedad_c,
+              Fecha_S1, Fecha_S2, Dia_Nom_S1, Dias_Frecuencia, Frec_S1_Exacta,
+              Dia_Proyectado_Nom, Metodo_Frec, Tiene_Intervalo_2S
+            )
+          
+          return(res_wide)
+        }
+      }
+    }
+  }
+  
+  # 2. Fallback sobre df_cosecha
+  if (is.null(df_cosecha) || !is.data.frame(df_cosecha) || nrow(df_cosecha) == 0) return(tibble())
   
   df_c_camp <- df_cosecha %>%
     filter(
@@ -1209,92 +1425,187 @@ calcular_frecuencias_valvula_2semanas <- function(df_cosecha, campana_sel, sem_a
       coalesce(Tipo_Cosecha, "Comercial") == "Comercial",
       `Kg Total` > 0
     )
-  
   if (nrow(df_c_camp) == 0) return(tibble())
   
   sems_disponibles <- sort(unique(suppressWarnings(as.numeric(df_c_camp$Semana))))
   ords_disponibles <- orden_semana_campana(sems_disponibles)
-  
   ords_prev <- sort(ords_disponibles[ords_disponibles < ord_sel], decreasing = TRUE)
   if (length(ords_prev) == 0) return(tibble())
   
-  ord_s1 <- ords_prev[1]
-  ord_s2 <- if (length(ords_prev) >= 2) ords_prev[2] else NA_real_
-  
-  sem_s1 <- sems_disponibles[match(ord_s1, ords_disponibles)]
-  sem_s2 <- if (!is.na(ord_s2)) sems_disponibles[match(ord_s2, ords_disponibles)] else NA_real_
-  
-  dias_nombres <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo")
+  sem_s1 <- sems_disponibles[match(ords_prev[1], ords_disponibles)]
+  sem_s2 <- if (length(ords_prev) >= 2) sems_disponibles[match(ords_prev[2], ords_disponibles)] else NA_real_
   
   df_sub <- df_c_camp %>%
     filter(Semana %in% c(sem_s1, sem_s2)) %>%
     mutate(
       Fecha_D     = as.Date(Fecha),
       Turno_num   = suppressWarnings(as.numeric(Turno)),
+      Módulo_raw  = trimws(as.character(Módulo)),
       Módulo_c    = case_when(
-        Módulo %in% c("13.1", "13.2") ~ "13",
-        Módulo %in% c("14.1", "14.2") ~ "14",
-        Módulo == "9" & between(Turno_num, 1, 11)  ~ "9.2",
-        Módulo == "9" & Turno_num >= 12            ~ "9.1",
-        Módulo == "11" & between(Turno_num, 1, 12) ~ "11.1",
-        Módulo == "11" & Turno_num >= 13           ~ "11.2",
-        TRUE                                       ~ trimws(as.character(Módulo))
+        Módulo_raw %in% c("13.1", "13.2") ~ "13",
+        Módulo_raw %in% c("14.1", "14.2") ~ "14",
+        Módulo_raw == "9" & between(Turno_num, 1, 11)  ~ "9.2",
+        Módulo_raw == "9" & Turno_num >= 12            ~ "9.1",
+        Módulo_raw == "11" & between(Turno_num, 1, 12) ~ "11.1",
+        Módulo_raw == "11" & Turno_num >= 13           ~ "11.2",
+        TRUE                                           ~ Módulo_raw
       ),
-      codigo_norm = norm_codigo_valvula(paste(Módulo_c, Turno, Válvula, sep = "-")),
+      Turno_c     = trimws(as.character(Turno)),
+      valv_clean  = sub("^V0*", "", toupper(trimws(as.character(Válvula)))),
+      codigo_norm = norm_codigo_valvula(paste0("M", Módulo_raw, "-T", Turno_c, "-V", valv_clean)),
       Semana_num  = suppressWarnings(as.numeric(Semana)),
       Variedad_c  = limpiar_variedad(Variedad)
     )
-  
   if (nrow(df_sub) == 0) return(tibble())
   
   v_s2 <- if (!is.na(sem_s2)) {
     df_sub %>%
       filter(Semana_num == sem_s2) %>%
-      group_by(codigo_norm) %>%
+      group_by(codigo_norm, Variedad_c) %>%
       summarise(Fecha_S2 = max(Fecha_D), .groups = "drop")
   } else {
-    tibble(codigo_norm = character(), Fecha_S2 = as.Date(character()))
+    tibble(codigo_norm = character(), Variedad_c = character(), Fecha_S2 = as.Date(character()))
   }
   
   v_s1 <- df_sub %>%
     filter(Semana_num == sem_s1) %>%
-    group_by(codigo_norm, Variedad = Variedad_c) %>%
+    group_by(codigo_norm, Módulo = Módulo_c, Turno = Turno_c, Variedad = Variedad_c) %>%
     summarise(
-      Fecha_S1   = max(Fecha_D),
-      Dia_Nom_S1 = dias_nombres[lubridate::wday(max(Fecha_D), week_start = 1)],
-      .groups    = "drop"
+      Fecha_Min_S1 = min(Fecha_D),
+      Fecha_S1     = max(Fecha_D),
+      Dia_Nom_S1   = dias_nombres[lubridate::wday(max(Fecha_D), week_start = 1)],
+      .groups      = "drop"
     )
   
-  # Frecuencia mediana por variedad (fallback si la válvula no estuvo en S-2)
   frec_var_fallback <- v_s1 %>%
-    left_join(v_s2, by = "codigo_norm") %>%
+    left_join(v_s2, by = c("codigo_norm", "Variedad" = "Variedad_c")) %>%
     filter(!is.na(Fecha_S2)) %>%
-    mutate(diff_d = as.numeric(Fecha_S1 - Fecha_S2)) %>%
+    mutate(diff_d = as.numeric(Fecha_Min_S1 - Fecha_S2)) %>%
     filter(diff_d >= 2, diff_d <= 18) %>%
     group_by(Variedad) %>%
-    summarise(
-      Frec_Mediana_Var = round(median(diff_d)),
-      .groups = "drop"
-    )
+    summarise(Frec_Mediana_Var = round(median(diff_d), 1), .groups = "drop")
   
   res <- v_s1 %>%
-    left_join(v_s2, by = "codigo_norm") %>%
+    left_join(v_s2, by = c("codigo_norm", "Variedad" = "Variedad_c")) %>%
     left_join(frec_var_fallback, by = "Variedad") %>%
     mutate(
       Frec_Mediana_Var   = coalesce(Frec_Mediana_Var, ifelse(Variedad == "ROCIO", 4, 7)),
-      Intervalo_Real     = as.numeric(Fecha_S1 - Fecha_S2),
+      Intervalo_Real     = as.numeric(Fecha_Min_S1 - Fecha_S2),
       Tiene_Intervalo_2S = !is.na(Intervalo_Real) & Intervalo_Real >= 2 & Intervalo_Real <= 18,
-      Dias_Frecuencia    = ifelse(Tiene_Intervalo_2S, as.integer(round(Intervalo_Real)), as.integer(Frec_Mediana_Var)),
-      # Fecha proyectada para la semana actual según frecuencia real
+      Frec_S1_Exacta     = ifelse(Tiene_Intervalo_2S, as.numeric(Intervalo_Real), as.numeric(Frec_Mediana_Var)),
+      Dias_Frecuencia    = as.integer(round(Frec_S1_Exacta)),
       Fecha_Proyectada_S = Fecha_S1 + Dias_Frecuencia,
       Wday_Proy          = lubridate::wday(Fecha_Proyectada_S, week_start = 1),
-      Dia_Proyectado_Nom = ifelse(Wday_Proy <= 7, dias_nombres[Wday_Proy], "Sábado"),
+      Dia_Proyectado_Nom = ifelse(Wday_Proy <= 6, dias_nombres[Wday_Proy], "Sábado"),
       Metodo_Frec        = ifelse(Tiene_Intervalo_2S, "2 Semanas Histórico (Válvula)", "Mediana Variedad Reciente")
     )
   
-  res %>% select(codigo_norm, Variedad, Fecha_S1, Fecha_S2, Dias_Frecuencia, Dia_Proyectado_Nom, Metodo_Frec, Tiene_Intervalo_2S)
+  res %>% select(
+    codigo_norm, Módulo, Turno, Variedad,
+    Fecha_S1, Fecha_S2, Dia_Nom_S1, Dias_Frecuencia, Frec_S1_Exacta,
+    Dia_Proyectado_Nom, Metodo_Frec, Tiene_Intervalo_2S
+  )
 }
 
+# Helper para obtener el contexto de Frecuencia S-1, Día S-1 y Rendimiento S-1 de un turno específico
+obtener_contexto_frecuencia_turno <- function(mod_sel, turno_sel, var_sel, sem_sel, camp_sel, dia_origen_nom = NULL, df_cosecha_in = NULL, df_frec_mv_in = NULL) {
+  mod_clean   <- trimws(as.character(mod_sel))
+  turno_clean <- trimws(as.character(turno_sel))
+  var_clean   <- limpiar_variedad(var_sel)
+  sem_num     <- suppressWarnings(as.numeric(sem_sel))
+  dias_nombres <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
+  dias_map     <- setNames(1:6, dias_nombres)
+  
+  frec_def <- if (var_clean == "ROCIO") 4.0 else 7.0
+  frec_cfg <- frec_def
+  if (!is.null(df_frec_mv_in) && is.data.frame(df_frec_mv_in) && nrow(df_frec_mv_in) > 0) {
+    m_row <- df_frec_mv_in %>%
+      filter(trimws(as.character(Módulo)) == mod_clean, limpiar_variedad(Variedad) == var_clean)
+    if (nrow(m_row) > 0 && !is.na(m_row$Frecuencia_Dias[1])) {
+      frec_cfg <- as.numeric(m_row$Frecuencia_Dias[1])
+    }
+  }
+  
+  df_2s <- tryCatch(calcular_frecuencias_valvula_2semanas(df_cosecha_in, camp_sel, sem_num), error = function(e) tibble())
+  frec_s1 <- frec_def
+  dia_s1  <- NA_character_
+  
+  if (!is.null(df_2s) && nrow(df_2s) > 0 && all(c("Módulo", "Turno", "Variedad", "Frec_S1_Exacta") %in% names(df_2s))) {
+    sub_t <- df_2s %>% filter(Módulo == mod_clean, Turno == turno_clean, Variedad == var_clean)
+    if (nrow(sub_t) > 0) {
+      frec_s1 <- round(mean(sub_t$Frec_S1_Exacta, na.rm = TRUE), 1)
+      d_tab <- table(na.omit(sub_t$Dia_Nom_S1))
+      if (length(d_tab) > 0) dia_s1 <- names(d_tab)[which.max(d_tab)]
+    } else {
+      sub_mv <- df_2s %>% filter(Módulo == mod_clean, Variedad == var_clean)
+      if (nrow(sub_mv) > 0) {
+        frec_s1 <- round(median(sub_mv$Frec_S1_Exacta, na.rm = TRUE), 1)
+      }
+    }
+  }
+  if (is.na(frec_s1) || frec_s1 <= 0) frec_s1 <- frec_def
+  
+  # Rendimiento real de S-1 para este turno
+  rend_s1 <- 0
+  if (exists("df_hist_oficial_wide") && !is.null(df_hist_oficial_wide) && nrow(df_hist_oficial_wide) > 0) {
+    ord_sel <- orden_semana_campana(sem_num)
+    sems_w  <- sort(unique(suppressWarnings(as.numeric(df_hist_oficial_wide$Semana))))
+    ords_w  <- orden_semana_campana(sems_w)
+    ords_p  <- sort(ords_w[ords_w < ord_sel], decreasing = TRUE)
+    if (length(ords_p) >= 1) {
+      sem_ant <- sems_w[match(ords_p[1], ords_w)]
+      es_camp_2026 <- grepl("2026|^26", as.character(camp_sel))
+      sub_ant <- df_hist_oficial_wide %>%
+        filter(as.numeric(Semana) == sem_ant) %>%
+        mutate(
+          Turno_num = suppressWarnings(as.numeric(Turno_Norm)),
+          Módulo_c  = case_when(
+            es_camp_2026 & Módulo_Norm %in% c("13.1", "13.2") ~ "13",
+            es_camp_2026 & Módulo_Norm %in% c("14.1", "14.2") ~ "14",
+            Módulo_Norm == "9" & between(Turno_num, 1, 11)  ~ "9.2",
+            Módulo_Norm == "9" & Turno_num >= 12            ~ "9.1",
+            Módulo_Norm == "11" & between(Turno_num, 1, 12) ~ "11.1",
+            Módulo_Norm == "11" & Turno_num >= 13           ~ "11.2",
+            TRUE                                            ~ trimws(as.character(Módulo_Norm))
+          ),
+          Turno_c    = trimws(as.character(Turno_Norm)),
+          Variedad_c = limpiar_variedad(Variedad),
+          cod_norm   = norm_codigo_valvula(Codigo_Valv)
+        ) %>%
+        filter(Módulo_c == mod_clean, Turno_c == turno_clean, Variedad_c == var_clean)
+      
+      if (nrow(sub_ant) > 0) {
+        res_ant <- sub_ant %>%
+          group_by(cod_norm) %>%
+          summarise(
+            kg_v = sum(Kg_Total_Sem, na.rm = TRUE),
+            ha_v = max(coalesce(Ha_Total_Sem, Area_Ha), na.rm = TRUE),
+            .groups = "drop"
+          )
+        tot_ha <- sum(res_ant$ha_v, na.rm = TRUE)
+        tot_kg <- sum(res_ant$kg_v, na.rm = TRUE)
+        if (tot_ha > 0 && tot_kg > 0) rend_s1 <- round(tot_kg / tot_ha, 2)
+      }
+    }
+  }
+  
+  idx_s1   <- if (!is.na(dia_s1) && dia_s1 %in% names(dias_map)) as.integer(dias_map[dia_s1]) else NA_integer_
+  idx_orig <- if (!is.null(dia_origen_nom) && dia_origen_nom %in% names(dias_map)) as.integer(dias_map[dia_origen_nom]) else NA_integer_
+  
+  frec_origen <- if (!is.na(idx_s1) && !is.na(idx_orig)) {
+    as.numeric((7L - idx_s1) + idx_orig)
+  } else {
+    frec_cfg
+  }
+  
+  list(
+    frec_s1     = frec_s1,
+    dia_s1      = dia_s1,
+    rend_s1     = rend_s1,
+    frec_cfg    = frec_cfg,
+    frec_origen = frec_origen
+  )
+}
 # ==============================================================================
 # MOTOR DE TENDENCIA FLORAL SEGÚN MADURACIÓN (PREMIO / CASTIGO)
 # ==============================================================================
@@ -5813,6 +6124,10 @@ ui <- fluidPage(
                                       # Tarjeta 2: Factor floral de la semana en curso
                                       div(class = "slicer-card", style = "padding: 14px 16px; background: #FFFFFF; border-radius: 14px; border: 1px solid rgba(0,0,0,0.05); box-shadow: 0 1px 3px rgba(0,0,0,0.02);",
                                           uiOutput("ui_kpi_factor_floral_semana")
+                                      ),
+                                      # Tarjeta 3: Factor de rendimiento aplicado al turno para esa semana
+                                      div(class = "slicer-card", style = "padding: 14px 16px; background: #FFFFFF; border-radius: 14px; border: 1px solid rgba(0,0,0,0.05); box-shadow: 0 1px 3px rgba(0,0,0,0.02);",
+                                          uiOutput("ui_kpi_factor_rendimiento_turno_semana")
                                       )
                                   )
                            )
@@ -6001,6 +6316,8 @@ ui <- fluidPage(
 # ==============================================================================
 
 server <- function(input, output, session) {
+  dias_semana_nombres <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
+  
   # Reactive Values para datos de cosecha (Comercial aislado de Testblock) y ediciones manuales
   rv_cosecha           <- reactiveVal(df_cosecha_inicial)
   rv_cosecha_testblock <- reactiveVal(df_cosecha_testblock_ini)
@@ -6308,27 +6625,52 @@ server <- function(input, output, session) {
       ) %>%
       select(-any_of(c("Área_cat", "Área_Cat", "Tipo_cat")))
     
-    # 4B. Calcular Ha Recorrida desde Rutas de Campo (con fallback a SAP protegido por remanente)
-    # Si estamos en la semana actual en curso, Ha Recorrida toma SOLO los días previos al día de ajuste seleccionado
+    # 4B. Válvulas físicas oficiales de SAP y Kilos por día
+    # Ha Recorrida y Ha Real evalúan la semana completa de cosecha real (Lunes a Sábado),
+    # evitando cualquier distorsión por los selectores DESDE/HASTA de la simulación de ajuste.
     dias_nombres_u   <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
     es_campana_act_u <- grepl("2026|^26", as.character(input$filtro_campana))
-    sem_actual_num_u <- lubridate::isoweek(Sys.Date())
-    permitir_cualquier_sem_u <- is.null(input$switch_ajuste_cualquier_semana) || isTRUE(input$switch_ajuste_cualquier_semana)
-    es_semana_act_u  <- (as.numeric(input$filtro_semana) == sem_actual_num_u) || permitir_cualquier_sem_u
-    
-    d_ini_u <- if (es_campana_act_u && es_semana_act_u && !is.null(input$ajustar_desde_dia) && input$ajustar_desde_dia %in% dias_nombres_u) {
-      input$ajustar_desde_dia
-    } else {
-      "Sábado"
-    }
-    idx_ini_u <- match(d_ini_u, dias_nombres_u)
-    dias_previos_u <- if (es_campana_act_u && es_semana_act_u) {
-      if (!is.na(idx_ini_u) && idx_ini_u > 1) dias_nombres_u[1:(idx_ini_u - 1)] else character(0)
-    } else {
-      dias_nombres_u
-    }
-    cols_ha_prev_u <- paste0("Ha_", dias_previos_u)
-    
+    cols_ha_sem_u    <- paste0("Ha_", dias_nombres_u)
+    cols_kg_sem_u    <- paste0("Kg_", dias_nombres_u)
+
+    df_sap_sem_u <- if (exists("df_hist_oficial_wide") && !is.null(df_hist_oficial_wide) && nrow(df_hist_oficial_wide) > 0) {
+      cols_ha_sap_exist_u <- intersect(cols_ha_sem_u, names(df_hist_oficial_wide))
+      cols_kg_sap_exist_u <- intersect(cols_kg_sem_u, names(df_hist_oficial_wide))
+      
+      df_hist_oficial_wide %>%
+        filter(as.numeric(Semana) == as.numeric(input$filtro_semana)) %>%
+        mutate(
+          Turno_num_s = suppressWarnings(as.numeric(Turno_Norm)),
+          Módulo_s = case_when(
+            es_campana_act_u & Módulo_Norm %in% c("13.1", "13.2") ~ "13",
+            es_campana_act_u & Módulo_Norm %in% c("14.1", "14.2") ~ "14",
+            as.character(Módulo_Norm) == "9" & between(Turno_num_s, 1, 11)  ~ "9.2",
+            as.character(Módulo_Norm) == "9" & Turno_num_s >= 12            ~ "9.1",
+            as.character(Módulo_Norm) == "11" & between(Turno_num_s, 1, 12) ~ "11.1",
+            as.character(Módulo_Norm) == "11" & Turno_num_s >= 13           ~ "11.2",
+            TRUE                                                           ~ as.character(Módulo_Norm)
+          ),
+          Turno_s = as.character(Turno_Norm),
+          Var_s   = limpiar_variedad(Variedad),
+          cod_norm_s = norm_codigo_valvula(Codigo_Valv),
+          Tiene_Cosecha_Sem_Sap = (if (length(cols_ha_sap_exist_u) > 0) rowSums(across(all_of(cols_ha_sap_exist_u)), na.rm = TRUE) else 0) > 0 |
+            (if (length(cols_kg_sap_exist_u) > 0) rowSums(across(all_of(cols_kg_sap_exist_u)), na.rm = TRUE) else 0) > 0
+        )
+    } else tibble()
+
+    sap_valv_kg_dias <- if (nrow(df_sap_sem_u) > 0) {
+      df_sap_sem_u %>%
+        group_by(cod_norm_s) %>%
+        summarise(across(all_of(intersect(cols_kg_sem_u, names(df_sap_sem_u))), ~ sum(coalesce(.x, 0), na.rm = TRUE)), .groups = "drop")
+    } else tibble()
+
+    sap_turno_kg_dias <- if (nrow(df_sap_sem_u) > 0) {
+      df_sap_sem_u %>%
+        group_by(Módulo_s, Turno_s, Var_s) %>%
+        summarise(across(all_of(intersect(cols_kg_sem_u, names(df_sap_sem_u))), ~ sum(coalesce(.x, 0), na.rm = TRUE)), .groups = "drop")
+    } else tibble()
+
+    # 4C. Cargar Rutas de Cosecha de Campo (asociando avance físico únicamente a días con kilos pesados en SAP)
     rc_file_cand <- tryCatch(obtener_rutas_campo_en_vivo(input$filtro_semana), error = function(e) cargar_rutas_cosecha())
     if (is.null(rc_file_cand) || nrow(rc_file_cand) == 0) rc_file_cand <- tryCatch(cargar_rutas_cosecha(), error = function(e) NULL)
     rc_sem_u <- if (!is.null(rc_file_cand) && "Semana" %in% names(rc_file_cand)) {
@@ -6339,18 +6681,8 @@ server <- function(input, output, session) {
       rc_temp_u <- rc_sem_u %>%
         filter(!("Tipo_Registro" %in% names(.)) | Tipo_Registro != "Rectificacion")
       
-      # Acumular avance ejecutado previo a dia_inicio_u (solo días con kilos o Lunes/Martes en curso)
-      ha_prev_vec_u <- numeric(nrow(rc_temp_u))
-      for (d_prev in dias_previos_u) {
-        col_h <- paste0("Ha_", d_prev)
-        col_k <- paste0("Kg_", d_prev)
-        v_h   <- if (col_h %in% names(rc_temp_u)) coalesce(rc_temp_u[[col_h]], 0) else 0
-        v_k   <- if (col_k %in% names(rc_temp_u)) coalesce(rc_temp_u[[col_k]], 0) else 0
-        ha_prev_vec_u <- ha_prev_vec_u + v_h
-      }
-      rc_temp_u$Ha_Rc_Prev <- ha_prev_vec_u
-      
-      rc_temp_u %>%
+      col_cod_rc_u <- intersect(c("Codigo_Valvula", "codigo", "Codigo_Valv"), names(rc_temp_u))[1]
+      rc_temp_u <- rc_temp_u %>%
         mutate(
           Turno_num_rc = suppressWarnings(as.numeric(Turno)),
           Módulo_rc = case_when(
@@ -6364,14 +6696,40 @@ server <- function(input, output, session) {
           ),
           Turno_rc   = as.character(Turno),
           Var_rc     = limpiar_variedad(Variedad),
+          cod_norm_rc = if (!is.na(col_cod_rc_u)) norm_codigo_valvula(.data[[col_cod_rc_u]]) else character(nrow(.)),
           kg_tot_rc  = if ("Kg_Total_Prog" %in% names(.)) coalesce(Kg_Total_Prog, 0) else 0,
           num_pas_rc = if ("Num_Pasada" %in% names(.)) suppressWarnings(as.numeric(Num_Pasada)) else 1
-        ) %>%
+        )
+      
+      if (nrow(sap_valv_kg_dias) > 0) {
+        rc_temp_u <- rc_temp_u %>% left_join(sap_valv_kg_dias, by = c("cod_norm_rc" = "cod_norm_s"))
+      }
+      if (nrow(sap_turno_kg_dias) > 0) {
+        rc_temp_u <- rc_temp_u %>% left_join(sap_turno_kg_dias, by = c("Módulo_rc" = "Módulo_s", "Turno_rc" = "Turno_s", "Var_rc" = "Var_s"), suffix = c("", "_turno"))
+      }
+      
+      # Acumular avance ejecutado ÚNICAMENTE para los días que tienen kilos pesados en SAP
+      ha_sem_vec_u <- numeric(nrow(rc_temp_u))
+      for (d_sem in dias_nombres_u) {
+        col_h   <- paste0("Ha_", d_sem)
+        col_k   <- paste0("Kg_", d_sem)
+        col_k_t <- paste0("Kg_", d_sem, "_turno")
+        
+        v_h  <- if (col_h %in% names(rc_temp_u)) coalesce(rc_temp_u[[col_h]], 0) else 0
+        v_k  <- if (col_k %in% names(rc_temp_u)) coalesce(rc_temp_u[[col_k]], 0) else 0
+        v_kt <- if (col_k_t %in% names(rc_temp_u)) coalesce(rc_temp_u[[col_k_t]], 0) else 0
+        
+        tiene_kg <- (v_k > 0) | (v_kt > 0)
+        ha_sem_vec_u <- ha_sem_vec_u + if_else(tiene_kg, v_h, 0)
+      }
+      rc_temp_u$Ha_Rc_Sem <- ha_sem_vec_u
+      
+      rc_temp_u %>%
         group_by(Módulo_rc, Turno_rc, Var_rc) %>%
         summarise(
-          Ha_Rc          = sum(coalesce(Ha_Rc_Prev, 0), na.rm = TRUE),
-          Ha_Rc_1ra      = sum(ifelse(coalesce(num_pas_rc, 1) == 1, coalesce(Ha_Rc_Prev, 0), 0), na.rm = TRUE),
-          Ha_Rc_2da      = sum(ifelse(coalesce(num_pas_rc, 1) == 2, coalesce(Ha_Rc_Prev, 0), 0), na.rm = TRUE),
+          Ha_Rc          = sum(coalesce(Ha_Rc_Sem, 0), na.rm = TRUE),
+          Ha_Rc_1ra      = sum(ifelse(coalesce(num_pas_rc, 1) == 1, coalesce(Ha_Rc_Sem, 0), 0), na.rm = TRUE),
+          Ha_Rc_2da      = sum(ifelse(coalesce(num_pas_rc, 1) == 2, coalesce(Ha_Rc_Sem, 0), 0), na.rm = TRUE),
           Kg_Real_1ra_rc = sum(ifelse(num_pas_rc == 1, kg_tot_rc, 0), na.rm = TRUE),
           Kg_Real_2da_rc = sum(ifelse(num_pas_rc == 2, kg_tot_rc, 0), na.rm = TRUE),
           .groups        = "drop"
@@ -6387,7 +6745,7 @@ server <- function(input, output, session) {
       col_cod_p2_u <- intersect(c("Codigo_Valvula", "codigo", "Codigo_Valv"), names(rc_p2_u))[1]
       if (!is.na(col_cod_p2_u) && nrow(rc_p2_u) > 0) {
         rc_p2_u <- rc_p2_u %>% mutate(cod_norm_temp = norm_codigo_valvula(.data[[col_cod_p2_u]]))
-        for (d in c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")) {
+        for (d in dias_nombres_u) {
           d_sin <- chartr("áéíóúÁÉÍÓÚ", "aeiouAEIOU", tolower(d))
           has_adv <- (if (d %in% names(rc_p2_u)) coalesce(rc_p2_u[[d]], 0) > 0 else FALSE) |
                      (if (paste0("Ha_", d) %in% names(rc_p2_u)) coalesce(rc_p2_u[[paste0("Ha_", d)]], 0) > 0 else FALSE) |
@@ -6396,38 +6754,15 @@ server <- function(input, output, session) {
         }
       }
     }
-    for (d in c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")) {
+    for (d in dias_nombres_u) {
       if (is.null(valvs_dias_p2_u[[d]])) valvs_dias_p2_u[[d]] <- character(0)
     }
 
-    # 4C. Válvulas físicas oficiales de SAP (área real y desglose exacto de kilos SAP por pasada)
-    sap_ha_valvs_turno <- if (exists("df_hist_oficial_wide") && !is.null(df_hist_oficial_wide) && nrow(df_hist_oficial_wide) > 0) {
-      cols_ha_sap_exist_u <- intersect(cols_ha_prev_u, names(df_hist_oficial_wide))
-      cols_kg_sap_exist_u <- intersect(paste0("Kg_", dias_previos_u), names(df_hist_oficial_wide))
-      
-      df_sap_sem_u <- df_hist_oficial_wide %>%
-        filter(as.numeric(Semana) == as.numeric(input$filtro_semana)) %>%
-        mutate(
-          Turno_num_s = suppressWarnings(as.numeric(Turno_Norm)),
-          Módulo_s = case_when(
-            es_campana_2026 & Módulo_Norm %in% c("13.1", "13.2") ~ "13",
-            es_campana_2026 & Módulo_Norm %in% c("14.1", "14.2") ~ "14",
-            as.character(Módulo_Norm) == "9" & between(Turno_num_s, 1, 11)  ~ "9.2",
-            as.character(Módulo_Norm) == "9" & Turno_num_s >= 12            ~ "9.1",
-            as.character(Módulo_Norm) == "11" & between(Turno_num_s, 1, 12) ~ "11.1",
-            as.character(Módulo_Norm) == "11" & Turno_num_s >= 13           ~ "11.2",
-            TRUE                                                           ~ as.character(Módulo_Norm)
-          ),
-          Turno_s = as.character(Turno_Norm),
-          Var_s   = limpiar_variedad(Variedad),
-          cod_norm_s = norm_codigo_valvula(Codigo_Valv),
-          Tiene_Cosecha_Prev_Sap = (if (length(cols_ha_sap_exist_u) > 0) rowSums(across(all_of(cols_ha_sap_exist_u)), na.rm = TRUE) else 0) > 0 |
-            (if (length(cols_kg_sap_exist_u) > 0) rowSums(across(all_of(cols_kg_sap_exist_u)), na.rm = TRUE) else 0) > 0
-        )
-      
+    # Desglose de válvulas físicas oficiales de SAP (área real y desglose exacto de kilos SAP por pasada)
+    sap_ha_valvs_turno <- if (nrow(df_sap_sem_u) > 0) {
       kg_2da_vals_u <- numeric(nrow(df_sap_sem_u))
       kg_1ra_vals_u <- numeric(nrow(df_sap_sem_u))
-      for (d in dias_previos_u) {
+      for (d in dias_nombres_u) {
         col_k <- paste0("Kg_", d)
         if (col_k %in% names(df_sap_sem_u)) {
           val_k <- coalesce(df_sap_sem_u[[col_k]], 0)
@@ -6442,7 +6777,7 @@ server <- function(input, output, session) {
       df_sap_sem_u %>%
         group_by(Módulo_s, Turno_s, Var_s) %>%
         summarise(
-          Ha_Valvs_SAP = sum(Area_Ha[!duplicated(Codigo_Valv) & Tiene_Cosecha_Prev_Sap], na.rm = TRUE),
+          Ha_Valvs_SAP = sum(Area_Ha[!duplicated(Codigo_Valv) & Tiene_Cosecha_Sem_Sap], na.rm = TRUE),
           Kg_Real_2da_sap = sum(Kg_Real_2da_sap, na.rm = TRUE),
           Kg_Real_1ra_sap = sum(Kg_Real_1ra_sap, na.rm = TRUE),
           .groups = "drop"
@@ -6451,7 +6786,7 @@ server <- function(input, output, session) {
       tibble(Módulo_s = character(), Turno_s = character(), Var_s = character(), Ha_Valvs_SAP = numeric(), Kg_Real_2da_sap = numeric(), Kg_Real_1ra_sap = numeric())
     }
     
-    cols_dias_kg_u <- intersect(dias_previos_u, c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"))
+    cols_dias_kg_u <- intersect(c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"), names(universo))
     
     universo <- universo %>%
       left_join(rc_ha_turno, by = c("Módulo_join" = "Módulo_rc", "Turno_join" = "Turno_rc", "Variedad_join" = "Var_rc")) %>%
@@ -6463,25 +6798,48 @@ server <- function(input, output, session) {
         kg_sap_act   = if (length(cols_dias_kg_u) > 0) {
           rowSums(across(all_of(cols_dias_kg_u)), na.rm = TRUE)
         } else {
-          rowSums(across(all_of(intersect(c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"), names(.)))), na.rm = TRUE)
+          0
         },
         Kg_SAP_Real  = round(kg_sap_act, 2),
         rend_proy_u  = ifelse(!is.na(Proyección) & Proyección > 0 & Área > 0, Proyección / Área, 1),
         es_remanente_u = (Ha_Rc == 0 & Ha_Valvs_SAP == 0) & (kg_sap_act > 0) & 
           ((!is.na(Proyección) & Proyección > 0 & (kg_sap_act / Proyección) < 0.15) | (kg_sap_act / pmax(0.1, Área)) < 50),
+        # REGLA OPERATIVA ACP:
+        # Mandan las Ha de Campo (recorrido físico) y los Kilos de SAP.
+        # Si no hay kilos en SAP (kg_sap_act <= 0), no se consideran Ha reales cosechadas (0),
+        # quedando íntegramente disponibles como Ha para ajustar.
+        # Cuando sí hay kilos SAP: Ha_Rc_1ra tiene prioridad sobre el área de catálogo de válvulas.
         `Ha Real 1ª Pas` = case_when(
+          kg_sap_act <= 0  ~ 0,
           Ha_Rc_1ra > 0    ~ round(pmin(Área, Ha_Rc_1ra), 2),
           Ha_Valvs_SAP > 0 ~ round(pmin(Área, Ha_Valvs_SAP), 2),
           es_remanente_u   ~ round(pmin(Área, kg_sap_act / pmax(1, rend_proy_u)), 2),
-          kg_sap_act > 0   ~ round(pmin(Área, kg_sap_act / pmax(1, rend_proy_u)), 2),
-          TRUE             ~ 0
+          TRUE             ~ round(pmin(Área, kg_sap_act / pmax(1, rend_proy_u)), 2)
         ),
-        # Separacion de Ha Real por pasada (2a pasada solo ROCIO, segun rutas de campo)
-        `Ha Real 2ª Pas` = ifelse(coalesce(Ha_Rc_2da, 0) > 0, round(pmin(Área, Ha_Rc_2da), 2), 0),
-        `Ha Recorrida`   = round(`Ha Real 1ª Pas` + `Ha Real 2ª Pas`, 2)
+        # Separación de Ha Real por pasada (2ª pasada solo ROCIO, siempre que haya kilos en SAP)
+        `Ha Real 2ª Pas` = case_when(
+          kg_sap_act <= 0 ~ 0,
+          limpiar_variedad(Variedad) == "ROCIO" & coalesce(Ha_Rc_2da, 0) > 0 ~ round(pmin(Área, Ha_Rc_2da), 2),
+          TRUE ~ 0
+        ),
+        `Ha Recorrida`   = round(`Ha Real 1ª Pas` + `Ha Real 2ª Pas`, 2),
+        Kg_Real_Sem_Tot  = round(kg_sap_act, 2),
+        Kg_Real_2da_Sem  = case_when(
+          coalesce(Kg_Real_2da_sap, 0) > 0 ~ round(pmin(Kg_Real_Sem_Tot, Kg_Real_2da_sap), 2),
+          limpiar_variedad(Variedad) == "ROCIO" & `Ha Real 2ª Pas` > 0 & (`Ha Real 1ª Pas` + `Ha Real 2ª Pas`) > 0 ~ 
+            round(pmin(Kg_Real_Sem_Tot, Kg_Real_Sem_Tot * (`Ha Real 2ª Pas` / (`Ha Real 1ª Pas` + `Ha Real 2ª Pas`))), 2),
+          TRUE ~ 0
+        ),
+        Kg_Real_1ra_Sem  = round(pmax(0, Kg_Real_Sem_Tot - Kg_Real_2da_Sem), 2),
+        Kg_Ha_Real_1ra_Sem = case_when(
+          `Ha Real 1ª Pas` <= 0 ~ NA_real_,
+          `Ha Real 2ª Pas` <= 0 & Kg_Real_Sem_Tot > 0 ~ round(Kg_Real_Sem_Tot / `Ha Real 1ª Pas`, 2),
+          Kg_Real_1ra_Sem > 0 ~ round(Kg_Real_1ra_Sem / `Ha Real 1ª Pas`, 2),
+          TRUE ~ NA_real_
+        )
       ) %>%
       select(-any_of(c("Ha_Rc", "Ha_Rc_1ra", "Ha_Rc_2da", "Ha_Valvs_SAP", "kg_sap_act", "rend_proy_u", "es_remanente_u")))
-    
+
     # 5. Flags iniciales de bloqueo
     universo <- universo %>%
       mutate(
@@ -6532,32 +6890,42 @@ server <- function(input, output, session) {
       
       if (nrow(ed_filtradas) > 0) {
         dias_validos <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
-        # REGLA VISTA AJUSTADO (PURA):
-        # En modo ajustado, los días del escenario proyectado se inicializan vacíos (NA)
-        # para mostrar EXCLUSIVAMENTE los datos del ajuste (auto/manual).
-        # Los días previos al escenario (p. ej. Lunes si inicia Martes) conservan la báscula Real SAP.
-        if (modo_detalle == "ajustado") {
-          d_desde_sel <- if (!is.null(input$ajustar_desde_dia)) as.character(input$ajustar_desde_dia) else "Lunes"
-          esc_activo_id <- tryCatch(rv_escenario_activo_id(), error = function(e) "__actual__")
-          df_esc_reg    <- tryCatch(rv_escenarios(), error = function(e) tibble())
-          if (!is.null(esc_activo_id) && esc_activo_id != "__actual__" && nrow(df_esc_reg) > 0) {
-            f_esc <- df_esc_reg %>% filter(Id_Escenario == esc_activo_id)
-            if (nrow(f_esc) > 0 && !is.na(f_esc$Dia_Desde[1]) && nzchar(as.character(f_esc$Dia_Desde[1]))) {
+        d_desde_sel  <- if (!is.null(input$ajustar_desde_dia)) as.character(input$ajustar_desde_dia) else "Lunes"
+        d_hasta_sel  <- if (!is.null(input$ajustar_hasta_dia)) as.character(input$ajustar_hasta_dia) else "Sábado"
+        
+        esc_activo_id <- tryCatch(rv_escenario_activo_id(), error = function(e) "__actual__")
+        df_esc_reg    <- tryCatch(rv_escenarios(), error = function(e) tibble())
+        if (!is.null(esc_activo_id) && esc_activo_id != "__actual__" && nrow(df_esc_reg) > 0) {
+          f_esc <- df_esc_reg %>% filter(Id_Escenario == esc_activo_id)
+          if (nrow(f_esc) > 0) {
+            if (!is.na(f_esc$Dia_Desde[1]) && nzchar(as.character(f_esc$Dia_Desde[1]))) {
               d_desde_sel <- as.character(f_esc$Dia_Desde[1])
             }
-          }
-          idx_ini <- match(d_desde_sel, dias_validos)
-          if (is.na(idx_ini)) idx_ini <- 1
-          
-          # Limpiar días del escenario para que no se filtren kilos reales posteriores no proyectados
-          if (idx_ini <= 6) {
-            dias_a_limpiar <- dias_validos[idx_ini:6]
-            for (d_clean in dias_a_limpiar) {
-              universo[[d_clean]] <- NA_real_
-              universo[[paste0(d_clean, "_tipo")]]      <- "none"
-              universo[[paste0(d_clean, "_bloqueado")]] <- FALSE
-              universo[[paste0(d_clean, "_manual")]]    <- FALSE
+            if ("Dia_Hasta" %in% names(f_esc) && !is.na(f_esc$Dia_Hasta[1]) && nzchar(as.character(f_esc$Dia_Hasta[1]))) {
+              d_hasta_sel <- as.character(f_esc$Dia_Hasta[1])
             }
+          }
+        }
+        
+        idx_ini <- match(d_desde_sel, dias_validos)
+        idx_fin <- match(d_hasta_sel, dias_validos)
+        if (is.na(idx_ini)) idx_ini <- 1
+        if (is.na(idx_fin)) idx_fin <- 6
+        if (idx_fin < idx_ini) idx_fin <- idx_ini
+        
+        dias_en_rango    <- dias_validos[idx_ini:idx_fin]
+        dias_fuera_rango <- setdiff(dias_validos, dias_en_rango)
+        
+        # REGLA VISTA AJUSTADO (PURA):
+        # En modo ajustado, SOLO los días del rango proyectado [DESDE, HASTA] se inicializan vacíos (NA)
+        # para mostrar EXCLUSIVAMENTE los datos del ajuste (auto/manual).
+        # Los días fuera del rango de ajuste conservan íntegramente sus kilos reales de SAP.
+        if (modo_detalle == "ajustado") {
+          for (d_clean in dias_en_rango) {
+            universo[[d_clean]] <- NA_real_
+            universo[[paste0(d_clean, "_tipo")]]      <- "none"
+            universo[[paste0(d_clean, "_bloqueado")]] <- FALSE
+            universo[[paste0(d_clean, "_manual")]]    <- FALSE
           }
         }
         
@@ -6613,53 +6981,51 @@ server <- function(input, output, session) {
         claves_ed_mtv <- paste(trimws(as.character(ed_filtradas$Módulo)),
                                trimws(as.character(ed_filtradas$Turno)),
                                limpiar_variedad(ed_filtradas$Variedad), sep = "___")
-        dias_validos <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
         
-        for (i in seq_len(nrow(ed_filtradas))) {
-          tipo_i <- if ("Tipo_Edicion" %in% names(ed_filtradas)) coalesce(as.character(ed_filtradas$Tipo_Edicion[i]), "manual") else "manual"
-          
-          matches <- which(claves_u == claves_ed[i])
-          if (length(matches) == 0) {
-            matches <- which(claves_u_mtv == claves_ed_mtv[i])
-          }
-          if (length(matches) == 0) next
-          
-          # REGLA TESTBLOCK: Testblock NO se proyecta ni se ajusta automáticamente.
-          # Si la edición es automática (auto o ruta_sin_kg), nunca aplicar a filas de Testblock.
-          if (tipo_i %in% c("auto", "ruta_sin_kg")) {
-            matches_validos <- matches[coalesce(universo$Tipo[matches], "") != "Testblock"]
-            if (length(matches_validos) == 0) next
-            idx <- matches_validos[1]
-          } else {
-            idx <- matches[1]
-          }
-          
-          if (!is.na(idx)) {
-            campo_i <- ed_filtradas$Campo[i]
-            val_i   <- suppressWarnings(as.numeric(ed_filtradas$Valor[i]))
-            if (!is.na(val_i)) {
-              if (campo_i == "Proyección") {
-                if (!universo$Proy_bloqueado[idx]) {
-                  universo$Proyección[idx]  <- val_i
-                  universo$Proy_manual[idx] <- TRUE
-                }
-              } else if (campo_i %in% dias_validos) {
-                lock_col <- paste0(campo_i, "_bloqueado")
-                man_col  <- paste0(campo_i, "_manual")
-                tipo_col <- paste0(campo_i, "_tipo")
-                # En modo "real", el dato de SAP tiene prioridad si existe.
-                # En modo "ajustado", se sobrepone la asignación proyectada guardada del ajuste.
-                debe_aplicar <- if (modo_detalle == "ajustado") {
-                  TRUE
-                } else {
-                  !universo[[lock_col]][idx]
-                }
-                if (debe_aplicar) {
-                  universo[[campo_i]][idx]  <- val_i
-                  universo[[man_col]][idx]  <- (tipo_i == "manual")
-                  universo[[tipo_col]][idx] <- tipo_i
-                  if (modo_detalle == "ajustado" && tipo_i %in% c("auto", "ruta_sin_kg", "manual")) {
-                    universo[[lock_col]][idx] <- FALSE
+        # En modo "real", solo se muestran datos reales de SAP (no se aplican ajustes a los días).
+        # En modo "ajustado", se sobreponen las asignaciones proyectadas guardadas.
+        if (modo_detalle == "ajustado") {
+          for (i in seq_len(nrow(ed_filtradas))) {
+            tipo_i <- if ("Tipo_Edicion" %in% names(ed_filtradas)) coalesce(as.character(ed_filtradas$Tipo_Edicion[i]), "manual") else "manual"
+            
+            matches <- which(claves_u == claves_ed[i])
+            if (length(matches) == 0) {
+              matches <- which(claves_u_mtv == claves_ed_mtv[i])
+            }
+            if (length(matches) == 0) next
+            
+            # REGLA TESTBLOCK: Testblock NO se proyecta ni se ajusta automáticamente.
+            if (tipo_i %in% c("auto", "ruta_sin_kg")) {
+              matches_validos <- matches[coalesce(universo$Tipo[matches], "") != "Testblock"]
+              if (length(matches_validos) == 0) next
+              idx <- matches_validos[1]
+            } else {
+              idx <- matches[1]
+            }
+            
+            if (!is.na(idx)) {
+              campo_i <- ed_filtradas$Campo[i]
+              val_i   <- suppressWarnings(as.numeric(ed_filtradas$Valor[i]))
+              if (!is.na(val_i)) {
+                if (campo_i == "Proyección") {
+                  if (!universo$Proy_bloqueado[idx]) {
+                    universo$Proyección[idx]  <- val_i
+                    universo$Proy_manual[idx] <- TRUE
+                  }
+                } else if (campo_i %in% dias_validos) {
+                  # Ediciones manuales aplican en cualquier día; automáticas en dias_en_rango
+                  debe_aplicar <- (tipo_i == "manual") || (campo_i %in% dias_en_rango)
+                  if (debe_aplicar) {
+                    lock_col <- paste0(campo_i, "_bloqueado")
+                    man_col  <- paste0(campo_i, "_manual")
+                    tipo_col <- paste0(campo_i, "_tipo")
+                    
+                    universo[[campo_i]][idx]  <- val_i
+                    universo[[man_col]][idx]  <- (tipo_i == "manual")
+                    universo[[tipo_col]][idx] <- tipo_i
+                    if (tipo_i %in% c("auto", "ruta_sin_kg", "manual")) {
+                      universo[[lock_col]][idx] <- FALSE
+                    }
                   }
                 }
               }
@@ -6739,31 +7105,51 @@ server <- function(input, output, session) {
           2
         ),
         
+        # Kilos estimados de ruta de campo sin pesaje oficial en SAP
+        Kg_Ruta_Sin_Kg   = round(
+          ifelse(coalesce(Lunes_tipo, "") == "ruta_sin_kg", Lunes, 0) +
+          ifelse(coalesce(Martes_tipo, "") == "ruta_sin_kg", Martes, 0) +
+          ifelse(coalesce(Miércoles_tipo, "") == "ruta_sin_kg", Miércoles, 0) +
+          ifelse(coalesce(Jueves_tipo, "") == "ruta_sin_kg", Jueves, 0) +
+          ifelse(coalesce(Viernes_tipo, "") == "ruta_sin_kg", Viernes, 0) +
+          ifelse(coalesce(Sábado_tipo, "") == "ruta_sin_kg", Sábado, 0),
+          2
+        ),
+        
         # Desglose de pasadas de la cosecha real basado en cruce exacto válvula-día de SAP con campo
         Kg_Real_2da      = case_when(
-          coalesce(Kg_Real_2da_sap, 0) > 0 ~ 
-            round(pmin(Kg_SAP_Real, Kg_Real_2da_sap), 2),
+          coalesce(Kg_Real_2da_Sem, 0) > 0 ~ Kg_Real_2da_Sem,
+          coalesce(Kg_Real_2da_sap, 0) > 0 ~ round(pmin(Kg_SAP_Real, Kg_Real_2da_sap), 2),
           limpiar_variedad(Variedad) == "ROCIO" & coalesce(`Ha Real 2ª Pas`, 0) > 0 & coalesce(`Ha Real 1ª Pas` + `Ha Real 2ª Pas`, 0) > 0 ~ 
             round(pmin(Kg_SAP_Real, Kg_SAP_Real * (`Ha Real 2ª Pas` / (`Ha Real 1ª Pas` + `Ha Real 2ª Pas`))), 2),
           TRUE ~ 0
         ),
-        Kg_Real_1ra      = round(pmax(0, Kg_SAP_Real - Kg_Real_2da), 2),
-        # 1ª pasada neta
-        # (descontando 2ª pasada si hubo)
-        # end 1ra pasada
+        Kg_Real_1ra      = case_when(
+          coalesce(Kg_Real_1ra_Sem, 0) > 0 ~ Kg_Real_1ra_Sem,
+          TRUE ~ round(pmax(0, Kg_SAP_Real - Kg_Real_2da), 2)
+        ),
         
         `Kg/Ha Proy`     = ifelse(Área > 0 & !is.na(Proyección), round(Proyección / Área, 2), NA_real_),
-        `Kg/Ha Real`     = ifelse(coalesce(`Ha Recorrida`, 0) > 0 & coalesce(Kg_SAP_Real, 0) > 0, round(Kg_SAP_Real / `Ha Recorrida`, 2), NA_real_),
+        `Kg/Ha Real`     = case_when(
+          coalesce(`Ha Recorrida`, 0) > 0 & coalesce(Kg_SAP_Real, 0) > 0 ~ round(Kg_SAP_Real / `Ha Recorrida`, 2),
+          TRUE ~ NA_real_
+        ),
         `Kg/Ha Real 1ª Pas` = case_when(
+          !is.na(Kg_Ha_Real_1ra_Sem) ~ Kg_Ha_Real_1ra_Sem,
           coalesce(`Ha Real 1ª Pas`, 0) <= 0 ~ NA_real_,
           coalesce(`Ha Real 2ª Pas`, 0) <= 0 & coalesce(Kg_SAP_Real, 0) > 0 ~ round(Kg_SAP_Real / `Ha Real 1ª Pas`, 2),
           coalesce(Kg_Real_1ra, 0) > 0 ~ round(Kg_Real_1ra / `Ha Real 1ª Pas`, 2),
           TRUE ~ NA_real_
         ),
+        Kg_Ha_Real_1ra_tipo = case_when(
+          coalesce(Kg_SAP_Real, 0) > 0 | coalesce(Kg_Real_1ra, 0) > 0 ~ "sap",
+          TRUE ~ "none"
+        ),
         `Kg/Ha Real 2ª Pas` = ifelse(coalesce(`Ha Real 2ª Pas`, 0) > 0 & coalesce(Kg_Real_2da, 0) > 0, round(Kg_Real_2da / `Ha Real 2ª Pas`, 2), NA_real_),
         Diferencia       = ifelse(!is.na(Proyección), round(Ajuste - Proyección, 2), NA_real_),
         
-        Tiene_Dias_Ajustados = (Lunes_tipo %in% c("auto", "manual") |
+        Tiene_Dias_Ajustados = (modo_detalle == "ajustado") & (
+                                  Lunes_tipo %in% c("auto", "manual") |
                                   Martes_tipo %in% c("auto", "manual") |
                                   Miércoles_tipo %in% c("auto", "manual") |
                                   Jueves_tipo %in% c("auto", "manual") |
@@ -6772,6 +7158,7 @@ server <- function(input, output, session) {
         
         # 1ª Pasada Ajustada: Faltante para completar el turno físico
         `Ha Aj. 1ª Pas` = case_when(
+          modo_detalle == "real" ~ 0,
           Tipo == "Testblock" ~ 0,
           !Tiene_Dias_Ajustados ~ 0,
           limpiar_variedad(Variedad) != "ROCIO" & coalesce(Tiene_Ha_Asig, FALSE) & coalesce(Ha_Ajustada_Total, 0) > 0 ~ round(pmin(Área, Ha_Ajustada_Total), 2),
@@ -6787,6 +7174,7 @@ server <- function(input, output, session) {
         
         # 2ª Pasada Ajustada: Área que repite cosecha (exclusiva de ROCÍO)
         `Ha Aj. 2ª Pas` = case_when(
+          modo_detalle == "real" ~ 0,
           Tipo == "Testblock" ~ 0,
           limpiar_variedad(Variedad) != "ROCIO" ~ 0,
           !Tiene_Dias_Ajustados ~ 0,
@@ -6799,6 +7187,7 @@ server <- function(input, output, session) {
         # Kilos ajustados netos (excluyendo lo ya cosechado en real)
         kg_aj_neto_u = pmax(0, Ajuste - coalesce(Kg_SAP_Real, 0)),
         Kg_Aj_1ra = case_when(
+          modo_detalle == "real" ~ 0,
           Tipo == "Testblock" ~ 0,
           !Tiene_Dias_Ajustados ~ 0,
           limpiar_variedad(Variedad) != "ROCIO" ~ kg_aj_neto_u,
@@ -6809,6 +7198,7 @@ server <- function(input, output, session) {
           TRUE ~ kg_aj_neto_u
         ),
         Kg_Aj_2da = case_when(
+          modo_detalle == "real" ~ 0,
           Tipo == "Testblock" ~ 0,
           limpiar_variedad(Variedad) != "ROCIO" ~ 0,
           !Tiene_Dias_Ajustados ~ 0,
@@ -6826,6 +7216,7 @@ server <- function(input, output, session) {
         
         # Motivo del Ajuste para el turno
         `Motivo del Ajuste` = case_when(
+          modo_detalle == "real" ~ "-",
           Tipo == "Testblock" ~ "Testblock (no editable)",
           Lunes_manual | Martes_manual | Miércoles_manual | Jueves_manual | Viernes_manual | Sábado_manual ~ "Edición manual",
           !is.na(Motivo_Guardado) & nzchar(Motivo_Guardado) ~ Motivo_Guardado,
@@ -6844,8 +7235,7 @@ server <- function(input, output, session) {
           TRUE ~ "-"
         )
       ) %>%
-      select(-any_of(c("Ha_Ajustada_Total", "Tiene_Ha_Asig", "Tiene_Detalle_Pas", "Ha_Aj_1ra_Ed", "Kg_Aj_1ra_Ed", "Ha_Aj_2da_Ed", "Kg_Aj_2da_Ed", "Tiene_Dias_Ajustados", "Módulo_join", "Turno_join", "Variedad_join", "Motivo_Guardado", "Factor_Floral_u", "Tipo_Efecto_Floral_u")))
-    
+      select(-any_of(c("Ha_Ajustada_Total", "Tiene_Ha_Asig", "Tiene_Detalle_Pas", "Ha_Aj_1ra_Ed", "Kg_Aj_1ra_Ed", "Ha_Aj_2da_Ed", "Kg_Aj_2da_Ed", "Tiene_Dias_Ajustados", "Módulo_join", "Turno_join", "Variedad_join", "Motivo_Guardado", "Factor_Floral_u", "Tipo_Efecto_Floral_u", "Kg_Real_Sem_Tot", "Kg_Real_2da_Sem", "Kg_Real_1ra_Sem", "Kg_Ha_Real_1ra_Sem")))
     return(universo)
   })
   
@@ -7196,6 +7586,7 @@ server <- function(input, output, session) {
           Kg_Aj_1ra_tot       = sum(coalesce(Kg_Aj_1ra, 0), na.rm = TRUE),
           Kg_Aj_2da_tot       = sum(coalesce(Kg_Aj_2da, 0), na.rm = TRUE),
           Kg_SAP_Real         = round(sum(coalesce(Kg_SAP_Real, 0), na.rm = TRUE), 2),
+          Kg_Ruta_Sin_Kg      = round(sum(coalesce(Kg_Ruta_Sin_Kg, 0), na.rm = TRUE), 2),
           Kg_Real_1ra         = round(sum(coalesce(Kg_Real_1ra, 0), na.rm = TRUE), 2),
           Kg_Real_2da         = round(sum(coalesce(Kg_Real_2da, 0), na.rm = TRUE), 2),
           Proy_manual         = any(Proy_manual, na.rm = TRUE),
@@ -7233,8 +7624,21 @@ server <- function(input, output, session) {
         ) %>%
         mutate(
           `Kg/Ha Proy`       = ifelse(Área > 0 & Proyección > 0, round(Proyección / Área, 2), NA_real_),
-          `Kg/Ha Real`       = ifelse(`Ha Recorrida` > 0 & Kg_SAP_Real > 0, round(Kg_SAP_Real / `Ha Recorrida`, 2), NA_real_),
-          `Kg/Ha Real 1ª Pas` = case_when(`Ha Real 1ª Pas` <= 0 ~ NA_real_, `Ha Real 2ª Pas` <= 0 & Kg_SAP_Real > 0 ~ round(Kg_SAP_Real / `Ha Real 1ª Pas`, 2), Kg_Real_1ra > 0 ~ round(Kg_Real_1ra / `Ha Real 1ª Pas`, 2), TRUE ~ NA_real_),
+          `Kg/Ha Real`       = case_when(
+            `Ha Recorrida` > 0 & Kg_SAP_Real > 0 ~ round(Kg_SAP_Real / `Ha Recorrida`, 2),
+            TRUE ~ NA_real_
+          ),
+          `Kg/Ha Real 1ª Pas` = case_when(
+            `Ha Real 1ª Pas` <= 0 ~ NA_real_,
+            `Ha Real 2ª Pas` <= 0 & Kg_SAP_Real > 0 ~ round(Kg_SAP_Real / `Ha Real 1ª Pas`, 2),
+            Kg_Real_1ra > 0 ~ round(Kg_Real_1ra / `Ha Real 1ª Pas`, 2),
+            TRUE ~ NA_real_
+          ),
+          Kg_Ha_Real_1ra_tipo = case_when(
+            Kg_SAP_Real > 0 | Kg_Real_1ra > 0 ~ "sap",
+            modo_detalle == "ajustado" & coalesce(Kg_Ruta_Sin_Kg, 0) > 0 ~ "ruta_sin_kg",
+            TRUE ~ "none"
+          ),
           `Kg/Ha Real 2ª Pas` = ifelse(`Ha Real 2ª Pas` > 0 & Kg_Real_2da > 0, round(Kg_Real_2da / `Ha Real 2ª Pas`, 2), NA_real_),
           `Kg/Ha Aj. 1ª Pas` = ifelse(`Ha Aj. 1ª Pas` > 0 & Kg_Aj_1ra_tot > 0, round(Kg_Aj_1ra_tot / `Ha Aj. 1ª Pas`, 2), NA_real_),
           `Kg/Ha Aj. 2ª Pas` = ifelse(`Ha Aj. 2ª Pas` > 0 & Kg_Aj_2da_tot > 0, round(Kg_Aj_2da_tot / `Ha Aj. 2ª Pas`, 2), NA_real_),
@@ -7264,7 +7668,7 @@ server <- function(input, output, session) {
         Proy_bloqueado, Lunes_bloqueado, Martes_bloqueado, Miércoles_bloqueado, Jueves_bloqueado, Viernes_bloqueado, Sábado_bloqueado,
         Lunes_tipo, Martes_tipo, Miércoles_tipo, Jueves_tipo, Viernes_tipo, Sábado_tipo,
         Kg_SAP_Real, Kg_Real_1ra, Kg_Real_2da, Kg_Aj_1ra, Kg_Aj_2da, Kg_Aj_Total,
-        `Ha Recorrida`, `Kg/Ha Real`
+        `Ha Recorrida`, `Kg/Ha Real`, Kg_Ha_Real_1ra_tipo
       ) %>%
       arrange(
         suppressWarnings(as.numeric(Sector)), Sector,
@@ -7941,7 +8345,7 @@ server <- function(input, output, session) {
       formatStyle('Ha Real 2ª Pas', color = '#007AFF', fontWeight = '600') %>%
       formatStyle('Ha Aj. 1ª Pas', color = '#34C759', fontWeight = '600') %>%
       formatStyle('Ha Aj. 2ª Pas', color = '#34C759', fontWeight = '600') %>%
-      formatStyle('Kg/Ha Real 1ª Pas', color = '#007AFF', fontWeight = '600') %>%
+      formatStyle('Kg/Ha Real 1ª Pas', 'Kg_Ha_Real_1ra_tipo', color = styleEqual(c('ruta_sin_kg', 'sap', 'none'), c('#E11D48', '#007AFF', '#007AFF'), default = '#007AFF'), fontWeight = styleEqual(c('ruta_sin_kg', 'sap', 'none'), c('bold', '600', '600'), default = '600')) %>%
       formatStyle('Kg/Ha Real 2ª Pas', color = '#007AFF', fontWeight = '600') %>%
       formatStyle('Kg/Ha Aj. 1ª Pas', fontWeight = 'bold', color = '#34C759') %>%
       formatStyle('Kg/Ha Aj. 2ª Pas', fontWeight = 'bold', color = '#34C759') %>%
@@ -8118,27 +8522,137 @@ server <- function(input, output, session) {
         )
     } else tibble()
     
-    # 3. Calcular hectáreas consumidas en otros días y hectáreas disponibles para este turno
+    # 3. Calcular hectáreas consumidas en días previos reales y otros días de la semana
     ha_real_1ra <- coalesce(as.numeric(fila[['Ha Real 1ª Pas']]), 0)
     ha_real_2da <- coalesce(as.numeric(fila[['Ha Real 2ª Pas']]), 0)
+    dias_semana_todos <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
+    modo_det_act <- if (!is.null(input$filtro_modo_detalle)) as.character(input$filtro_modo_detalle) else "real"
     
-    ed_otros_dias <- if (!is.null(ed_actuales) && nrow(ed_actuales) > 0) {
-      ed_actuales %>%
+    dias_reales_previos <- character(0)
+    if (modo_det_act == "ajustado") {
+      d_desde_sel <- if (!is.null(input$ajustar_desde_dia)) as.character(input$ajustar_desde_dia) else "Lunes"
+      idx_desde <- match(d_desde_sel, dias_semana_todos)
+      if (is.na(idx_desde)) idx_desde <- 1
+      if (idx_desde > 1) {
+        dias_reales_previos <- dias_semana_todos[1:(idx_desde - 1)]
+      }
+    } else {
+      idx_col <- match(col_name, dias_semana_todos)
+      if (is.na(idx_col)) idx_col <- 1
+      if (idx_col > 1) {
+        dias_reales_previos <- dias_semana_todos[1:(idx_col - 1)]
+      }
+    }
+    
+    # Ha real ejecutada estrictamente en días previos consolidados para este turno
+    ha_real_prev_1ra <- 0
+    ha_real_prev_2da <- 0
+    if (length(dias_reales_previos) > 0) {
+      if (exists("df_hist_oficial_wide") && !is.null(df_hist_oficial_wide) && nrow(df_hist_oficial_wide) > 0) {
+        sub_sap_prev <- df_hist_oficial_wide %>%
+          filter(
+            as.numeric(Semana) == as.numeric(input$filtro_semana),
+            as.character(Módulo_Norm) == as.character(fila$Módulo),
+            as.character(Turno_Norm)  == as.character(fila$Turno),
+            limpiar_variedad(Variedad) == limpiar_variedad(fila$Variedad)
+          )
+        if (nrow(sub_sap_prev) > 0) {
+          cols_ha_prev <- intersect(paste0("Ha_", dias_reales_previos), names(sub_sap_prev))
+          if (length(cols_ha_prev) > 0) {
+            ha_tot_prev <- sum(rowSums(sub_sap_prev %>% select(all_of(cols_ha_prev)), na.rm = TRUE), na.rm = TRUE)
+            if (limpiar_variedad(fila$Variedad) == "ROCIO") {
+              ha_p2_prev <- sum(rowSums(sub_sap_prev %>% filter(coalesce(as.character(Pasada), "1") == "2") %>% select(all_of(cols_ha_prev)), na.rm = TRUE), na.rm = TRUE)
+              ha_real_prev_2da <- round(min(area_turno, ha_p2_prev), 2)
+              ha_real_prev_1ra <- round(min(area_turno, ha_tot_prev - ha_p2_prev), 2)
+            } else {
+              ha_real_prev_1ra <- round(min(area_turno, ha_tot_prev), 2)
+            }
+          }
+        }
+      }
+      if (ha_real_prev_1ra <= 0 && ha_real_prev_2da <= 0) {
+        rc_disco_prev <- tryCatch(cargar_rutas_cosecha(), error = function(e) NULL)
+        if (!is.null(rc_disco_prev) && nrow(rc_disco_prev) > 0 && "Semana" %in% names(rc_disco_prev)) {
+          rc_sub_prev <- rc_disco_prev %>%
+            filter(
+              as.numeric(Semana) == as.numeric(input$filtro_semana),
+              as.character(Módulo) == as.character(fila$Módulo),
+              as.character(Turno)  == as.character(fila$Turno),
+              limpiar_variedad(Variedad) == limpiar_variedad(fila$Variedad)
+            )
+          if (nrow(rc_sub_prev) > 0) {
+            cols_rc_prev <- intersect(paste0("Ha_", dias_reales_previos), names(rc_sub_prev))
+            if (length(cols_rc_prev) > 0) {
+              p1_rc <- rc_sub_prev %>% filter(coalesce(as.integer(Num_Pasada), 1L) == 1L)
+              p2_rc <- rc_sub_prev %>% filter(coalesce(as.integer(Num_Pasada), 1L) == 2L)
+              if (nrow(p1_rc) > 0) ha_real_prev_1ra <- round(min(area_turno, sum(rowSums(p1_rc %>% select(all_of(cols_rc_prev)), na.rm = TRUE), na.rm = TRUE)), 2)
+              if (nrow(p2_rc) > 0) ha_real_prev_2da <- round(min(area_turno, sum(rowSums(p2_rc %>% select(all_of(cols_rc_prev)), na.rm = TRUE), na.rm = TRUE)), 2)
+            }
+          }
+        }
+      }
+    }
+    
+    # Hectáreas asignadas en otros días de la semana (excluyendo el día actual que se edita)
+    dias_otros <- setdiff(dias_semana_todos, c(dias_reales_previos, col_name))
+    ha_man_otros_1ra <- 0
+    ha_man_otros_2da <- 0
+    ha_auto_otros_1ra <- 0
+    ha_auto_otros_2da <- 0
+    
+    # Manuales en otros días
+    if (!is.null(ed_actuales) && nrow(ed_actuales) > 0) {
+      ed_otros_dias <- ed_actuales %>%
         filter(
           as.character(Campaña) == as.character(input$filtro_campana),
           as.numeric(Semana)    == as.numeric(input$filtro_semana),
           as.character(Módulo)   == as.character(fila$Módulo),
           as.character(Turno)    == as.character(fila$Turno),
           limpiar_variedad(Variedad) == limpiar_variedad(fila$Variedad),
-          as.character(Campo)    != as.character(col_name),
+          as.character(Campo)    %in% dias_otros,
           coalesce(Tipo_Edicion, "") == "manual"
         )
-    } else tibble()
+      if (nrow(ed_otros_dias) > 0) {
+        ha_man_otros_1ra <- sum(coalesce(as.numeric(ed_otros_dias$Ha_Asignada_1ra), 0), na.rm = TRUE)
+        ha_man_otros_2da <- sum(coalesce(as.numeric(ed_otros_dias$Ha_Asignada_2da), 0), na.rm = TRUE)
+      }
+    }
     
-    ha_man_otros_1ra <- sum(coalesce(as.numeric(ed_otros_dias$Ha_Asignada_1ra), 0), na.rm = TRUE)
-    ha_man_otros_2da <- sum(coalesce(as.numeric(ed_otros_dias$Ha_Asignada_2da), 0), na.rm = TRUE)
+    # Válvulas de ajuste automático en otros días (si no fueron sobreescritas manualmente)
+    dias_man_otros <- if (!is.null(ed_actuales) && nrow(ed_actuales) > 0) {
+      unique(ed_actuales %>%
+        filter(
+          as.character(Campaña) == as.character(input$filtro_campana),
+          as.numeric(Semana)    == as.numeric(input$filtro_semana),
+          as.character(Módulo)   == as.character(fila$Módulo),
+          as.character(Turno)    == as.character(fila$Turno),
+          limpiar_variedad(Variedad) == limpiar_variedad(fila$Variedad),
+          as.character(Campo)    %in% dias_otros,
+          coalesce(Tipo_Edicion, "") == "manual"
+        ) %>% pull(Campo))
+    } else character(0)
     
-    ha_disponible_1ra <- max(0, round(area_turno - ha_real_1ra - ha_man_otros_1ra, 2))
+    dias_auto_otros <- setdiff(dias_otros, dias_man_otros)
+    if (length(dias_auto_otros) > 0 && !is.null(valvs_aj) && nrow(valvs_aj) > 0) {
+      valvs_otros <- valvs_aj %>%
+        filter(
+          as.character(Campaña) == as.character(input$filtro_campana),
+          as.numeric(Semana)    == as.numeric(input$filtro_semana),
+          as.character(Módulo)   == as.character(fila$Módulo),
+          as.character(Turno)    == as.character(fila$Turno),
+          limpiar_variedad(Variedad) == limpiar_variedad(fila$Variedad),
+          as.character(Dia_Asignado) %in% dias_auto_otros
+        )
+      if (nrow(valvs_otros) > 0) {
+        ha_auto_otros_1ra <- sum(valvs_otros$Ha_Asignada[coalesce(valvs_otros$Num_Pasada, 1L) == 1L], na.rm = TRUE)
+        ha_auto_otros_2da <- sum(valvs_otros$Ha_Asignada[coalesce(valvs_otros$Num_Pasada, 1L) == 2L], na.rm = TRUE)
+      }
+    }
+    
+    ha_consumida_otros_1ra <- round(ha_real_prev_1ra + ha_man_otros_1ra + ha_auto_otros_1ra, 2)
+    ha_consumida_otros_2da <- round(ha_real_prev_2da + ha_man_otros_2da + ha_auto_otros_2da, 2)
+    
+    ha_disponible_1ra <- max(0, round(area_turno - ha_consumida_otros_1ra, 2))
     
     # 2ª Pasada: Cálculo inteligente por válvula y frecuencia para el día específico
     frec_dias_var <- if (limpiar_variedad(fila$Variedad) == "ROCIO") 3L else 7L
@@ -8185,20 +8699,19 @@ server <- function(input, output, session) {
       }
     }
     
-    ha_pool_2da_restante <- max(0, round(area_turno - ha_real_2da - ha_man_otros_2da, 2))
+    ha_pool_2da_restante <- max(0, round(area_turno - ha_consumida_otros_2da, 2))
     ha_disponible_2da <- if (ha_valvs_2da_dia > 0) {
       round(min(ha_pool_2da_restante, ha_valvs_2da_dia), 2)
     } else {
       ha_pool_2da_restante
     }
-    
     pasada_sugerida <- if (limpiar_variedad(fila$Variedad) != "ROCIO") {
       1L
     } else if (nrow(valvs_celda) > 0 && any(valvs_celda$Num_Pasada == 2)) {
       2L
     } else if (nrow(ed_celda) > 0 && coalesce(ed_celda$Ha_Asignada_2da[1], 0) > 0) {
       2L
-    } else if (limpiar_variedad(fila$Variedad) == "ROCIO" && ha_real_1ra >= (area_turno - 0.05)) {
+    } else if (limpiar_variedad(fila$Variedad) == "ROCIO" && (ha_consumida_otros_1ra >= (area_turno - 0.05) || ha_real_1ra >= (area_turno - 0.05))) {
       2L
     } else {
       1L
@@ -8208,9 +8721,9 @@ server <- function(input, output, session) {
     
     # Hectáreas y rendimiento sugeridos para precargar
     ha_preset <- if (nrow(ed_celda) > 0 && !is.na(ed_celda$Ha_Asignada[1]) && ed_celda$Ha_Asignada[1] > 0) {
-      round(pmin(ha_disponible_sug, ed_celda$Ha_Asignada[1]), 2)
+      round(pmin(area_turno, ed_celda$Ha_Asignada[1]), 2)
     } else if (nrow(valvs_celda) > 0 && sum(valvs_celda$Ha_Asignada, na.rm = TRUE) > 0) {
-      round(pmin(ha_disponible_sug, sum(valvs_celda$Ha_Asignada, na.rm = TRUE)), 2)
+      round(pmin(area_turno, sum(valvs_celda$Ha_Asignada, na.rm = TRUE)), 2)
     } else {
       ha_disponible_sug
     }
@@ -8218,12 +8731,13 @@ server <- function(input, output, session) {
     kg_preset <- round(valor_actual, 2)
     kgha_preset <- if (ha_preset > 0 && kg_preset > 0) {
       round(kg_preset / ha_preset, 2)
+    } else if (!is.na(fila$`Kg/Ha Aj. 1ª Pas`) && as.numeric(fila$`Kg/Ha Aj. 1ª Pas`) > 0) {
+      round(as.numeric(fila$`Kg/Ha Aj. 1ª Pas`), 2)
     } else if (!is.na(fila$`Kg/Ha Proy`) && as.numeric(fila$`Kg/Ha Proy`) > 0) {
       round(as.numeric(fila$`Kg/Ha Proy`), 2)
     } else {
       100.0
     }
-    
     ctx <- list(
       fila               = fila,
       campo              = col_name,
@@ -8239,10 +8753,23 @@ server <- function(input, output, session) {
       ha_disponible_1ra  = ha_disponible_1ra,
       ha_disponible_2da  = ha_disponible_2da,
       ha_disponible_sug  = ha_disponible_sug,
-      ha_real_1ra        = ha_real_1ra,
-      ha_real_2da        = ha_real_2da,
-      ha_man_otros_1ra   = ha_man_otros_1ra,
-      ha_man_otros_2da   = ha_man_otros_2da
+      ha_real_1ra        = ha_real_prev_1ra,
+      ha_real_2da        = ha_real_prev_2da,
+      ha_man_otros_1ra   = ha_man_otros_1ra + ha_auto_otros_1ra,
+      ha_man_otros_2da   = ha_man_otros_2da + ha_auto_otros_2da,
+      frec_ctx           = tryCatch(
+        obtener_contexto_frecuencia_turno(
+          mod_sel        = fila$Módulo,
+          turno_sel      = fila$Turno,
+          var_sel        = fila$Variedad,
+          sem_sel        = input$filtro_semana,
+          camp_sel       = input$filtro_campana,
+          dia_origen_nom = col_name,
+          df_cosecha_in  = rv_cosecha(),
+          df_frec_mv_in  = frec_df_disco
+        ),
+        error = function(e) list(frec_s1 = 7, dia_s1 = NA_character_, rend_s1 = 0, frec_cfg = 7, frec_origen = 7)
+      )
     )
     modal_celda_activa(ctx)
     
@@ -8647,7 +9174,7 @@ server <- function(input, output, session) {
       1L
     }
     ha_real_pasada <- if (pasada_activa == 2L) ctx$ha_real_2da else ctx$ha_real_1ra
-    ha_pool_pasada <- if (pasada_activa == 2L) ctx$ha_disponible_2da else max(0, round(ctx$area_turno - ha_real_pasada, 2))
+    ha_pool_pasada <- if (pasada_activa == 2L) ctx$ha_disponible_2da else ctx$ha_disponible_1ra
     
     ed_act <- ediciones_manuales()
     if (!is.null(ed_act) && nrow(ed_act) > 0) {
@@ -8686,7 +9213,61 @@ server <- function(input, output, session) {
     ha_fijas <- if (nrow(ed_fijas) > 0) sum(if (pasada_activa == 2L) coalesce(ed_fijas$Ha_Asignada_2da, 0) else coalesce(ed_fijas$Ha_Asignada_1ra, 0), na.rm = TRUE) else 0
     ha_pool_prorr <- max(0, round(ha_pool_pasada - ha_fijas, 2))
     
-    # Banner de retroalimentación de cambio de día
+    # Obtener cosecha previa existente en día destino si dia_destino != dia_origen
+    kg_dest_prev <- 0
+    ha_dest_prev <- 0
+    if (dia_destino != dia_origen) {
+      ed_dest <- if (!is.null(ed_act) && nrow(ed_act) > 0) {
+        ed_act %>%
+          filter(
+            as.character(Campaña) == as.character(input$filtro_campana),
+            as.numeric(Semana)    == as.numeric(input$filtro_semana),
+            as.character(Sector)   == as.character(ctx$fila$Sector),
+            as.character(Módulo)   == as.character(ctx$fila$Módulo),
+            as.character(Turno)    == as.character(ctx$fila$Turno),
+            limpiar_variedad(Variedad) == limpiar_variedad(ctx$fila$Variedad),
+            as.character(Campo)    == as.character(dia_destino)
+          )
+      } else tibble()
+      
+      valvs_dest <- if (nrow(ed_dest) == 0) {
+        valvs_t <- rv_ajuste_valvulas()
+        if (!is.null(valvs_t) && nrow(valvs_t) > 0) {
+          valvs_t %>%
+            filter(
+              as.character(Campaña) == as.character(input$filtro_campana),
+              as.numeric(Semana)    == as.numeric(input$filtro_semana),
+              as.character(Módulo)   == as.character(ctx$fila$Módulo),
+              as.character(Turno)    == as.character(ctx$fila$Turno),
+              limpiar_variedad(Variedad) == limpiar_variedad(ctx$fila$Variedad),
+              as.character(Dia_Asignado) == as.character(dia_destino)
+            )
+        } else tibble()
+      } else tibble()
+      
+      if (nrow(ed_dest) > 0) {
+        kg_dest_prev <- sum(coalesce(as.numeric(ed_dest$Valor), 0), na.rm = TRUE)
+        ha_dest_prev <- sum(coalesce(as.numeric(ed_dest$Ha_Asignada), 0), na.rm = TRUE)
+      } else if (nrow(valvs_dest) > 0) {
+        kg_dest_prev <- sum(coalesce(as.numeric(valvs_dest$Kg_Asignado), 0), na.rm = TRUE)
+        ha_dest_prev <- sum(coalesce(as.numeric(valvs_dest$Area), as.numeric(valvs_dest$Ha_Asignada), 0), na.rm = TRUE)
+      } else if (!is.null(ctx$fila[[dia_destino]]) && coalesce(as.numeric(ctx$fila[[dia_destino]]), 0) > 0) {
+        kg_dest_prev <- coalesce(as.numeric(ctx$fila[[dia_destino]]), 0)
+        rend_ref <- if (!is.na(ctx$fila$`Kg/Ha Aj. 1ª Pas`) && as.numeric(ctx$fila$`Kg/Ha Aj. 1ª Pas`) > 0) as.numeric(ctx$fila$`Kg/Ha Aj. 1ª Pas`) else 200
+        ha_dest_prev <- round(kg_dest_prev / rend_ref, 2)
+      }
+    }
+    
+    # Banner de retroalimentación de Factor de Frecuencia (Movimiento de día y Referencia S-1 en edición manual)
+    frec_ctx <- if (!is.null(ctx$frec_ctx)) ctx$frec_ctx else list(frec_s1 = 7, dia_s1 = NA_character_, rend_s1 = 0, frec_cfg = 7, frec_origen = 7)
+    elast_pct <- tryCatch(rv_elasticidad_frecuencia(), error = function(e) 70)
+    frec_s1_val <- coalesce(as.numeric(frec_ctx$frec_s1), if (limpiar_variedad(ctx$fila$Variedad) == "ROCIO") 4 else 7)
+    frec_orig_val <- coalesce(as.numeric(frec_ctx$frec_origen), frec_s1_val)
+    if (nrow(ctx$valvs_celda) > 0 && "Frec_Turno_Sem" %in% names(ctx$valvs_celda)) {
+      f_v <- suppressWarnings(as.numeric(ctx$valvs_celda$Frec_Turno_Sem[1]))
+      if (!is.na(f_v) && f_v > 0) frec_orig_val <- f_v
+    }
+    
     banner_cambio_dia <- if (dia_destino != dia_origen) {
       if (isTRUE(ctx$fila[[paste0(dia_destino, "_bloqueado")]])) {
         div(
@@ -8697,19 +9278,116 @@ server <- function(input, output, session) {
           tags$div(style = "font-size: 11px; color: #be123c; margin-top: 2px;", "Este día está bloqueado por recepción oficial. Por favor selecciona otro día.")
         )
       } else {
+        dias_map <- setNames(1:6, c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"))
+        diff_dias <- as.integer(dias_map[dia_destino] - dias_map[dia_origen])
+        frec_dest_val <- max(1, frec_orig_val + diff_dias)
+        
+        # Factor comparativo respecto a S-1 en día origen vs día destino (evita doble conteo)
+        f_orig_s1 <- calcular_factor_frecuencia(frec_orig_val - frec_s1_val, frec_s1_val, elast_pct)
+        f_dest_s1 <- calcular_factor_frecuencia(frec_dest_val - frec_s1_val, frec_s1_val, elast_pct)
+        factor_mov <- max(0.40, min(1.60, f_dest_s1$factor / pmax(0.40, f_orig_s1$factor)))
+        delta_mov_pct <- (factor_mov - 1) * 100
+        
+        es_kgha_modo <- (!is.null(modo) && modo == "kgha")
+        if (es_kgha_modo) {
+          val_orig <- coalesce(as.numeric(ctx$kgha_preset), 0)
+          val_sug  <- round(val_orig * factor_mov, 1)
+          delta_val <- round(val_sug - val_orig, 1)
+          unidad_str <- "kg/ha"
+        } else {
+          val_orig <- coalesce(as.numeric(ctx$valor_actual), 0)
+          val_sug  <- round(val_orig * factor_mov, 0)
+          delta_val <- round(val_sug - val_orig, 0)
+          unidad_str <- "kg"
+        }
+        
+        badge_bg  <- if (delta_mov_pct > 0) "rgba(88, 86, 214, 0.10)" else if (delta_mov_pct < 0) "rgba(255, 59, 48, 0.10)" else "#F4F4F5"
+        badge_col <- if (delta_mov_pct > 0) "#5856D6" else if (delta_mov_pct < 0) "#D32F2F" else "#636366"
+        badge_bdr <- if (delta_mov_pct > 0) "rgba(88, 86, 214, 0.25)" else if (delta_mov_pct < 0) "rgba(255, 59, 48, 0.25)" else "#E5E5EA"
+        
         div(
-          style = "background: #f5f3ff; border: 1px solid #ddd6fe; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between;",
+          style = "background: #F9F9FB; border: 1.5px solid rgba(88, 86, 214, 0.25); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px;",
           div(
-            tags$div(
-              style = "font-size: 12px; font-weight: 600; color: #5b21b6; display: flex; align-items: center; gap: 6px;",
-              tags$span(style = "display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #6366f1;"),
-              sprintf("Moviendo asignación: %s ➔ %s", dia_origen, dia_destino)
+            style = "display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; flex-wrap: wrap; gap: 6px;",
+            div(
+              style = "display: flex; align-items: center; gap: 6px;",
+              tags$span(style = "width: 7px; height: 7px; border-radius: 50%; background: #5856D6; display: inline-block;"),
+              tags$span(style = "font-size: 12.5px; font-weight: 700; color: #1C1C1E;", sprintf("Moviendo: %s ➔ %s (%+d día%s)", dia_origen, dia_destino, diff_dias, if (abs(diff_dias) == 1) "" else "s"))
             ),
-            tags$div(style = "font-size: 11px; color: #6d28d9; margin-top: 2px;", sprintf("La cosecha de %s se limpiará y se registrará en %s", dia_origen, dia_destino))
+            tags$span(
+              style = sprintf("background: %s; color: %s; border: 1px solid %s; font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 6px; font-variant-numeric: tabular-nums;", badge_bg, badge_col, badge_bdr),
+              sprintf("Efecto Mov: %+.1f%% (vs S-1: %+.1f%%)", delta_mov_pct, f_dest_s1$delta_pct)
+            )
           ),
-          tags$span(style = "font-size: 10.5px; font-weight: 600; background: #ede9fe; color: #6d28d9; border: 1px solid #c4b5fd; padding: 2px 8px; border-radius: 9999px;", "Cambio de día")
+          tags$p(
+            style = "margin: 0 0 10px 0; font-size: 11.5px; color: #636366; line-height: 1.45;",
+            sprintf("Frecuencia en S-1: %.1f d • En %s: %.1f d ➔ En %s: %.1f d (%+.1f d vs S-1). %s Sugerido con factor: %s %s (%+s %s vs %s).",
+                    frec_s1_val, dia_origen, frec_orig_val, dia_destino, frec_dest_val, frec_dest_val - frec_s1_val,
+                    if (diff_dias > 0) "Al postergar la cosecha, la planta acumula fruta adicional." else "Al adelantar la cosecha, reduce días de acumulación.",
+                    format(val_sug, big.mark = ","), unidad_str, format(delta_val, big.mark = ","), unidad_str, dia_origen)
+          ),
+          div(
+            style = "display: flex; gap: 8px; align-items: center;",
+            actionButton(
+              "btn_aplicar_factor_frecuencia_modal",
+              label = tagList(icon("wand-magic-sparkles"), sprintf("Aplicar Sugerencia: %s %s (%+s %s)", format(val_sug, big.mark = ","), unidad_str, format(delta_val, big.mark = ","), unidad_str)),
+              class = "ek-btn-primary",
+              style = "font-size: 11.5px; padding: 5px 12px; border-radius: 6px; background: #5856D6; color: white; border: none; font-weight: 600; box-shadow: 0 1px 3px rgba(88, 86, 214, 0.3);"
+            )
+          )
         )
       }
+    } else if (coalesce(as.numeric(frec_ctx$rend_s1), 0) > 0 && dia_origen %in% c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")) {
+      # Asistente de Frecuencia Comparativa (S vs S-1) para edición manual en el mismo día
+      diff_s1 <- round(frec_orig_val - frec_s1_val, 1)
+      f_s1_info <- calcular_factor_frecuencia(diff_s1, frec_s1_val, elast_pct)
+      rend_s1_base <- as.numeric(frec_ctx$rend_s1)
+      kgha_s1_sug  <- round(rend_s1_base * f_s1_info$factor, 1)
+      ha_ref_man   <- if (!is.null(modo) && modo == "kgha") {
+        h_in <- suppressWarnings(as.numeric(input$modal_input_ha))
+        if (length(h_in) > 0 && !is.na(h_in) && h_in > 0) h_in else coalesce(ctx$ha_preset, ha_pool_prorr)
+      } else {
+        coalesce(ctx$ha_preset, ha_pool_prorr)
+      }
+      kg_s1_sug <- round(kgha_s1_sug * ha_ref_man, 0)
+      es_kgha_modo <- (!is.null(modo) && modo == "kgha")
+      
+      badge_bg  <- if (f_s1_info$delta_pct > 0) "rgba(16, 185, 129, 0.10)" else if (f_s1_info$delta_pct < 0) "rgba(244, 63, 94, 0.10)" else "#F4F4F5"
+      badge_col <- if (f_s1_info$delta_pct > 0) "#059669" else if (f_s1_info$delta_pct < 0) "#E11D48" else "#636366"
+      badge_bdr <- if (f_s1_info$delta_pct > 0) "rgba(16, 185, 129, 0.25)" else if (f_s1_info$delta_pct < 0) "rgba(244, 63, 94, 0.25)" else "#E5E5EA"
+      
+      div(
+        style = "background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 10px 14px; margin-bottom: 14px;",
+        div(
+          style = "display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; flex-wrap: wrap; gap: 6px;",
+          tags$span(
+            style = "font-size: 11.5px; font-weight: 700; color: #334155;",
+            sprintf("Frecuencia Comparativa (S-1: %.1f d ➔ %s: %.1f d)", frec_s1_val, dia_origen, frec_orig_val)
+          ),
+          tags$span(
+            style = sprintf("background: %s; color: %s; border: 1px solid %s; font-size: 10.5px; font-weight: 700; padding: 1px 7px; border-radius: 6px; font-variant-numeric: tabular-nums;", badge_bg, badge_col, badge_bdr),
+            sprintf("%+.1f d vs S-1 (%+.1f%%)", diff_s1, f_s1_info$delta_pct)
+          )
+        ),
+        div(
+          style = "display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;",
+          tags$span(
+            style = "font-size: 11px; color: #64748B;",
+            sprintf("Rend. S-1: %s kg/ha • Con factor frec.: %s kg/ha (%s kg en %.2f ha)",
+                    format(round(rend_s1_base, 1), big.mark = ","),
+                    format(kgha_s1_sug, big.mark = ","),
+                    format(kg_s1_sug, big.mark = ","),
+                    ha_ref_man)
+          ),
+          actionButton(
+            "btn_aplicar_frec_s1_modal",
+            label = tagList(icon("bolt"), if (es_kgha_modo) sprintf("Usar %s kg/ha", format(kgha_s1_sug, big.mark = ",")) else sprintf("Usar %s kg", format(kg_s1_sug, big.mark = ","))),
+            style = "font-size: 11px; padding: 3px 10px; border-radius: 6px; background: #0F172A; color: #FFFFFF; border: none; font-weight: 600;"
+          )
+        )
+      )
+    } else {
+      NULL
     }
     
     cuerpo_calculo <- if (!is.null(modo) && modo == "kgha") {
@@ -8718,28 +9396,106 @@ server <- function(input, output, session) {
       kgha <- if (length(kgha) == 0 || is.na(kgha) || kgha < 0) 0 else kgha
       ha   <- if (length(ha) == 0 || is.na(ha) || ha < 0) 0 else ha
       kilos_calc <- round(kgha * ha, 2)
-      ha_restante <- max(0, round(ha_pool_prorr - ha, 2))
       
-      div(
-        style = "background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 14px; display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 14px;",
+      if (dia_destino != dia_origen && kg_dest_prev > 0) {
+        kg_tot_dest <- round(kg_dest_prev + kilos_calc, 1)
+        ha_tot_dest <- round(pmin(ctx$area_turno, ha_dest_prev + ha), 2)
+        rend_recalc <- if (ha_tot_dest > 0) round(kg_tot_dest / ha_tot_dest, 1) else 0
+        
         div(
-          tags$div(style = "font-size: 12px; font-weight: 500; color: #475569;", sprintf("Total estimado (%s)", dia_destino)),
-          tags$div(
-            style = "font-size: 11.5px; color: #94a3b8; margin-top: 2px;",
-            sprintf("%.2f kg/ha × %.2f ha%s", kgha, ha,
-                    if (nrow(ed_prorr) > 0) sprintf(" • Restan %.2f ha para otros días", ha_restante) else "")
+          style = "background: #F8FAFC; border: 1.5px solid #CBD5E1; border-radius: 10px; padding: 12px 14px; margin-bottom: 14px;",
+          div(
+            style = "display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed #E2E8F0; padding-bottom: 7px; margin-bottom: 8px;",
+            div(
+              tags$div(style = "font-size: 11px; font-weight: 500; color: #64748B;", sprintf("Cosecha previa en %s:", dia_destino)),
+              tags$div(style = "font-size: 13px; font-weight: 600; color: #334155;", sprintf("%s kg (%.2f ha)", format(round(kg_dest_prev, 1), big.mark = ","), ha_dest_prev))
+            ),
+            div(
+              style = "text-align: right;",
+              tags$div(style = "font-size: 11px; font-weight: 500; color: #64748B;", sprintf("Traslado desde %s:", dia_origen)),
+              tags$div(style = "font-size: 13px; font-weight: 600; color: #5856D6;", sprintf("+%s kg (%.2f ha)", format(round(kilos_calc, 1), big.mark = ","), ha))
+            )
+          ),
+          div(
+            style = "display: flex; justify-content: space-between; align-items: baseline;",
+            div(
+              tags$div(style = "font-size: 12px; font-weight: 700; color: #0F172A;", sprintf("Total consolidado en %s:", dia_destino)),
+              tags$div(style = "font-size: 11px; color: #64748B; margin-top: 2px;", sprintf("Consumo total del turno: %.2f ha", ha_tot_dest))
+            ),
+            div(
+              style = "text-align: right;",
+              tags$div(
+                style = "font-size: 18px; font-weight: 700; color: #0F172A; font-variant-numeric: tabular-nums;",
+                sprintf("%s kg", format(kg_tot_dest, big.mark = ","))
+              ),
+              tags$div(
+                style = "font-size: 11px; font-weight: 600; color: #059669;",
+                sprintf("Rendimiento: %.1f kg/ha", rend_recalc)
+              )
+            )
           )
-        ),
-        tags$div(
-          style = "font-size: 20px; font-weight: 600; color: #0f172a; font-variant-numeric: tabular-nums;",
-          sprintf("%s kg", format(kilos_calc, big.mark = ","))
         )
-      )
+      } else {
+        ha_restante <- max(0, round(ha_pool_prorr - ha, 2))
+        div(
+          style = "background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 14px; display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 14px;",
+          div(
+            tags$div(style = "font-size: 12px; font-weight: 500; color: #475569;", sprintf("Total estimado (%s)", dia_destino)),
+            tags$div(
+              style = "font-size: 11.5px; color: #94a3b8; margin-top: 2px;",
+              sprintf("%.2f kg/ha × %.2f ha%s", kgha, ha,
+                      if (nrow(ed_prorr) > 0) sprintf(" • Restan %.2f ha para otros días", ha_restante) else "")
+            )
+          ),
+          tags$div(
+            style = "font-size: 20px; font-weight: 600; color: #0f172a; font-variant-numeric: tabular-nums;",
+            sprintf("%s kg", format(kilos_calc, big.mark = ","))
+          )
+        )
+      }
     } else {
       kg_hoy <- suppressWarnings(as.numeric(input$modal_input_kilos))
       kg_hoy <- if (length(kg_hoy) == 0 || is.na(kg_hoy) || kg_hoy < 0) 0 else kg_hoy
       
-      if (nrow(ed_prorr) > 0) {
+      if (dia_destino != dia_origen && kg_dest_prev > 0) {
+        kg_tot_dest <- round(kg_dest_prev + kg_hoy, 1)
+        ha_tot_dest <- round(pmin(ctx$area_turno, ha_dest_prev + ha_pool_prorr), 2)
+        rend_recalc <- if (ha_tot_dest > 0) round(kg_tot_dest / ha_tot_dest, 1) else 0
+        
+        div(
+          style = "background: #F8FAFC; border: 1.5px solid #CBD5E1; border-radius: 10px; padding: 12px 14px; margin-bottom: 14px;",
+          div(
+            style = "display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed #E2E8F0; padding-bottom: 7px; margin-bottom: 8px;",
+            div(
+              tags$div(style = "font-size: 11px; font-weight: 500; color: #64748B;", sprintf("Cosecha previa en %s:", dia_destino)),
+              tags$div(style = "font-size: 13px; font-weight: 600; color: #334155;", sprintf("%s kg (%.2f ha)", format(round(kg_dest_prev, 1), big.mark = ","), ha_dest_prev))
+            ),
+            div(
+              style = "text-align: right;",
+              tags$div(style = "font-size: 11px; font-weight: 500; color: #64748B;", sprintf("Traslado desde %s:", dia_origen)),
+              tags$div(style = "font-size: 13px; font-weight: 600; color: #5856D6;", sprintf("+%s kg (%.2f ha)", format(round(kg_hoy, 1), big.mark = ","), ha_pool_prorr))
+            )
+          ),
+          div(
+            style = "display: flex; justify-content: space-between; align-items: baseline;",
+            div(
+              tags$div(style = "font-size: 12px; font-weight: 700; color: #0F172A;", sprintf("Total consolidado en %s:", dia_destino)),
+              tags$div(style = "font-size: 11px; color: #64748B; margin-top: 2px;", sprintf("Consumo total del turno: %.2f ha", ha_tot_dest))
+            ),
+            div(
+              style = "text-align: right;",
+              tags$div(
+                style = "font-size: 18px; font-weight: 700; color: #0F172A; font-variant-numeric: tabular-nums;",
+                sprintf("%s kg", format(kg_tot_dest, big.mark = ","))
+              ),
+              tags$div(
+                style = "font-size: 11px; font-weight: 600; color: #059669;",
+                sprintf("Rendimiento: %.1f kg/ha", rend_recalc)
+              )
+            )
+          )
+        )
+      } else if (nrow(ed_prorr) > 0) {
         kg_otros_sum <- sum(coalesce(as.numeric(ed_prorr$Valor), 0), na.rm = TRUE)
         dias_otros_str <- paste(unique(ed_prorr$Campo), collapse = ", ")
         kg_total <- kg_otros_sum + kg_hoy
@@ -8792,7 +9548,7 @@ server <- function(input, output, session) {
     
     tagList(banner_cambio_dia, cuerpo_calculo)
   })
-  
+
   observeEvent(input$modal_btn_guardar, {
     ctx <- modal_celda_activa()
     req(ctx)
@@ -8816,7 +9572,7 @@ server <- function(input, output, session) {
       1L
     }
     ha_real_pasada <- if (pasada_activa == 2L) ctx$ha_real_2da else ctx$ha_real_1ra
-    ha_pool_pasada <- if (pasada_activa == 2L) ctx$ha_disponible_2da else max(0, round(ctx$area_turno - ha_real_pasada, 2))
+    ha_pool_pasada <- if (pasada_activa == 2L) ctx$ha_disponible_2da else ctx$ha_disponible_1ra
     
     val_final <- if (!is.null(modo) && modo == "kgha") {
       kgha <- suppressWarnings(as.numeric(input$modal_input_kgha))
@@ -8949,7 +9705,7 @@ server <- function(input, output, session) {
       return()
     }
     
-    # Calcular hectáreas finales según modo
+    # Calcular hectáreas finales del lote transferido
     ha_final <- 0
     if (!is.null(modo) && modo == "kgha") {
       ha_in <- suppressWarnings(as.numeric(input$modal_input_ha))
@@ -9023,10 +9779,62 @@ server <- function(input, output, session) {
     
     num_pasada_sel <- if (limpiar_variedad(ctx$fila$Variedad) == "ROCIO") pasada_activa else 1L
     motivo_txt <- if (!is.null(input$modal_input_motivo)) trimws(as.character(input$modal_input_motivo)) else ""
-    motivo_final <- if (length(motivo_txt) > 0 && nzchar(motivo_txt[1])) {
+    
+    # Si se mueve de día (dia_destino != dia_origen), recuperar la cosecha previa en dia_destino para consolidar y no sobreescribir
+    kg_dest_prev <- 0
+    ha_dest_prev <- 0
+    if (dia_destino != dia_origen) {
+      ed_dest <- ed_actuales %>%
+        filter(
+          as.character(Campaña) == as.character(input$filtro_campana),
+          as.numeric(Semana)    == as.numeric(input$filtro_semana),
+          as.character(Sector)   == as.character(ctx$fila$Sector),
+          as.character(Módulo)   == as.character(ctx$fila$Módulo),
+          as.character(Turno)    == as.character(ctx$fila$Turno),
+          limpiar_variedad(Variedad) == limpiar_variedad(ctx$fila$Variedad),
+          as.character(Campo)    == as.character(dia_destino)
+        )
+      valvs_dest <- if (nrow(ed_dest) == 0) {
+        valvs_t <- rv_ajuste_valvulas()
+        if (!is.null(valvs_t) && nrow(valvs_t) > 0) {
+          valvs_t %>%
+            filter(
+              as.character(Campaña) == as.character(input$filtro_campana),
+              as.numeric(Semana)    == as.numeric(input$filtro_semana),
+              as.character(Módulo)   == as.character(ctx$fila$Módulo),
+              as.character(Turno)    == as.character(ctx$fila$Turno),
+              limpiar_variedad(Variedad) == limpiar_variedad(ctx$fila$Variedad),
+              as.character(Dia_Asignado) == as.character(dia_destino)
+            )
+        } else tibble()
+      } else tibble()
+      
+      if (nrow(ed_dest) > 0) {
+        kg_dest_prev <- sum(coalesce(as.numeric(ed_dest$Valor), 0), na.rm = TRUE)
+        ha_dest_prev <- sum(coalesce(as.numeric(ed_dest$Ha_Asignada), 0), na.rm = TRUE)
+      } else if (nrow(valvs_dest) > 0) {
+        kg_dest_prev <- sum(coalesce(as.numeric(valvs_dest$Kg_Asignado), 0), na.rm = TRUE)
+        ha_dest_prev <- sum(coalesce(as.numeric(valvs_dest$Area), as.numeric(valvs_dest$Ha_Asignada), 0), na.rm = TRUE)
+      } else if (!is.null(ctx$fila[[dia_destino]]) && coalesce(as.numeric(ctx$fila[[dia_destino]]), 0) > 0) {
+        kg_dest_prev <- coalesce(as.numeric(ctx$fila[[dia_destino]]), 0)
+        rend_ref <- if (!is.na(ctx$fila$`Kg/Ha Aj. 1ª Pas`) && as.numeric(ctx$fila$`Kg/Ha Aj. 1ª Pas`) > 0) as.numeric(ctx$fila$`Kg/Ha Aj. 1ª Pas`) else 200
+        ha_dest_prev <- round(kg_dest_prev / rend_ref, 2)
+      }
+    }
+    
+    val_guardar_dest  <- if (dia_destino != dia_origen) round(val_final + kg_dest_prev, 2) else round(val_final, 2)
+    ha_guardar_dest   <- if (dia_destino != dia_origen) round(pmin(ctx$area_turno, ha_final + ha_dest_prev), 2) else round(ha_final, 2)
+    rend_guardar_dest <- if (ha_guardar_dest > 0) round(val_guardar_dest / ha_guardar_dest, 1) else 0
+    
+    motivo_guardar <- if (length(motivo_txt) > 0 && nzchar(motivo_txt[1])) {
       motivo_txt[1]
     } else if (dia_destino != dia_origen) {
-      if (!is.null(modo) && modo == "kgha") {
+      if (kg_dest_prev > 0) {
+        sprintf("Consolidado: %s kg de %s + %s kg previos de %s (Rend: %.1f kg/ha en %.2f ha)",
+                format(round(val_final, 1), big.mark = ","), dia_origen,
+                format(round(kg_dest_prev, 1), big.mark = ","), dia_destino,
+                rend_guardar_dest, ha_guardar_dest)
+      } else if (!is.null(modo) && modo == "kgha") {
         sprintf("Movido desde %s (%s kg/ha en %.2f ha)", dia_origen, format(round(coalesce(as.numeric(input$modal_input_kgha), 0), 1)), ha_final)
       } else if (nrow(ed_prorr) > 0) {
         sprintf("Movido desde %s prorrateado (%s kg en %.2f ha)", dia_origen, format(round(val_final, 1)), ha_final)
@@ -9049,15 +9857,15 @@ server <- function(input, output, session) {
       Turno           = as.character(ctx$fila$Turno),
       Variedad        = limpiar_variedad(ctx$fila$Variedad),
       Campo           = as.character(dia_destino),
-      Valor           = val_final,
-      Ha_Asignada     = ha_final,
-      Ha_Asignada_1ra = ifelse(num_pasada_sel == 1L, ha_final, 0),
-      Kg_Asignado_1ra = ifelse(num_pasada_sel == 1L, val_final, 0),
-      Ha_Asignada_2da = ifelse(num_pasada_sel == 2L, ha_final, 0),
-      Kg_Asignado_2da = ifelse(num_pasada_sel == 2L, val_final, 0),
+      Valor           = val_guardar_dest,
+      Ha_Asignada     = ha_guardar_dest,
+      Ha_Asignada_1ra = ifelse(num_pasada_sel == 1L, ha_guardar_dest, 0),
+      Kg_Asignado_1ra = ifelse(num_pasada_sel == 1L, val_guardar_dest, 0),
+      Ha_Asignada_2da = ifelse(num_pasada_sel == 2L, ha_guardar_dest, 0),
+      Kg_Asignado_2da = ifelse(num_pasada_sel == 2L, val_guardar_dest, 0),
       Tipo_Edicion    = "manual",
       Modo_Ingreso    = if (!is.null(modo)) modo else "kilos",
-      Motivo_Ajuste   = motivo_final,
+      Motivo_Ajuste   = motivo_guardar,
       Fecha_Edicion   = Sys.time()
     )
     
@@ -9100,26 +9908,35 @@ server <- function(input, output, session) {
     
     msg_extra <- if (nrow(ed_prorr) > 0) sprintf(" (Prorrateado con %s)", paste(unique(ed_prorr$Campo), collapse = ", ")) else ""
     if (dia_destino != dia_origen) {
-      showNotification(
-        sprintf("Cosecha movida de %s a %s: %s Kg, %.2f ha (Turno %s)%s", dia_origen, dia_destino, format(val_final, big.mark = ","), ha_final, ctx$fila$Turno, msg_extra),
-        type = "message",
-        duration = 3
-      )
+      msg_notif <- if (kg_dest_prev > 0) {
+        sprintf("Cosecha consolidada en %s: %s kg (%.2f ha) + %s kg previos = %s kg totales (Rend: %.1f kg/ha en %.2f ha)%s",
+                dia_destino,
+                format(round(val_final, 1), big.mark = ","),
+                ha_final,
+                format(round(kg_dest_prev, 1), big.mark = ","),
+                format(round(val_guardar_dest, 1), big.mark = ","),
+                rend_guardar_dest,
+                ha_guardar_dest,
+                msg_extra)
+      } else {
+        sprintf("Cosecha movida de %s a %s: %s Kg, %.2f ha (Turno %s)%s",
+                dia_origen, dia_destino, format(val_guardar_dest, big.mark = ","), ha_guardar_dest, ctx$fila$Turno, msg_extra)
+      }
+      showNotification(msg_notif, type = "message", duration = 4)
     } else if (ok_disco) {
       showNotification(
-        sprintf("Dato guardado como manual: [%s] = %s Kg, %.2f ha (Turno %s)%s", ctx$campo, format(val_final, big.mark = ","), ha_final, ctx$fila$Turno, msg_extra),
+        sprintf("Dato guardado como manual: [%s] = %s Kg, %.2f ha (Turno %s)%s", ctx$campo, format(val_guardar_dest, big.mark = ","), ha_guardar_dest, ctx$fila$Turno, msg_extra),
         type = "message",
         duration = 3
       )
     } else {
       showNotification(
-        sprintf("Dato registrado en sesión: [%s] = %s Kg, %.2f ha (Turno %s)%s", ctx$campo, format(val_final, big.mark = ","), ha_final, ctx$fila$Turno, msg_extra),
+        sprintf("Dato registrado en sesión: [%s] = %s Kg, %.2f ha (Turno %s)%s", ctx$campo, format(val_guardar_dest, big.mark = ","), ha_guardar_dest, ctx$fila$Turno, msg_extra),
         type = "warning",
         duration = 4
       )
     }
   })
-
   observeEvent(input$modal_input_pasada, {
     ctx <- modal_celda_activa()
     req(ctx)
@@ -10515,7 +11332,7 @@ server <- function(input, output, session) {
       )))
     } else if (tiene_premio) {
       pct_prem_txt <- if (grepl("Premio floral ([+-]?[0-9.]+)%", motivo_str)) {
-        sub(".*Premio floral ([+-]?[0-9.]+)%.*", "\1%", motivo_str)
+        sub(".*Premio floral ([+-]?[0-9.]+)%.*", "\\1%", motivo_str)
       } else "+40.0%"
       pasos <- c(pasos, list(list(
         num = "2",
@@ -10524,7 +11341,7 @@ server <- function(input, output, session) {
       )))
     } else if (tiene_castigo) {
       pct_cast_txt <- if (grepl("Castigo floral ([+-]?[0-9.]+)%", motivo_str)) {
-        sub(".*Castigo floral ([+-]?[0-9.]+)%.*", "\1%", motivo_str)
+        sub(".*Castigo floral ([+-]?[0-9.]+)%.*", "\\1%", motivo_str)
       } else "-40.0%"
       pasos <- c(pasos, list(list(
         num = "2",
@@ -10542,6 +11359,21 @@ server <- function(input, output, session) {
         num = "2",
         titulo = "Maduración Neutra",
         desc = "La tasa de maduración se encuentra en línea con la curva teórica estándar de la variedad (variación neutra al 0%)."
+      )))
+    }
+    # Paso 3: Factor de Frecuencia de Cosecha Comparativa (S vs S-1)
+    if (grepl("Frec: [0-9.]+d|Frecuencia [0-9.]+d", motivo_str)) {
+      txt_frec_aj <- if (grepl("Frec: ([^•]+)", motivo_str)) {
+        trimws(sub(".*Frec: ([^•]+).*", "\\1", motivo_str))
+      } else if (grepl("Frecuencia ([0-9.]+d \\([+-]?[0-9.]+%\\))", motivo_str)) {
+        sub(".*Frecuencia ([0-9.]+d \\([+-]?[0-9.]+%\\)).*", "\\1", motivo_str)
+      } else if (grepl("Frecuencia ([0-9.]+d)", motivo_str)) {
+        sub(".*Frecuencia ([0-9.]+d).*", "\\1", motivo_str)
+      } else "Frecuencia comparativa"
+      pasos <- c(pasos, list(list(
+        num = as.character(length(pasos) + 1),
+        titulo = sprintf("Ajuste Comparativo por Frecuencia (%s)", txt_frec_aj),
+        desc = "Compara la frecuencia de cosecha de la semana actual (S) frente a la frecuencia real con la que se obtuvo el rendimiento de la semana anterior (S-1). Si el turno descansa más días que en S-1 (ej. pasa de 4d a 7d), acumula mayor carga de fruta madura en planta (+%); si descansa menos días que en S-1, ajusta proporcionalmente a la baja (-%)."
       )))
     }
     
@@ -11665,6 +12497,114 @@ server <- function(input, output, session) {
   # ============================================================================== =
   rv_modo_frecuencia <- reactiveVal(cargar_modo_frecuencia_disco())
   rv_frecuencias     <- reactiveVal(cargar_frecuencias_disco())
+  rv_elasticidad_frecuencia <- reactiveVal(cargar_elasticidad_frecuencia_disco())
+  # Guardar elasticidad de frecuencia cuando el usuario la edita
+  observeEvent(input$input_elasticidad_frecuencia, {
+    val <- input$input_elasticidad_frecuencia
+    req(!is.null(val), !is.na(val))
+    val_clamped <- max(0, min(100, as.numeric(val)))
+    rv_elasticidad_frecuencia(val_clamped)
+    guardar_elasticidad_frecuencia_disco(val_clamped)
+  })
+
+  # Tira de simulación reactiva de respuesta al mover días por elasticidad de frecuencia
+  output$ui_simulacion_elasticidad_frecuencia <- renderUI({
+    elast <- if (!is.null(input$input_elasticidad_frecuencia) && !is.na(input$input_elasticidad_frecuencia)) {
+      as.numeric(input$input_elasticidad_frecuencia)
+    } else {
+      tryCatch(rv_elasticidad_frecuencia(), error = function(e) 70)
+    }
+    
+    div(
+      style = "display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; text-align: center;",
+      lapply(c(-3, -2, -1, 0, 1, 2, 3), function(d) {
+        f_obj <- calcular_factor_frecuencia(d, frec_base = 7, elasticidad_pct = elast)
+        es_cero <- (d == 0)
+        col_bg <- if (es_cero) "#1C1C1E" else if (d > 0) "rgba(88, 86, 214, 0.08)" else "rgba(255, 59, 48, 0.08)"
+        col_tx <- if (es_cero) "#FFFFFF" else if (d > 0) "#5856D6" else "#D32F2F"
+        bdr    <- if (es_cero) "#1C1C1E" else if (d > 0) "rgba(88, 86, 214, 0.25)" else "rgba(255, 59, 48, 0.25)"
+        
+        div(
+          style = sprintf("background: %s; border: 1px solid %s; border-radius: 8px; padding: 6px 4px; transition: all 0.15s ease;", col_bg, bdr),
+          tags$div(style = sprintf("font-size: 10px; font-weight: 600; color: %s;", if (es_cero) "rgba(255,255,255,0.7)" else "#8E8E93"), sprintf("%+d día%s", d, if (abs(d) == 1) "" else "s")),
+          tags$div(style = sprintf("font-size: 12px; font-weight: 700; color: %s; font-variant-numeric: tabular-nums;", col_tx), if (es_cero) "100%" else sprintf("%+.1f%%", f_obj$delta_pct)),
+          tags$div(style = sprintf("font-size: 9.5px; color: %s;", if (es_cero) "rgba(255,255,255,0.85)" else "#636366"), sprintf("%d días", 7 + d))
+        )
+      })
+    )
+  })
+  
+  # Aplicar sugerencia de Factor de Frecuencia en el modal de edición de celda
+  observeEvent(input$btn_aplicar_factor_frecuencia_modal, {
+    ctx <- modal_celda_activa()
+    req(ctx)
+    dia_origen <- as.character(ctx$campo)
+    dia_destino <- as.character(input$modal_input_dia)
+    req(dia_origen, dia_destino, dia_origen != dia_destino)
+    
+    dias_map <- setNames(1:6, c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"))
+    diff_dias <- as.integer(dias_map[dia_destino] - dias_map[dia_origen])
+    
+    frec_ctx <- if (!is.null(ctx$frec_ctx)) ctx$frec_ctx else list(frec_s1 = 7, frec_origen = 7)
+    frec_s1_val <- coalesce(as.numeric(frec_ctx$frec_s1), if (limpiar_variedad(ctx$fila$Variedad) == "ROCIO") 4 else 7)
+    frec_orig_val <- coalesce(as.numeric(frec_ctx$frec_origen), frec_s1_val)
+    if (nrow(ctx$valvs_celda) > 0 && "Frec_Turno_Sem" %in% names(ctx$valvs_celda)) {
+      f_v <- suppressWarnings(as.numeric(ctx$valvs_celda$Frec_Turno_Sem[1]))
+      if (!is.na(f_v) && f_v > 0) frec_orig_val <- f_v
+    }
+    frec_dest_val <- max(1, frec_orig_val + diff_dias)
+    
+    elast_pct <- tryCatch(rv_elasticidad_frecuencia(), error = function(e) 70)
+    f_orig_s1 <- calcular_factor_frecuencia(frec_orig_val - frec_s1_val, frec_s1_val, elast_pct)
+    f_dest_s1 <- calcular_factor_frecuencia(frec_dest_val - frec_s1_val, frec_s1_val, elast_pct)
+    factor_mov <- max(0.40, min(1.60, f_dest_s1$factor / pmax(0.40, f_orig_s1$factor)))
+    delta_mov_pct <- (factor_mov - 1) * 100
+    
+    modo <- input$modal_modo_ingreso
+    if (identical(modo, "kgha")) {
+      kgha_orig <- coalesce(as.numeric(ctx$kgha_preset), 0)
+      if (kgha_orig > 0) {
+        kgha_sug <- round(kgha_orig * factor_mov, 1)
+        updateNumericInput(session, "modal_input_kgha", value = kgha_sug)
+      }
+    } else {
+      kg_orig <- coalesce(as.numeric(ctx$valor_actual), 0)
+      if (kg_orig > 0) {
+        kg_sug <- round(kg_orig * factor_mov, 0)
+        updateNumericInput(session, "modal_input_kilos", value = kg_sug)
+      }
+    }
+    
+    motivo_sug <- sprintf("Ajuste por Frecuencia (%s %.1fd ➔ %s %.1fd, S-1: %.1fd, %+.1f%%)", dia_origen, frec_orig_val, dia_destino, frec_dest_val, frec_s1_val, delta_mov_pct)
+    updateTextInput(session, "modal_input_motivo", value = motivo_sug)
+    showNotification(sprintf("✔ Factor de frecuencia aplicado (%+.1f%%). Valor actualizado.", delta_mov_pct), type = "message", duration = 3)
+  })
+
+  observeEvent(input$btn_aplicar_frec_s1_modal, {
+    ctx <- modal_celda_activa()
+    req(ctx)
+    frec_ctx <- ctx$frec_ctx
+    req(!is.null(frec_ctx), coalesce(as.numeric(frec_ctx$rend_s1), 0) > 0)
+    
+    frec_s1_val   <- coalesce(as.numeric(frec_ctx$frec_s1), 7)
+    frec_orig_val <- coalesce(as.numeric(frec_ctx$frec_origen), 7)
+    diff_s1       <- round(frec_orig_val - frec_s1_val, 1)
+    elast_pct     <- tryCatch(rv_elasticidad_frecuencia(), error = function(e) 70)
+    f_s1_info     <- calcular_factor_frecuencia(diff_s1, frec_s1_val, elast_pct)
+    
+    kgha_sug <- round(as.numeric(frec_ctx$rend_s1) * f_s1_info$factor, 1)
+    modo     <- input$modal_modo_ingreso
+    if (identical(modo, "kgha")) {
+      updateNumericInput(session, "modal_input_kgha", value = kgha_sug)
+    } else {
+      ha_use <- coalesce(ctx$ha_preset, ctx$ha_disponible_sug, ctx$area_turno)
+      kg_sug <- round(kgha_sug * ha_use, 0)
+      updateNumericInput(session, "modal_input_kilos", value = kg_sug)
+    }
+    motivo_sug <- sprintf("Manual con Rend S-1 + Frec (%.1fd S-1 ➔ %.1fd, %+.1f%%)", frec_s1_val, frec_orig_val, f_s1_info$delta_pct)
+    updateTextInput(session, "modal_input_motivo", value = motivo_sug)
+    showNotification(sprintf("✔ Aplicado Rend. S-1 con Factor Frecuencia (%+.1f%%: %s kg/ha).", f_s1_info$delta_pct, format(kgha_sug, big.mark = ",")), type = "message", duration = 3)
+  })
   
   combinaciones_frecuencias_activas <- reactive({
     es_campana_act <- if (!is.null(input$filtro_campana)) grepl("2026|^26", as.character(input$filtro_campana)) else TRUE
@@ -11720,6 +12660,20 @@ server <- function(input, output, session) {
     }
     
     es_auto <- identical(rv_modo_frecuencia(), "automatico")
+    elast_cfg <- tryCatch(rv_elasticidad_frecuencia(), error = function(e) 70)
+    
+    # Calcular frecuencias reales de S-1 por Módulo y Variedad para mostrar el comparativo S-1 -> S
+    df_2s_modal <- tryCatch(
+      calcular_frecuencias_valvula_2semanas(rv_cosecha(), input$filtro_campana, input$filtro_semana),
+      error = function(e) tibble()
+    )
+    frec_s1_mv_map <- if (!is.null(df_2s_modal) && nrow(df_2s_modal) > 0 && all(c("Módulo", "Variedad", "Frec_S1_Exacta") %in% names(df_2s_modal))) {
+      df_2s_modal %>%
+        group_by(Módulo, Variedad) %>%
+        summarise(Frec_S1_Med = round(median(Frec_S1_Exacta, na.rm = TRUE), 1), .groups = "drop")
+    } else {
+      tibble(Módulo = character(), Variedad = character(), Frec_S1_Med = numeric())
+    }
     
     cards_list <- lapply(seq_len(nrow(combos)), function(i) {
       m <- combos$Módulo[i]
@@ -11742,13 +12696,29 @@ server <- function(input, output, session) {
         }
       }
       
+      idx_s1 <- which(frec_s1_mv_map$Módulo == m & frec_s1_mv_map$Variedad == v)
+      frec_s1_mv <- if (length(idx_s1) > 0 && !is.na(frec_s1_mv_map$Frec_S1_Med[idx_s1[1]])) {
+        as.numeric(frec_s1_mv_map$Frec_S1_Med[idx_s1[1]])
+      } else if (v == "ROCIO") {
+        4.0
+      } else {
+        7.0
+      }
+      diff_mv <- round(as.numeric(val_actual) - frec_s1_mv, 1)
+      info_mv <- calcular_factor_frecuencia(diff_mv, frec_s1_mv, elast_cfg)
+      
       es_2da   <- (val_actual <= 4L)
       col_m    <- if (v == "ROCIO") "#007AFF" else "#5856D6"
       bg_badge <- if (v == "ROCIO") "rgba(0, 122, 255, 0.10)" else "rgba(88, 86, 214, 0.10)"
       
-      badge_tx <- if (es_2da) "2ª Pasada (≤ 4d)" else "Ciclo 1 Pasada"
-      badge_cl <- if (es_2da) "#007AFF" else "#636366"
-      badge_bg <- if (es_2da) "rgba(0, 122, 255, 0.10)" else "rgba(142, 142, 147, 0.12)"
+      badge_tx <- sprintf("S-1: %sd", format(frec_s1_mv, trim = TRUE))
+      delta_tx <- if (abs(diff_mv) >= 0.3) {
+        sprintf("%+sd (%+.0f%%)", format(diff_mv, trim = TRUE), info_mv$delta_pct)
+      } else {
+        "0d (0%)"
+      }
+      delta_cl <- if (info_mv$delta_pct > 0) "#059669" else if (info_mv$delta_pct < 0) "#E11D48" else "#636366"
+      delta_bg <- if (info_mv$delta_pct > 0) "rgba(16, 185, 129, 0.12)" else if (info_mv$delta_pct < 0) "rgba(244, 63, 94, 0.12)" else "rgba(142, 142, 147, 0.12)"
       
       card_style <- paste0(
         "background: #FFFFFF; border: 1.5px solid ",
@@ -11761,13 +12731,17 @@ server <- function(input, output, session) {
         class = "frec-modvar-card",
         style = card_style,
         div(
-          style = "display: flex; flex-direction: column; gap: 3px; min-width: 0;",
+          style = "display: flex; flex-direction: column; gap: 4px; min-width: 0;",
           div(
             style = "display: flex; align-items: center; gap: 6px; flex-wrap: wrap;",
             tags$span(style = sprintf("font-size: 11px; font-weight: 700; color: %s; background: %s; padding: 2px 7px; border-radius: 6px;", col_m, bg_badge), paste("Módulo", m)),
             tags$span(style = "font-size: 12.5px; font-weight: 700; color: #1C1C1E; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;", v)
           ),
-          tags$span(style = sprintf("font-size: 10px; font-weight: 600; color: %s; background: %s; padding: 1px 6px; border-radius: 6px; width: fit-content;", badge_cl, badge_bg), badge_tx)
+          div(
+            style = "display: flex; align-items: center; gap: 4px; flex-wrap: wrap;",
+            tags$span(style = "font-size: 10px; font-weight: 600; color: #475569; background: #F1F5F9; padding: 1px 6px; border-radius: 5px;", badge_tx),
+            tags$span(style = sprintf("font-size: 10px; font-weight: 700; color: %s; background: %s; padding: 1px 6px; border-radius: 5px; font-variant-numeric: tabular-nums;", delta_cl, delta_bg), delta_tx)
+          )
         ),
         div(
           style = "width: 78px; flex-shrink: 0;",
@@ -11836,6 +12810,52 @@ server <- function(input, output, session) {
           )
         )
       },
+      
+      # Sección: Sensibilidad de Acumulación por Frecuencia (Factor al Mover Días)
+      div(
+        style = "background: #F8F9FA; border: 1px solid #E5E5EA; border-radius: 12px; padding: 13px 16px; margin-bottom: 14px;",
+        div(
+          style = "display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 8px;",
+          div(
+            tags$div(
+              style = "font-size: 13px; font-weight: 700; color: #1C1C1E; display: flex; align-items: center; gap: 6px;",
+              tags$span(style = "width: 7px; height: 7px; border-radius: 50%; background: #5856D6; display: inline-block;"),
+              "Sensibilidad de Acumulación: Factor de Frecuencia al Mover Cosecha"
+            ),
+            tags$div(
+              style = "font-size: 11px; color: #636366; margin-top: 2px;",
+              "Modela el % de acumulación o pérdida de fruta madura cuando se adelanta o posterga una cosecha."
+            )
+          ),
+          div(
+            style = "display: flex; align-items: center; gap: 8px;",
+            tags$span(style = "font-size: 10.5px; font-weight: 600; color: #5856D6; background: rgba(88, 86, 214, 0.08); border: 1px solid rgba(88, 86, 214, 0.20); padding: 2px 8px; border-radius: 6px; font-variant-numeric: tabular-nums;", "Recomendado: 60% - 80%"),
+            div(
+              style = "display: flex; align-items: center; gap: 4px;",
+              numericInput(
+                "input_elasticidad_frecuencia",
+                label = NULL,
+                value = isolate(rv_elasticidad_frecuencia()),
+                min = 0,
+                max = 100,
+                step = 5,
+                width = "75px"
+              ),
+              tags$span(style = "font-size: 12px; font-weight: 700; color: #1C1C1E;", "%")
+            )
+          )
+        ),
+        # Simulación de Respuesta Gráfica en vivo para base 7 días
+        div(
+          style = "background: #FFFFFF; border: 1px solid rgba(0,0,0,0.06); border-radius: 10px; padding: 10px 12px;",
+          tags$div(
+            style = "display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 11px; font-weight: 600; color: #8E8E93;",
+            tags$span("Simulación de Respuesta Dinámica al Mover Días (Base 7 días):"),
+            tags$span(style = "font-weight: 400;", "Kilos esperados por pase")
+          ),
+          uiOutput("ui_simulacion_elasticidad_frecuencia")
+        )
+      ),
       
       # Rejilla de tarjetas por Módulo y Variedad
       div(
@@ -12867,13 +13887,14 @@ server <- function(input, output, session) {
     camp_chr <- as.character(camp_sel)
     camp_num <- suppressWarnings(as.numeric(camp_chr))
     
-    # 1. Cosecha real
+    # 1. Cosecha real (filtrada por Módulo, Turno y Variedad específica)
     df_cos <- if (exists("df_cosecha") && is.data.frame(df_cosecha) && nrow(df_cosecha) > 0) df_cosecha else tibble()
     df_y <- df_cos %>%
       filter(
         (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
         trimws(as.character(Módulo)) == trimws(as.character(m)),
         trimws(as.character(Turno)) == trimws(as.character(t)),
+        limpiar_variedad(Variedad) == limpiar_variedad(v),
         !coalesce(Es_Testblock, FALSE),
         `Kg Total` > 0
       ) %>%
@@ -12893,6 +13914,7 @@ server <- function(input, output, session) {
         filter(
           (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
           trimws(as.character(Módulo)) == trimws(as.character(m)),
+          limpiar_variedad(Variedad) == limpiar_variedad(v),
           !coalesce(Es_Testblock, FALSE),
           `Kg Total` > 0
         ) %>%
@@ -12908,13 +13930,14 @@ server <- function(input, output, session) {
         arrange(Semana_Num)
     }
     
-    # 2. Conteo floral
+    # 2. Conteo floral (filtrado por Módulo, Turno y Variedad específica)
     df_c_hist <- if (exists("df_conteo_historico") && is.data.frame(df_conteo_historico) && nrow(df_conteo_historico) > 0) df_conteo_historico else tibble()
     df_c <- df_c_hist %>%
       filter(
         (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
         trimws(as.character(Módulo)) == trimws(as.character(m)),
-        trimws(as.character(Turno)) == trimws(as.character(t))
+        trimws(as.character(Turno)) == trimws(as.character(t)),
+        limpiar_variedad(Variedad) == limpiar_variedad(v)
       ) %>%
       mutate(Semana_Num = suppressWarnings(as.numeric(Semana))) %>%
       filter(!is.na(Semana_Num)) %>%
@@ -12931,7 +13954,8 @@ server <- function(input, output, session) {
       df_c <- df_c_hist %>%
         filter(
           (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
-          trimws(as.character(Módulo)) == trimws(as.character(m))
+          trimws(as.character(Módulo)) == trimws(as.character(m)),
+          limpiar_variedad(Variedad) == limpiar_variedad(v)
         ) %>%
         mutate(Semana_Num = suppressWarnings(as.numeric(Semana))) %>%
         filter(!is.na(Semana_Num)) %>%
@@ -13109,6 +14133,7 @@ server <- function(input, output, session) {
         (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
         trimws(as.character(Módulo)) == trimws(as.character(m)),
         trimws(as.character(Turno)) == trimws(as.character(t)),
+        limpiar_variedad(Variedad) == limpiar_variedad(v),
         !coalesce(Es_Testblock, FALSE),
         `Kg Total` > 0
       ) %>%
@@ -13122,11 +14147,32 @@ server <- function(input, output, session) {
         .groups  = "drop"
       )
     
+    if (nrow(df_y) == 0) {
+      df_y <- df_cos %>%
+        filter(
+          (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
+          trimws(as.character(Módulo)) == trimws(as.character(m)),
+          limpiar_variedad(Variedad) == limpiar_variedad(v),
+          !coalesce(Es_Testblock, FALSE),
+          `Kg Total` > 0
+        ) %>%
+        mutate(Semana_Num = suppressWarnings(as.numeric(Semana))) %>%
+        filter(!is.na(Semana_Num)) %>%
+        group_by(Semana_Num) %>%
+        summarise(
+          Kg_Total = sum(`Kg Total`, na.rm = TRUE),
+          Area     = sum(first(na.omit(Área)), na.rm = TRUE),
+          Rend     = ifelse(!is.na(Area) && Area > 0, Kg_Total / Area, Kg_Total),
+          .groups  = "drop"
+        )
+    }
+    
     df_c <- df_c_hist %>%
       filter(
         (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
         trimws(as.character(Módulo)) == trimws(as.character(m)),
-        trimws(as.character(Turno)) == trimws(as.character(t))
+        trimws(as.character(Turno)) == trimws(as.character(t)),
+        limpiar_variedad(Variedad) == limpiar_variedad(v)
       ) %>%
       mutate(Semana_Num = suppressWarnings(as.numeric(Semana))) %>%
       filter(!is.na(Semana_Num)) %>%
@@ -13137,6 +14183,24 @@ server <- function(input, output, session) {
         Carga   = ifelse(Muestra > 0, Organos / Muestra, mean(Total_Floral_Planta, na.rm = TRUE)),
         .groups = "drop"
       )
+    
+    if (nrow(df_c) == 0) {
+      df_c <- df_c_hist %>%
+        filter(
+          (as.character(Campaña) == camp_chr | (!is.na(camp_num) & Campaña == camp_num)),
+          trimws(as.character(Módulo)) == trimws(as.character(m)),
+          limpiar_variedad(Variedad) == limpiar_variedad(v)
+        ) %>%
+        mutate(Semana_Num = suppressWarnings(as.numeric(Semana))) %>%
+        filter(!is.na(Semana_Num)) %>%
+        group_by(Semana_Num) %>%
+        summarise(
+          Organos = sum(Boton + Flor, na.rm = TRUE),
+          Muestra = sum(MuestraF, na.rm = TRUE),
+          Carga   = ifelse(Muestra > 0, Organos / Muestra, mean(Total_Floral_Planta, na.rm = TRUE)),
+          .groups = "drop"
+        )
+    }
     
     sw_int <- round(d / 7)
     df_join <- df_y %>%
@@ -13250,7 +14314,7 @@ server <- function(input, output, session) {
     updateSliderInput(session, "calibrar_slider_dias", value = d_val)
   }, ignoreInit = TRUE)
   
-  # Observer: Ajustar Automáticamente
+  # Observer: Ajustar Automáticamente (Sincroniza Picos y Guarda Inmediatamente)
   observeEvent(input$btn_auto_ajustar_calce, {
     m <- calibrador_state$modulo
     v <- calibrador_state$variedad
@@ -13265,8 +14329,30 @@ server <- function(input, output, session) {
     
     if (!is.na(opt$r)) {
       updateSliderInput(session, "calibrar_slider_dias", value = opt$opt_dias)
+      
+      # Persistir inmediatamente la calibración para este turno
+      df_mad_t <- rv_maduracion_turno()
+      if (is.null(df_mad_t) || !is.data.frame(df_mad_t)) df_mad_t <- cargar_maduracion_turno_disco()
+      
+      df_mad_t <- df_mad_t %>%
+        filter(!(Módulo == m & Turno == t & Variedad == v))
+      
+      nueva_fila <- tibble(
+        Módulo             = m,
+        Turno              = t,
+        Variedad           = v,
+        Dias_Maduracion    = opt$opt_dias,
+        Correlacion        = round(opt$r, 3),
+        Fecha_Calibracion  = as.character(Sys.Date())
+      )
+      df_mad_t <- bind_rows(df_mad_t, nueva_fila)
+      
+      rv_maduracion_turno(df_mad_t)
+      guardar_maduracion_turno_disco(df_mad_t)
+      calibrador_state$dias <- opt$opt_dias
+      
       showNotification(
-        sprintf("✔ Calce óptimo para Turno %s: %d días (%d semanas, r = %+.3f).", t, opt$opt_dias, opt$sem_shift, opt$r),
+        sprintf("✔ Calce óptimo sincronizado y guardado para Turno %s (%s): %d días (%d semanas, r = %+.3f).", t, v, opt$opt_dias, opt$sem_shift, opt$r),
         type = "message", duration = 4
       )
     } else {
@@ -13656,6 +14742,7 @@ server <- function(input, output, session) {
       }
       
       dias_previos_nom <- if (dia_inicio_idx > 1) dias_nombres[1:(dia_inicio_idx - 1)] else character(0)
+      dia_siguiente_nom <- if (dia_inicio_idx < dia_fin_idx) dias_nombres[dia_inicio_idx + 1] else dia_inicio_nom
       cols_ha_prev <- paste0("Ha_", dias_previos_nom)
       cols_kg_prev <- paste0("Kg_", dias_previos_nom)
       cols_ha_rc_exist <- intersect(cols_ha_prev, names(rc_sem))
@@ -13826,16 +14913,33 @@ server <- function(input, output, session) {
         ) %>%
         left_join(
           if (!is.null(df_frec_valvs_2sem) && nrow(df_frec_valvs_2sem) > 0) {
-            df_frec_valvs_2sem %>% select(codigo_norm, Frec_Auto_Dias = Dias_Frecuencia, Dia_Auto_Valv = Dia_Proyectado_Nom)
-          } else tibble(codigo_norm = character(), Frec_Auto_Dias = integer(), Dia_Auto_Valv = character()),
-          by = "codigo_norm"
+            df_frec_valvs_2sem %>%
+              distinct(codigo_norm, Variedad, .keep_all = TRUE) %>%
+              select(codigo_norm, Variedad, Frec_Auto_Dias = Dias_Frecuencia, Frec_S1_Exacta, Dia_Auto_Valv = Dia_Proyectado_Nom)
+          } else tibble(codigo_norm = character(), Variedad = character(), Frec_Auto_Dias = integer(), Frec_S1_Exacta = numeric(), Dia_Auto_Valv = character()),
+          by = c("codigo_norm", "Variedad")
+        ) %>%
+        left_join(
+          if (!is.null(df_frec_valvs_2sem) && nrow(df_frec_valvs_2sem) > 0) {
+            df_frec_valvs_2sem %>%
+              group_by(Módulo, Turno, Variedad) %>%
+              summarise(Frec_Med_Turno_S1 = round(mean(Frec_S1_Exacta, na.rm = TRUE), 1), .groups = "drop")
+          } else tibble(Módulo = character(), Turno = character(), Variedad = character(), Frec_Med_Turno_S1 = numeric()),
+          by = c("Módulo", "Turno", "Variedad")
+        ) %>%
+        left_join(
+          if (!is.null(df_frec_valvs_2sem) && nrow(df_frec_valvs_2sem) > 0) {
+            df_frec_valvs_2sem %>%
+              group_by(Módulo, Variedad) %>%
+              summarise(Frec_Med_ModVar_S1 = round(median(Frec_S1_Exacta, na.rm = TRUE), 1), .groups = "drop")
+          } else tibble(Módulo = character(), Variedad = character(), Frec_Med_ModVar_S1 = numeric()),
+          by = c("Módulo", "Variedad")
         ) %>%
         mutate(
-          Frecuencia_Dias = if (modo_frec == "manual") {
-            coalesce(as.integer(Frec_Manual_Dias), ifelse(Variedad == "ROCIO", 3L, 7L))
-          } else {
-            coalesce(as.integer(Frec_Auto_Dias), as.integer(Frec_Manual_Dias), ifelse(Variedad == "ROCIO", 3L, 7L))
-          },
+          # Frecuencia Real de S-1 (intervalo con el que se cosechó la semana anterior S-2 -> S-1)
+          Frec_Ant_Valv = coalesce(as.numeric(Frec_S1_Exacta), as.numeric(Frec_Med_Turno_S1), as.numeric(Frec_Med_ModVar_S1), ifelse(Variedad == "ROCIO", 4.0, 7.0)),
+          # Frecuencia objetivo para la semana actual S
+          Frecuencia_Dias = coalesce(as.integer(Frec_Manual_Dias), ifelse(Variedad == "ROCIO", 3L, 7L)),
           Dia_Auto_Valv = if (modo_frec == "manual") NA_character_ else Dia_Auto_Valv
         ) %>%
         left_join(
@@ -13851,26 +14955,26 @@ server <- function(input, output, session) {
         left_join(rc_valv_avance, by = "codigo_norm") %>%
         left_join(sap_valv_avance, by = "codigo_norm") %>%
         mutate(
-          # REGLA DE COHERENCIA BÁSCULA vs CAMPO:
-          # Si SAP ya cerró la recepción de la válvula con pesaje oficial (Kg_Prog_Sap > 0 o Ha_Prog_Sap > 0),
-          # se adopta la superficie real cerrada de SAP para evitar que hojas de rutas desfasadas
-          # REGLA OPERATIVA ACP: Mandan las Ha de Campo (recorrido físico) y los Kilos de SAP
+          # REGLA OPERATIVA ACP:
+          # Si una válvula tiene ruta de campo pero NO tiene kilos en SAP (Kg_Prog_Sap <= 0),
+          # NO considerarla como cosechada/programada. Se deja íntegramente como área pendiente para ajustar.
           Ha_Prog      = case_when(
-            !is.null(rc_sem) && nrow(rc_sem) > 0 ~ pmin(Área, coalesce(Ha_Prog_Rc, 0)),
-            coalesce(Ha_Prog_Sap, 0) > 0         ~ pmin(Área, Ha_Prog_Sap),
-            TRUE                                 ~ 0
+            coalesce(Kg_Prog_Sap, 0) > 0 & coalesce(Ha_Prog_Rc, 0) > 0  ~ pmin(Área, Ha_Prog_Rc),
+            coalesce(Kg_Prog_Sap, 0) > 0 & coalesce(Ha_Prog_Sap, 0) > 0 ~ pmin(Área, Ha_Prog_Sap),
+            coalesce(Kg_Prog_Sap, 0) > 0                                ~ Área,
+            TRUE                                                        ~ 0
           ),
           Kg_Prog      = case_when(
             Ha_Prog > 0 & coalesce(Kg_Prog_Sap, 0) > 0 ~ Kg_Prog_Sap,
-            Ha_Prog > 0 & coalesce(Kg_Prog_Rc, 0) > 0  ~ Kg_Prog_Rc,
-            is.null(rc_sem) || nrow(rc_sem) == 0       ~ coalesce(Kg_Prog_Sap, 0),
             TRUE                                       ~ 0
           ),
-          Ha_Lunes_Rc   = pmax(coalesce(Ha_Lunes_Rc, 0), coalesce(Ha_Lunes_Sap, 0)),
-          Ha_Martes_Rc  = pmax(coalesce(Ha_Martes_Rc, 0), coalesce(Ha_Martes_Sap, 0)),
-          Kg_Lunes_Valv = coalesce(Kg_Lunes_Sap, 0) + ifelse(coalesce(Kg_Lunes_Sap, 0) == 0, coalesce(Kg_Lunes_Rc, 0), 0),
-          Kg_Martes_Valv = coalesce(Kg_Martes_Sap, 0) + ifelse(coalesce(Kg_Martes_Sap, 0) == 0, coalesce(Kg_Martes_Rc, 0), 0),
-          Ha_Faltante   = pmax(0, Área - Ha_Prog)
+          Ha_Lunes_Rc   = if_else(coalesce(Kg_Lunes_Sap, 0) > 0, pmax(coalesce(Ha_Lunes_Rc, 0), coalesce(Ha_Lunes_Sap, 0)), 0),
+          Ha_Martes_Rc  = if_else(coalesce(Kg_Martes_Sap, 0) > 0, pmax(coalesce(Ha_Martes_Rc, 0), coalesce(Ha_Martes_Sap, 0)), 0),
+          Kg_Lunes_Valv = coalesce(Kg_Lunes_Sap, 0),
+          Kg_Martes_Valv = coalesce(Kg_Martes_Sap, 0),
+          Ha_Rc_Inicio  = 0,
+          Ha_Prog_Total = pmin(Área, Ha_Prog),
+          Ha_Faltante   = pmax(0, Área - Ha_Prog_Total)
         ) %>%
         left_join(valv_7d_map, by = "codigo_norm") %>%
         left_join(turno_dia_habitual, by = c("Módulo", "Turno")) %>%
@@ -13880,18 +14984,29 @@ server <- function(input, output, session) {
           Dia_Base_Ant            = coalesce(Dia_7d, Dia_Habitual),
           Dia_Natural_Valv        = case_when(
             !is.na(Dia_Ruta_Sem) & nzchar(Dia_Ruta_Sem)   ~ Dia_Ruta_Sem,
+            Variedad == "ROCIO"                           ~ dia_inicio_nom,
             !is.na(Dia_Rect_Ant) & nzchar(Dia_Rect_Ant)   ~ desplazar_dia_frecuencia(Dia_Rect_Ant, Frecuencia_Dias, dias_nombres, 1L, "Lunes", 6L, "Sábado"),
-            !is.na(Dia_Auto_Valv) & nzchar(Dia_Auto_Valv) ~ Dia_Auto_Valv,
             !is.na(Dia_Base_Ant) & nzchar(Dia_Base_Ant)   ~ desplazar_dia_frecuencia(Dia_Base_Ant, Frecuencia_Dias, dias_nombres, 1L, "Lunes", 6L, "Sábado"),
+            !is.na(Dia_Auto_Valv) & nzchar(Dia_Auto_Valv) ~ Dia_Auto_Valv,
             TRUE                                          ~ dia_inicio_nom
           ),
           idx_natural             = match(Dia_Natural_Valv, dias_nombres),
           idx_natural             = ifelse(is.na(idx_natural), dia_inicio_idx, idx_natural),
-          # REGLA DE POSICIONAMIENTO EN RANGO [DESDE, HASTA]:
-          # Si el día natural está dentro del rango disponible, se respeta.
-          # Si cae antes (ej. Martes cuando rango empieza Miércoles), se posiciona en dia_inicio (fecha más próxima).
-          # Si cae después (ej. Sábado cuando rango termina Viernes), se posiciona en dia_fin (fecha más próxima).
           idx_asig_rango          = pmin(dia_fin_idx, pmax(dia_inicio_idx, idx_natural)),
+          Dia_Asig_Nom            = dias_nombres[idx_asig_rango],
+          Dia_Ant_Ref             = coalesce(Dia_Rect_Ant, Dia_7d, Dia_Habitual),
+          dias_interv_valv        = {
+            dias_map_local <- setNames(1:6, dias_nombres)
+            idx_ant <- dias_map_local[Dia_Ant_Ref]
+            idx_act <- dias_map_local[Dia_Asig_Nom]
+            if (modo_frec == "manual") {
+              coalesce(as.numeric(Frecuencia_Dias), ifelse(Variedad == "ROCIO", 4, 7))
+            } else {
+              ifelse(!is.na(idx_ant) & !is.na(idx_act),
+                     as.numeric((7L - as.integer(idx_ant)) + as.integer(idx_act)),
+                     coalesce(as.numeric(Frecuencia_Dias), ifelse(Variedad == "ROCIO", 4, 7)))
+            }
+          },
           Dia_Habitual_Calc       = dias_nombres[idx_asig_rango],
           Tiene_Ciclo_Previo_Valv = !is.na(Dia_7d) | (!is.na(Dia_Auto_Valv) & nzchar(Dia_Auto_Valv)) | (!is.na(Dia_Ruta_Sem) & nzchar(Dia_Ruta_Sem)),
           
@@ -13980,12 +15095,14 @@ server <- function(input, output, session) {
       turno_avance_ha <- valvulas_calc %>%
         group_by(Módulo, Turno, Variedad) %>%
         summarise(
-          Ha_Prog_Turno     = sum(Ha_Prog, na.rm = TRUE),
+          Ha_Prog_Turno     = sum(Ha_Prog_Total, na.rm = TRUE),
           Kg_Prog_Turno     = sum(Kg_Prog, na.rm = TRUE),
           Ha_Lunes_Turno    = sum(Ha_Lunes_Rc, na.rm = TRUE),
           Ha_Martes_Turno   = sum(Ha_Martes_Rc, na.rm = TRUE),
           Ha_Faltante_Turno = sum(Ha_Faltante, na.rm = TRUE),
           Area_Total_Turno  = sum(Área, na.rm = TRUE),
+          Frec_Turno_Sem    = round(weighted.mean(dias_interv_valv, w = Área, na.rm = TRUE), 1),
+          Frec_Ant_Turno    = round(weighted.mean(Frec_Ant_Valv, w = Área, na.rm = TRUE), 1),
           Valvulas_Total    = n(),
           Frecuencia_Dias   = first(Frecuencia_Dias),
           Ha_Fresca_Turno   = sum(Ha_Fresca_Valv, na.rm = TRUE),
@@ -14071,6 +15188,8 @@ server <- function(input, output, session) {
           )
       }
       
+      elast_frec_pct <- tryCatch(rv_elasticidad_frecuencia(), error = function(e) 70)
+      
       rend_turno <- rend_turno %>%
         mutate(
           Kg_Real_Sem        = coalesce(Kg_Real_Sem, 0),
@@ -14086,20 +15205,37 @@ server <- function(input, output, session) {
           Sap_Cosecho_Martes = coalesce(Sap_Cosecho_Martes, FALSE),
           Rend_Proy          = ifelse(Area_Total_Turno > 0 & Proy_Kg > 0, Proy_Kg / Area_Total_Turno, 0),
           
+          # ====================================================================
+          # FACTOR DE FRECUENCIA COMPARATIVA (Semana Actual S vs Semana Anterior S-1)
+          # Si usa Rend_Ant_Turno (> 0), compara Frec_Turno_Sem contra Frec_Ant_Turno (S-1).
+          # Si no tuvo cosecha en S-1 y usa Rend_Proy, compara contra la base estándar (7d / 4d Rocío).
+          # ====================================================================
+          Frec_Estandar_Var = ifelse(limpiar_variedad(Variedad) == "ROCIO", 4.0, 7.0),
+          Frec_Turno_Sem    = coalesce(Frec_Turno_Sem, Frec_Estandar_Var),
+          Frec_Ant_Turno    = coalesce(Frec_Ant_Turno, Frec_Estandar_Var),
+          Frec_Base_Turno   = ifelse(Rend_Ant_Turno > 0, Frec_Ant_Turno, Frec_Estandar_Var),
+          Diff_Dias_Frec    = round(Frec_Turno_Sem - Frec_Base_Turno, 1),
+          Factor_Frecuencia = vapply(seq_along(Diff_Dias_Frec), function(k) {
+            calcular_factor_frecuencia(Diff_Dias_Frec[k], Frec_Base_Turno[k], elast_frec_pct)$factor
+          }, numeric(1)),
+          Delta_Frec_Pct    = vapply(seq_along(Diff_Dias_Frec), function(k) {
+            calcular_factor_frecuencia(Diff_Dias_Frec[k], Frec_Base_Turno[k], elast_frec_pct)$delta_pct
+          }, numeric(1)),
+          
           # Detección de remanente mínimo (<15% proyección o <50 kg/ha sin reporte de rutas)
           es_remanente_minimo = (Ha_Prog_Turno == 0) & (Kg_Real_Sem > 0) & 
             ((Kg_Real_Sem / pmax(1, Proy_Kg)) < 0.15 | (Kg_Real_Sem / pmax(0.1, Area_Total_Turno)) < 50),
           
-          # Detección de cosecha previa al día de inicio de ajuste
-          Cosecho_Lunes     = Sap_Cosecho_Lunes | (Ha_Lunes_Turno > 0) | (Kg_Lunes_Real > 0),
-          Cosecho_Martes    = Sap_Cosecho_Martes | (Ha_Martes_Turno > 0) | (Kg_Martes_Real > 0),
-          Tiene_Cosecha_Act = !es_remanente_minimo & (Sap_Cosecho_Previo | Cosecho_Lunes | Cosecho_Martes | Kg_Real_Sem > 0 | Ha_Prog_Turno > 0),
+          # Detección de cosecha previa al día de inicio de ajuste (SOLO con pesaje oficial SAP)
+          Cosecho_Lunes     = Sap_Cosecho_Lunes | (Kg_Lunes_Real > 0),
+          Cosecho_Martes    = Sap_Cosecho_Martes | (Kg_Martes_Real > 0),
+          Tiene_Cosecha_Act = !es_remanente_minimo & (Sap_Cosecho_Previo | Cosecho_Lunes | Cosecho_Martes | Kg_Real_Sem > 0),
           
           Ha_Recorrida_Turno = case_when(
-            Ha_Prog_Turno > 0   ~ Ha_Prog_Turno,
-            es_remanente_minimo ~ round(pmin(Area_Total_Turno, Kg_Real_Sem / pmax(1, Rend_Proy)), 2),
-            Kg_Real_Sem > 0     ~ round(pmin(Area_Total_Turno, Kg_Real_Sem / pmax(1, Rend_Proy)), 2),
-            TRUE                ~ 0
+            Kg_Real_Sem > 0 & Ha_Prog_Turno > 0 ~ Ha_Prog_Turno,
+            es_remanente_minimo                 ~ round(pmin(Area_Total_Turno, Kg_Real_Sem / pmax(1, Rend_Proy)), 2),
+            Kg_Real_Sem > 0                     ~ round(pmin(Area_Total_Turno, Kg_Real_Sem / pmax(1, Rend_Proy)), 2),
+            TRUE                                ~ 0
           ),
           
           Prop_Avance_Turno = ifelse(Area_Total_Turno > 0, pmin(1, Ha_Recorrida_Turno / Area_Total_Turno), 0),
@@ -14191,7 +15327,7 @@ server <- function(input, output, session) {
           # Si el rendimiento de la semana pasada (S-1) aplicándole el factor floral supera a la
           # proyección oficial por más de 25%, se utiliza la proyección; sino, se sigue con el rendimiento calculado.
           Usa_Base_S1     = (Rend_Base_Turno == Rend_Ant_Turno) & (Rend_Ant_Turno > 0),
-          Rend_S1_Floral  = round(Rend_Ant_Turno * Factor_Floral, 2),
+          Rend_S1_Floral  = round(Rend_Ant_Turno * Factor_Floral * Factor_Frecuencia, 2),
           Excede_25_Proy  = Usa_Base_S1 & Esta_Proyectado & (Rend_Proy > 0) & (Rend_S1_Floral > 1.25 * Rend_Proy),
           Pct_Exceso_Proy = round(((Rend_S1_Floral / pmax(1, Rend_Proy)) - 1) * 100, 1),
           
@@ -14202,7 +15338,7 @@ server <- function(input, output, session) {
             Semana_Ant_No_Finalizo & Tiene_Cosecha_Fresca & Prop_Fresca_Turno > prop_umbral_cfg ~ round(Rend_Base_Turno, 2),
             Tiene_Cosecha_Act & Prop_Avance_Turno > prop_umbral_cfg                              ~ round(Rend_Base_Turno, 2),
             Excede_25_Proy                                                                      ~ round(Rend_Proy, 2),
-            TRUE                                                                                ~ round(Rend_Base_Turno * Factor_Floral, 2)
+            TRUE                                                                                ~ round(Rend_Base_Turno * Factor_Floral * Factor_Frecuencia, 2)
           ),
           
           # Si el turno NO está proyectado en la semana o si se cosechó 100% entre Lunes/Martes y NO es Rocío -> No ajustar (0)
@@ -14237,12 +15373,22 @@ server <- function(input, output, session) {
             TRUE                            ~ "Floral neutro (0%)"
           ),
           
+          Detalle_Frecuencia = case_when(
+            !Esta_Proyectado | (Turno_Completo_Lun_Mar & !Es_Ciclo_Corto) | (Turno_Completo_Lun_Mar & Es_Ciclo_Corto) ~ "",
+            Semana_Ant_No_Finalizo & Tiene_Cosecha_Fresca & Prop_Fresca_Turno > prop_umbral_cfg ~ "",
+            Tiene_Cosecha_Act & Prop_Avance_Turno > prop_umbral_cfg ~ "",
+            Excede_25_Proy ~ "",
+            abs(Diff_Dias_Frec) >= 0.3 ~ sprintf("Frec: %.1fd (S-1) ➔ %.1fd (%+.1fd, %+.1f%%)", Frec_Base_Turno, Frec_Turno_Sem, Diff_Dias_Frec, Delta_Frec_Pct),
+            TRUE ~ sprintf("Frec: %.1fd (S-1) ➔ %.1fd (0%%)", Frec_Base_Turno, Frec_Turno_Sem)
+          ),
           Motivo_Ajuste = case_when(
             !Esta_Proyectado ~ "No proyectado",
             Turno_Completo_Lun_Mar & !Es_Ciclo_Corto ~ "Cerró 100% en Lun/Mar",
             Turno_Completo_Lun_Mar & Es_Ciclo_Corto ~ Motivo_Base,
             Semana_Ant_No_Finalizo & Tiene_Cosecha_Fresca & Prop_Fresca_Turno > prop_umbral_cfg ~ Motivo_Base,
+            nzchar(Detalle_Floral) & nzchar(Detalle_Frecuencia) ~ paste0(Motivo_Base, " • ", Detalle_Floral, " • ", Detalle_Frecuencia),
             nzchar(Detalle_Floral) ~ paste0(Motivo_Base, " • ", Detalle_Floral),
+            nzchar(Detalle_Frecuencia) ~ paste0(Motivo_Base, " • ", Detalle_Frecuencia),
             TRUE ~ Motivo_Base
           )
         )
@@ -14255,7 +15401,7 @@ server <- function(input, output, session) {
             Esta_Proyectado, Tiene_Cosecha_Act, Semana_Ant_No_Finalizo, Turno_Completo_Lun_Mar, Es_Ciclo_Corto,
             Cosecho_Lunes, Cosecho_Martes, Kg_Lunes_Real, Kg_Martes_Real, Kg_Real_Sem, Ha_Prog_Turno,
             Area_Total_Turno, Ha_Manual_1ra, Ha_Manual_2da, Ha_Faltante_Turno_Neto, Turno_Completo_1ra, Ha_Real_2da, Ha_Faltante_2da_Neto, Turno_Completo_2da,
-            Ultimo_Dia_Cosecha_Ant, Prop_Avance_Turno, Factor_Floral, Tipo_Efecto_Floral, Delta_Floral_Pct, Motivo_Ajuste
+            Factor_Floral, Tipo_Efecto_Floral, Delta_Floral_Pct, Factor_Frecuencia, Delta_Frec_Pct, Frec_Turno_Sem, Frec_Ant_Turno, Frec_Base_Turno, Motivo_Ajuste
           ),
           by = c("Módulo", "Turno", "Variedad")
         ) %>%
@@ -14268,6 +15414,7 @@ server <- function(input, output, session) {
           Valvula_Tiene_2da_Real   = codigo_norm %in% valvs_con_2da_rc,
           
           Ha_Cosechada_Lunes = case_when(
+            coalesce(Kg_Lunes_Real, 0) <= 0 & coalesce(Kg_Lunes_Valv, 0) <= 0                       ~ 0,
             Ha_Lunes_Rc > 0                                                                          ~ Ha_Lunes_Rc,
             Valvula_Cosecho_Lunes                                                                    ~ Área,
             !Semana_Ant_No_Finalizo & Cosecho_Lunes & !Cosecho_Martes & Ha_Prog_Turno == 0            ~ Área,
@@ -14276,6 +15423,7 @@ server <- function(input, output, session) {
             TRUE                                                                                     ~ 0
           ),
           Ha_Cosechada_Martes = case_when(
+            coalesce(Kg_Martes_Real, 0) <= 0 & coalesce(Kg_Martes_Valv, 0) <= 0                      ~ 0,
             Ha_Martes_Rc > 0                                                                         ~ Ha_Martes_Rc,
             Valvula_Cosecho_Martes                                                                   ~ Área,
             !Semana_Ant_No_Finalizo & !Cosecho_Lunes & Cosecho_Martes & Ha_Prog_Turno == 0            ~ Área,
@@ -14320,30 +15468,21 @@ server <- function(input, output, session) {
       # COMPONENTES DE AJUSTE AUTOMÁTICO SEGÚN FLUJOGRAMA:
       # ------------------------------------------------------------------------
       
-      # Componente 0: HECTÁREAS QUE YA TIENEN RUTA PERO AÚN NO TIENEN KILOS EN SAP (ej. Martes con ruta y 0 kg en SAP)
-      # Nota: Solo se calculan si el turno está proyectado. Como son Ha Recorrida, se registra Ha_Asignada = 0
-      # para no inflar 'Ha Ajustada' y permitir identificar los kilos en rojo sin duplicar área recorrida.
-      reg_ruta_lun <- valvulas_calc %>%
-        filter(coalesce(Esta_Proyectado, FALSE), Ha_Lunes_Rc > 0, Kg_Lunes_Real == 0) %>%
-        mutate(
-          Dia_Asignado   = "Lunes",
-          Kg_Asignado    = round(Ha_Lunes_Rc * coalesce(Rend_Base_Turno, 0), 2),
-          Ha_Asignada    = 0,
-          Num_Pasada     = 1L,
-          Es_Ruta_Sin_Kg = TRUE
-        ) %>%
-        filter(Kg_Asignado > 0)
+      # Componente 0: Rutas sin pesaje oficial SAP NO se asignan con kilos sintéticos.
+      # Se dejan íntegramente como área pendiente para ajustar en el Componente 1 (Pasada Regular).
+      reg_ruta_lun <- tibble(
+        id = character(), codigo = character(), Sector = character(), Módulo = character(),
+        Turno = character(), Variedad = character(), Dia_Asignado = character(),
+        Kg_Asignado = numeric(), Ha_Asignada = numeric(), Num_Pasada = integer(),
+        Es_Ruta_Sin_Kg = logical(), Motivo_Ajuste = character()
+      )
       
-      reg_ruta_mar <- valvulas_calc %>%
-        filter(coalesce(Esta_Proyectado, FALSE), Ha_Martes_Rc > 0, Kg_Martes_Real == 0) %>%
-        mutate(
-          Dia_Asignado   = "Martes",
-          Kg_Asignado    = round(Ha_Martes_Rc * coalesce(Rend_Base_Turno, 0), 2),
-          Ha_Asignada    = 0,
-          Num_Pasada     = 1L,
-          Es_Ruta_Sin_Kg = TRUE
-        ) %>%
-        filter(Kg_Asignado > 0)
+      reg_ruta_mar <- tibble(
+        id = character(), codigo = character(), Sector = character(), Módulo = character(),
+        Turno = character(), Variedad = character(), Dia_Asignado = character(),
+        Kg_Asignado = numeric(), Ha_Asignada = numeric(), Num_Pasada = integer(),
+        Es_Ruta_Sin_Kg = logical(), Motivo_Ajuste = character()
+      )
       
       # Componente 1: PASADA REGULAR (Válvulas de S-1 en Rama Izquierda + Pasada Regular en Rama Derecha)
       # Nota: Se filtra si Turno_Completo_1ra == TRUE (si entre SAP, Rutas y Ajustes Manuales ya completó 100% de 1ª pasada)
@@ -14362,8 +15501,8 @@ server <- function(input, output, session) {
           ),
           
           Dia_Asignado = case_when(
-            # REGLA EXCLUSIVA ROCÍO: El saldo restante de la 1ª pasada se programa de inmediato en el día de reinicio (Desde:)
-            limpiar_variedad(Variedad) == "ROCIO" ~ dia_inicio_nom,
+            # REGLA EXCLUSIVA ROCÍO: El saldo restante de la 1ª pasada se programa de inmediato en el día de reinicio (Desde:), o siguiente si cosechó en dia_inicio
+            limpiar_variedad(Variedad) == "ROCIO" ~ ifelse(coalesce(Ha_Rc_Inicio, 0) > 0, dia_siguiente_nom, dia_inicio_nom),
             
             # RAMA IZQUIERDA:
             Semana_Ant_No_Finalizo & Tiene_Ciclo_Previo_Valv ~ Dia_Habitual_Calc,
@@ -14371,10 +15510,10 @@ server <- function(input, output, session) {
             Semana_Ant_No_Finalizo ~ dia_inicio_nom,
             
             # RAMA DERECHA:
+            Tiene_Cosecha_Act & coalesce(Ha_Rc_Inicio, 0) > 0 & Ha_Faltante > 0.02 ~ dia_siguiente_nom,
             Tiene_Cosecha_Act & Ha_Prog > 0 & Ha_Faltante > 0.02 ~ dia_inicio_nom,
             TRUE ~ Dia_Habitual_Calc
           ),
-          
           idx_asig = match(Dia_Asignado, dias_nombres),
           Dia_Asignado = case_when(
             !is.na(idx_asig) & idx_asig > dia_fin_idx    ~ dia_fin_nom,
@@ -15841,6 +16980,7 @@ server <- function(input, output, session) {
         
         mod_f <- input$filtro_modulo
         tur_f <- input$filtro_turno
+        var_f <- input$filtro_variedad
         
         d_res <- NA_real_
         es_c  <- FALSE
@@ -15848,6 +16988,10 @@ server <- function(input, output, session) {
         if (!is.null(mod_f) && length(mod_f) == 1 && !is.null(tur_f) && length(tur_f) == 1 && nrow(df_mad_t) > 0) {
           sub_t <- df_mad_t %>% filter(trimws(as.character(Módulo)) == trimws(as.character(mod_f)),
                                        trimws(as.character(Turno)) == trimws(as.character(tur_f)))
+          if (!is.null(var_f) && length(var_f) > 0) {
+            sub_t_v <- sub_t %>% filter(limpiar_variedad(Variedad) %in% limpiar_variedad(var_f))
+            if (nrow(sub_t_v) > 0) sub_t <- sub_t_v
+          }
           if (nrow(sub_t) > 0 && !is.na(sub_t$Dias_Maduracion[1])) {
             d_res <- as.numeric(sub_t$Dias_Maduracion[1])
             es_c  <- TRUE
@@ -15855,9 +16999,21 @@ server <- function(input, output, session) {
         }
         if (is.na(d_res) && !is.null(mod_f) && length(mod_f) == 1 && nrow(df_mad_m) > 0) {
           sub_m <- df_mad_m %>% filter(trimws(as.character(Módulo)) == trimws(as.character(mod_f)))
+          if (!is.null(var_f) && length(var_f) > 0) {
+            sub_m_v <- sub_m %>% filter(limpiar_variedad(Variedad) %in% limpiar_variedad(var_f))
+            if (nrow(sub_m_v) > 0) sub_m <- sub_m_v
+          }
           if (nrow(sub_m) > 0 && !is.na(sub_m$Dias_Maduracion[1])) {
             d_res <- as.numeric(sub_m$Dias_Maduracion[1])
           }
+        }
+        if (is.na(d_res) && !is.null(var_f) && length(var_f) > 0 && nrow(df_mad_t) > 0) {
+          vals_t <- df_mad_t %>% filter(limpiar_variedad(Variedad) %in% limpiar_variedad(var_f)) %>% pull(Dias_Maduracion) %>% na.omit() %>% as.numeric()
+          if (length(vals_t) > 0) d_res <- round(mean(vals_t))
+        }
+        if (is.na(d_res) && !is.null(var_f) && length(var_f) > 0 && nrow(df_mad_m) > 0) {
+          vals_m <- df_mad_m %>% filter(limpiar_variedad(Variedad) %in% limpiar_variedad(var_f)) %>% pull(Dias_Maduracion) %>% na.omit() %>% as.numeric()
+          if (length(vals_m) > 0) d_res <- round(mean(vals_m))
         }
         if (is.na(d_res) && nrow(df_mad_t) > 0) {
           vals <- na.omit(suppressWarnings(as.numeric(df_mad_t$Dias_Maduracion)))
@@ -16477,7 +17633,7 @@ server <- function(input, output, session) {
     
     df_mad_mod <- if (exists("rv_maduracion") && is.function(rv_maduracion)) rv_maduracion() else tibble()
     df_mad_tur <- if (exists("rv_maduracion_turno") && is.function(rv_maduracion_turno)) rv_maduracion_turno() else tibble()
-    sens_pct   <- if (!is.null(input$sensibilidad_floral_pct)) input$sensibilidad_floral_pct else 50
+    sens_pct   <- tryCatch(rv_sensibilidad_floral(), error = function(e) 50)
     
     df_fac <- tryCatch({
       calcular_factor_tendencia_floral(
@@ -16522,8 +17678,8 @@ server <- function(input, output, session) {
     }
     
     # Consolidar métricas para el ámbito seleccionado
-    factor_medio   <- mean(df_fac$Ajuste_Floral_Pct, na.rm = TRUE)
-    delta_medio    <- mean(df_fac$Delta_Floral_Pct, na.rm = TRUE)
+    factor_medio   <- mean(df_fac$Ajuste_Floral_Pct, na.rm = TRUE) * 100
+    delta_medio    <- mean(df_fac$Delta_Floral_Pct, na.rm = TRUE) * 100
     dias_medio     <- round(mean(df_fac$Dias_Maduracion, na.rm = TRUE))
     sem_flor_media <- round(mean(df_fac$Sem_Flor, na.rm = TRUE))
     es_calibrado   <- any(coalesce(df_fac$Es_Personalizado, FALSE))
@@ -16591,6 +17747,164 @@ server <- function(input, output, session) {
         } else {
           span(style = "font-size: 9.5px; color: #8E8E93;", sprintf("Amortig. %d%%", sens_pct))
         }
+      )
+    )
+  })
+
+  # ==============================================================================
+  # KPI CARD: FACTOR DE RENDIMIENTO APLICADO AL TURNO PARA LA SEMANA (EMIL KOWALSKI)
+  # ==============================================================================
+  output$ui_kpi_factor_rendimiento_turno_semana <- renderUI({
+    req(input$filtro_campana, input$filtro_semana)
+    
+    sem_sel  <- as.numeric(input$filtro_semana)
+    camp_sel <- as.character(input$filtro_campana)
+    sem_ant  <- sem_sel - 1
+    
+    # 1. Base S-1 (Rendimiento observado semana previa)
+    df_w <- if (exists("df_hist_oficial_wide", inherits = TRUE) && !is.null(df_hist_oficial_wide)) df_hist_oficial_wide else tibble()
+    dias_cols <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
+    
+    sub_s1 <- df_w %>%
+      filter(!is.na(Codigo_Valv), as.numeric(Semana) == sem_ant)
+    
+    if (!is.null(input$filtro_modulo) && length(input$filtro_modulo) > 0) {
+      sub_s1 <- sub_s1 %>% filter(trimws(as.character(Módulo_Norm)) %in% trimws(as.character(input$filtro_modulo)))
+    }
+    if (!is.null(input$filtro_turno) && length(input$filtro_turno) > 0) {
+      sub_s1 <- sub_s1 %>% filter(trimws(as.character(Turno_Norm)) %in% trimws(as.character(input$filtro_turno)))
+    }
+    if (!is.null(input$filtro_variedad) && length(input$filtro_variedad) > 0) {
+      sub_s1 <- sub_s1 %>% filter(limpiar_variedad(Variedad) %in% limpiar_variedad(input$filtro_variedad))
+    }
+    
+    kg_s1 <- if (nrow(sub_s1) > 0) {
+      sum(sub_s1 %>% select(any_of(paste0("Kg_", dias_cols))) %>% as.matrix(), na.rm = TRUE)
+    } else 0
+    area_s1 <- if (nrow(sub_s1) > 0) sum(sub_s1$Area_Ha, na.rm = TRUE) else 0
+    rend_s1 <- if (area_s1 > 0 && kg_s1 > 0) round(kg_s1 / area_s1, 1) else 0
+    
+    # 2. Factor Floral
+    df_c_hist <- if (exists("df_conteo_historico") && is.data.frame(df_conteo_historico) && nrow(df_conteo_historico) > 0) {
+      df_conteo_historico
+    } else if (file.exists("historico_conteo.rds")) {
+      readRDS("historico_conteo.rds")
+    } else if (file.exists("D:/ACP/Actualizacion Semanal/historico_conteo.rds")) {
+      readRDS("D:/ACP/Actualizacion Semanal/historico_conteo.rds")
+    } else {
+      tibble()
+    }
+    
+    sens_pct   <- rv_sensibilidad_floral()
+    df_mad_mod <- rv_maduracion()
+    if (is.null(df_mad_mod) || nrow(df_mad_mod) == 0) df_mad_mod <- cargar_maduracion_disco()
+    df_mad_tur <- rv_maduracion_turno()
+    if (is.null(df_mad_tur) || nrow(df_mad_tur) == 0) df_mad_tur <- cargar_maduracion_turno_disco()
+    
+    df_fac <- tryCatch({
+      calcular_factor_tendencia_floral(
+        df_conteo        = df_c_hist,
+        campana_sel      = camp_sel,
+        sem_cosecha      = sem_sel,
+        df_maduracion    = df_mad_mod,
+        sensibilidad_pct = sens_pct,
+        df_mad_turno     = df_mad_tur
+      )
+    }, error = function(e) tibble())
+    
+    if (!is.null(input$filtro_modulo) && length(input$filtro_modulo) > 0) {
+      df_fac <- df_fac %>% filter(trimws(as.character(Módulo)) %in% trimws(as.character(input$filtro_modulo)))
+    }
+    if (!is.null(input$filtro_turno) && length(input$filtro_turno) > 0) {
+      df_fac <- df_fac %>% filter(trimws(as.character(Turno)) %in% trimws(as.character(input$filtro_turno)))
+    }
+    if (!is.null(input$filtro_variedad) && length(input$filtro_variedad) > 0) {
+      df_fac <- df_fac %>% filter(toupper(trimws(as.character(Variedad))) %in% toupper(trimws(as.character(input$filtro_variedad))))
+    }
+    
+    factor_flor_val <- if (nrow(df_fac) > 0) mean(df_fac$Factor_Floral, na.rm = TRUE) else 1.0
+    delta_flor_pct  <- (factor_flor_val - 1) * 100
+    
+    # 3. Factor Frecuencia
+    df_frec_camp <- tryCatch(frecuencia_campana_data(), error = function(e) tibble())
+    frec_dias_val <- 7.0
+    if (!is.null(df_frec_camp) && nrow(df_frec_camp) > 0) {
+      sub_fr <- df_frec_camp %>% filter(as.numeric(Semana) == sem_sel)
+      if (!is.null(input$filtro_modulo) && length(input$filtro_modulo) > 0) {
+        sub_fr <- sub_fr %>% filter(trimws(as.character(Módulo)) %in% trimws(as.character(input$filtro_modulo)))
+      }
+      if (!is.null(input$filtro_turno) && length(input$filtro_turno) > 0) {
+        sub_fr <- sub_fr %>% filter(trimws(as.character(Turno)) %in% trimws(as.character(input$filtro_turno)))
+      }
+      if (nrow(sub_fr) > 0 && "Frecuencia" %in% names(sub_fr)) {
+        frec_dias_val <- round(mean(sub_fr$Frecuencia, na.rm = TRUE), 1)
+      }
+    }
+    
+    var_sel_chr <- if (!is.null(input$filtro_variedad) && length(input$filtro_variedad) > 0) limpiar_variedad(input$filtro_variedad[1]) else ""
+    frec_base_val <- if (var_sel_chr == "ROCIO") 4.0 else 7.0
+    diff_dias_val <- frec_dias_val - frec_base_val
+    elast_val     <- tryCatch(rv_elasticidad_frecuencia(), error = function(e) 70)
+    info_frec_kpi <- calcular_factor_frecuencia(diff_dias_val, frec_base_val, elast_val)
+    factor_frec_val <- info_frec_kpi$factor
+    delta_frec_pct  <- info_frec_kpi$delta_pct
+    
+    # 4. Rendimiento Aplicado Resultante
+    rend_aplicado <- if (rend_s1 > 0) {
+      round(rend_s1 * factor_flor_val * factor_frec_val, 1)
+    } else 0
+    delta_total_pct <- if (rend_s1 > 0) round((rend_aplicado / rend_s1 - 1) * 100, 1) else 0
+    
+    signo_tot <- if (delta_total_pct > 0) "+" else ""
+    str_delta_tot <- sprintf("%s%.1f%%", signo_tot, delta_total_pct)
+    color_num_tot <- if (delta_total_pct > 0) "#248A3D" else if (delta_total_pct < 0) "#D32F2F" else "#1C1C1E"
+    
+    tur_txt <- if (!is.null(input$filtro_turno) && length(input$filtro_turno) > 0) {
+      sprintf("Turno %s", paste(input$filtro_turno, collapse = ", "))
+    } else if (!is.null(input$filtro_modulo) && length(input$filtro_modulo) > 0) {
+      sprintf("Módulo %s", paste(input$filtro_modulo, collapse = ", "))
+    } else "Global"
+    
+    div(
+      style = "display: flex; flex-direction: column; gap: 8px;",
+      div(
+        style = "display: flex; justify-content: space-between; align-items: center;",
+        div(
+          style = "display: flex; align-items: center; gap: 6px;",
+          span(style = "width: 7px; height: 7px; border-radius: 50%; background: #007AFF; display: inline-block;"),
+          span(style = "font-size: 12px; font-weight: 600; color: #1C1C1E; letter-spacing: -0.01em;", sprintf("Rendimiento Aplicado S%d", sem_sel))
+        ),
+        span(
+          style = "background: #F4F4F5; color: #1C1C1E; border: 1px solid #E4E4E7; font-size: 10px; font-weight: 600; padding: 1.5px 7px; border-radius: 5px; font-variant-numeric: tabular-nums;",
+          tur_txt
+        )
+      ),
+      div(
+        style = "display: flex; align-items: baseline; justify-content: space-between; margin-top: 1px;",
+        div(
+          span(style = sprintf("font-size: 23px; font-weight: 700; color: %s; letter-spacing: -0.02em; font-variant-numeric: tabular-nums;", color_num_tot),
+               if (rend_aplicado > 0) sprintf("%.1f", rend_aplicado) else "-"),
+          span(style = "font-size: 10.5px; color: #8E8E93; margin-left: 4px;", "kg/ha aj.")
+        ),
+        div(
+          style = sprintf("font-size: 11px; font-weight: 600; color: %s; font-variant-numeric: tabular-nums;", color_num_tot),
+          if (rend_s1 > 0) sprintf("%s vs S%d (%.1f)", str_delta_tot, sem_ant, rend_s1) else "Sin base S-1"
+        )
+      ),
+      div(
+        style = "background: #F9F9FB; border-radius: 8px; padding: 6px 10px; border: 1px solid rgba(0,0,0,0.04); display: flex; justify-content: space-between; align-items: center; font-size: 10px; color: #636366; font-variant-numeric: tabular-nums; flex-wrap: wrap; gap: 4px;",
+        div(
+          span(style = "color: #8E8E93;", "Base: "),
+          strong(style = "color: #1C1C1E;", sprintf("%.1f", rend_s1))
+        ),
+        div(
+          span(style = "color: #8E8E93;", "× Flor: "),
+          strong(style = if (delta_flor_pct < 0) "color: #D32F2F;" else "color: #248A3D;", sprintf("%+.1f%%", delta_flor_pct))
+        ),
+        div(
+          span(style = "color: #8E8E93;", "× Frec: "),
+          strong(style = if (delta_frec_pct > 0) "color: #5856D6;" else "color: #D32F2F;", sprintf("%+.1f%% (%.1fd)", delta_frec_pct, frec_dias_val))
+        )
       )
     )
   })
@@ -18165,14 +19479,22 @@ server <- function(input, output, session) {
 
   # 3. Modal para Guardar Proyección / Escenario
   observeEvent(input$btn_abrir_modal_guardar_escenario, {
+    dias_semana_nombres <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
     camp_sel <- as.character(input$filtro_campana)
     sem_sel  <- as.numeric(input$filtro_semana)
     d_desde  <- if (!is.null(input$ajustar_desde_dia)) input$ajustar_desde_dia else "Lunes"
     d_hasta  <- if (!is.null(input$ajustar_hasta_dia)) input$ajustar_hasta_dia else "Sábado"
     
+    idx_d <- match(d_desde, dias_semana_nombres)
+    idx_h <- match(d_hasta, dias_semana_nombres)
+    if (is.na(idx_d)) idx_d <- 1
+    if (is.na(idx_h)) idx_h <- 6
+    if (idx_h < idx_d) idx_h <- idx_d
+    dias_en_rango_esc <- dias_semana_nombres[idx_d:idx_h]
+
     ed_todas <- ediciones_manuales()
     ed_sem <- if (!is.null(ed_todas) && nrow(ed_todas) > 0) {
-      ed_todas %>% filter(as.character(`Campaña`) == camp_sel, as.numeric(Semana) == sem_sel, coalesce(Valor, 0) > 0)
+      ed_todas %>% filter(as.character(`Campaña`) == camp_sel, as.numeric(Semana) == sem_sel, Campo %in% dias_en_rango_esc, coalesce(Valor, 0) > 0)
     } else tibble()
     
     if (nrow(ed_sem) == 0) {
@@ -18249,15 +19571,23 @@ server <- function(input, output, session) {
       return()
     }
     
+    dias_semana_nombres <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado")
     camp_sel <- as.character(input$filtro_campana)
     sem_sel  <- as.numeric(input$filtro_semana)
     d_desde  <- if (!is.null(input$ajustar_desde_dia)) input$ajustar_desde_dia else "Lunes"
     d_hasta  <- if (!is.null(input$ajustar_hasta_dia)) input$ajustar_hasta_dia else "Sábado"
     rango_str <- sprintf("%s a %s", d_desde, d_hasta)
     
+    idx_d <- match(d_desde, dias_semana_nombres)
+    idx_h <- match(d_hasta, dias_semana_nombres)
+    if (is.na(idx_d)) idx_d <- 1
+    if (is.na(idx_h)) idx_h <- 6
+    if (idx_h < idx_d) idx_h <- idx_d
+    dias_en_rango_esc <- dias_semana_nombres[idx_d:idx_h]
+
     ed_todas <- ediciones_manuales()
     ed_sem <- if (!is.null(ed_todas) && nrow(ed_todas) > 0) {
-      ed_todas %>% filter(as.character(`Campaña`) == camp_sel, as.numeric(Semana) == sem_sel)
+      ed_todas %>% filter(as.character(`Campaña`) == camp_sel, as.numeric(Semana) == sem_sel, Campo %in% dias_en_rango_esc)
     } else tibble()
     
     valvs_todas <- rv_ajuste_valvulas()
@@ -18455,25 +19785,63 @@ server <- function(input, output, session) {
     
     # Helper: Normalizar y evaluar un escenario sobre universo_base()
     evaluar_escenario <- function(df_ed, esc_info = tibble()) {
-      dias_ajuste <- character(0)
-      if (!is.null(esc_info) && nrow(esc_info) > 0) {
+      dias_ajuste  <- character(0)
+      dias_previos <- character(0)
+      
+      # 1. Escenario guardado con rango explícito
+      if (!is.null(esc_info) && nrow(esc_info) > 0 && !is.na(esc_info$Dia_Desde[1]) && nzchar(as.character(esc_info$Dia_Desde[1]))) {
         d_desde <- as.character(esc_info$Dia_Desde[1])
-        d_hasta <- as.character(esc_info$Dia_Hasta[1])
+        d_hasta <- if ("Dia_Hasta" %in% names(esc_info) && !is.na(esc_info$Dia_Hasta[1]) && nzchar(as.character(esc_info$Dia_Hasta[1]))) {
+          as.character(esc_info$Dia_Hasta[1])
+        } else {
+          "Sábado"
+        }
         idx_d <- match(d_desde, dias_semana_nombres)
         idx_h <- match(d_hasta, dias_semana_nombres)
-        if (!is.na(idx_d) && !is.na(idx_h) && idx_d <= idx_h) {
+        if (is.na(idx_d)) idx_d <- 1
+        if (is.na(idx_h)) idx_h <- 6
+        if (idx_h < idx_d) idx_h <- idx_d
+        dias_ajuste <- dias_semana_nombres[idx_d:idx_h]
+        if (idx_d > 1) dias_previos <- dias_semana_nombres[1:(idx_d - 1)]
+      } else {
+        # 2. Ajuste en curso: tomar el rango activo [DESDE, HASTA] de la simulación
+        d_desde <- tryCatch({
+          if (!is.null(input$ajustar_desde_dia) && as.character(input$ajustar_desde_dia) %in% dias_semana_nombres) {
+            as.character(input$ajustar_desde_dia)
+          } else {
+            NULL
+          }
+        }, error = function(e) NULL)
+        
+        d_hasta <- tryCatch({
+          if (!is.null(input$ajustar_hasta_dia) && as.character(input$ajustar_hasta_dia) %in% dias_semana_nombres) {
+            as.character(input$ajustar_hasta_dia)
+          } else {
+            NULL
+          }
+        }, error = function(e) NULL)
+        
+        if (!is.null(d_desde) && !is.null(d_hasta)) {
+          idx_d <- match(d_desde, dias_semana_nombres)
+          idx_h <- match(d_hasta, dias_semana_nombres)
+          if (is.na(idx_d)) idx_d <- 1
+          if (is.na(idx_h)) idx_h <- 6
+          if (idx_h < idx_d) idx_h <- idx_d
           dias_ajuste <- dias_semana_nombres[idx_d:idx_h]
-        } 
+          if (idx_d > 1) dias_previos <- dias_semana_nombres[1:(idx_d - 1)]
+        } else if (!is.null(df_ed) && nrow(df_ed) > 0) {
+          # Fallback para pruebas sin inputs reactivos activos: excluir tipo ruta_sin_kg
+          dias_ajuste <- intersect(dias_semana_nombres, unique(as.character(df_ed$Campo[coalesce(df_ed$Valor, 0) > 0])))
+          if (length(dias_ajuste) == 0) dias_ajuste <- dias_semana_nombres
+          min_idx <- min(match(dias_ajuste, dias_semana_nombres))
+          if (min_idx > 1) dias_previos <- dias_semana_nombres[1:(min_idx - 1)]
+        } else {
+          dias_ajuste <- dias_semana_nombres
+        }
       }
-      if (length(dias_ajuste) == 0 && !is.null(df_ed) && nrow(df_ed) > 0) {
-        dias_ajuste <- intersect(dias_semana_nombres, unique(as.character(df_ed$Campo)))
-      }
-      if (length(dias_ajuste) == 0) dias_ajuste <- dias_semana_nombres
       
-      min_idx <- min(match(dias_ajuste, dias_semana_nombres))
-      dias_previos <- if (min_idx > 1) dias_semana_nombres[1:(min_idx - 1)] else character(0)
-      
-      ed_agg <- if (!is.null(df_ed) && nrow(df_ed) > 0) {
+      # Separar df_ed en 1ra y 2da pasada para coherencia con filtros de pasada (sin pérdida de kilos)
+      ed_filtrada <- if (!is.null(df_ed) && nrow(df_ed) > 0) {
         df_ed %>%
           filter(Campo %in% dias_ajuste, coalesce(Valor, 0) > 0) %>%
           mutate(
@@ -18481,16 +19849,83 @@ server <- function(input, output, session) {
             Turno_clean  = ifelse(!is.na(Turno_num), as.character(Turno_num), trimws(as.character(Turno))),
             Módulo_clean = trimws(as.character(Módulo)),
             Sector_clean = trimws(as.character(Sector)),
-            Var_clean    = toupper(trimws(limpiar_variedad(Variedad)))
-          ) %>%
+            Var_clean    = toupper(trimws(limpiar_variedad(Variedad))),
+            es_rocio     = (Var_clean == "ROCIO"),
+            
+            # Kilos y Has asignadas explícitas
+            k_1ra = coalesce(Kg_Asignado_1ra, 0),
+            h_1ra = coalesce(Ha_Asignada_1ra, 0),
+            k_2da = coalesce(Kg_Asignado_2da, 0),
+            h_2da = coalesce(Ha_Asignada_2da, 0),
+            val_tot = coalesce(Valor, 0),
+            ha_tot  = coalesce(Ha_Asignada, 0),
+            
+            tiene_desglose_k = (k_1ra > 0 | k_2da > 0),
+            tiene_desglose_h = (h_1ra > 0 | h_2da > 0),
+            es_2da_texto     = es_rocio & grepl("2da pasada|2ª pasada", coalesce(Motivo_Ajuste, ""), ignore.case = TRUE),
+            
+            # Asignar 1ª y 2ª pasada con total consistencia sin perder kilos
+            kg_p1 = case_when(
+              tiene_desglose_k ~ k_1ra,
+              tiene_desglose_h & h_1ra > 0 & h_2da == 0 ~ val_tot,
+              !tiene_desglose_k & !es_2da_texto ~ val_tot,
+              TRUE ~ 0
+            ),
+            ha_p1 = case_when(
+              tiene_desglose_h ~ h_1ra,
+              tiene_desglose_k & k_1ra > 0 & k_2da == 0 ~ ha_tot,
+              !tiene_desglose_h & !es_2da_texto ~ ha_tot,
+              TRUE ~ 0
+            ),
+            kg_p2 = case_when(
+              tiene_desglose_k ~ k_2da,
+              tiene_desglose_h & h_2da > 0 & h_1ra == 0 ~ val_tot,
+              !tiene_desglose_k & es_2da_texto ~ val_tot,
+              TRUE ~ 0
+            ),
+            ha_p2 = case_when(
+              tiene_desglose_h ~ h_2da,
+              tiene_desglose_k & k_2da > 0 & k_1ra == 0 ~ ha_tot,
+              !tiene_desglose_h & es_2da_texto ~ ha_tot,
+              TRUE ~ 0
+            ),
+            # Salvaguarda anti-pérdida: si quedó remanente entre kg_p1 + kg_p2 y Valor, sumarlo según corresponda
+            kg_rem = pmax(0, val_tot - (kg_p1 + kg_p2)),
+            kg_p1  = ifelse(kg_rem > 0 & !es_2da_texto, kg_p1 + kg_rem, kg_p1),
+            kg_p2  = ifelse(kg_rem > 0 & es_2da_texto, kg_p2 + kg_rem, kg_p2)
+          )
+      } else {
+        tibble()
+      }
+      ed_p1 <- if (nrow(ed_filtrada) > 0) {
+        ed_filtrada %>%
+          filter(kg_p1 > 0 | ha_p1 > 0) %>%
           group_by(Sector = Sector_clean, Módulo = Módulo_clean, Turno = Turno_clean, Variedad = Var_clean) %>%
           summarise(
-            Ha_Ajustada_Esc = round(sum(coalesce(Ha_Asignada, 0), na.rm = TRUE), 2),
-            Kg_Ajustado_Esc = round(sum(coalesce(Valor, 0), na.rm = TRUE), 1),
+            Ha_Ajustada_Esc = round(sum(coalesce(ha_p1, 0), na.rm = TRUE), 2),
+            Kg_Ajustado_Esc = round(sum(coalesce(kg_p1, 0), na.rm = TRUE), 1),
             Motivo_Ajuste   = {
-              m <- if ("Motivo_Ajuste" %in% names(.)) na.omit(as.character(Motivo_Ajuste)) else character(0)
+              m <- if ("Motivo_Ajuste" %in% names(.)) na.omit(as.character(Motivo_Ajuste[kg_p1 > 0 | ha_p1 > 0])) else character(0)
               m <- m[nzchar(m) & m != "Sin ajuste programado"]
               if (length(m) > 0) m[1] else "Ajuste programado"
+            },
+            .groups = "drop"
+          )
+      } else {
+        tibble(Sector = character(), Módulo = character(), Turno = character(), Variedad = character(), Ha_Ajustada_Esc = numeric(), Kg_Ajustado_Esc = numeric(), Motivo_Ajuste = character())
+      }
+      
+      ed_p2 <- if (nrow(ed_filtrada) > 0) {
+        ed_filtrada %>%
+          filter(kg_p2 > 0 | ha_p2 > 0) %>%
+          group_by(Sector = Sector_clean, Módulo = Módulo_clean, Turno = Turno_clean, Variedad = Var_clean) %>%
+          summarise(
+            Ha_Ajustada_Esc = round(sum(coalesce(ha_p2, 0), na.rm = TRUE), 2),
+            Kg_Ajustado_Esc = round(sum(coalesce(kg_p2, 0), na.rm = TRUE), 1),
+            Motivo_Ajuste   = {
+              m <- if ("Motivo_Ajuste" %in% names(.)) na.omit(as.character(Motivo_Ajuste[kg_p2 > 0 | ha_p2 > 0])) else character(0)
+              m <- m[nzchar(m) & m != "Sin ajuste programado"]
+              if (length(m) > 0) m[1] else "2ª Pasada Rocío"
             },
             .groups = "drop"
           )
@@ -18501,7 +19936,8 @@ server <- function(input, output, session) {
       cols_prev_u <- intersect(dias_previos, names(u_base))
       cols_sem_u  <- intersect(dias_semana_nombres, names(u_base))
       
-      res <- u_base %>%
+      # 1. Base para 1ª Pasada
+      res_1ra <- u_base %>%
         mutate(
           Turno_num    = suppressWarnings(as.numeric(Turno)),
           Turno_clean  = ifelse(!is.na(Turno_num), as.character(Turno_num), trimws(as.character(Turno))),
@@ -18509,37 +19945,42 @@ server <- function(input, output, session) {
           Sector_clean = trimws(as.character(Sector)),
           Var_clean    = toupper(trimws(limpiar_variedad(Variedad))),
           Pasada       = "1ª Pasada",
-          Kg_Real_Prev = if (length(cols_prev_u) > 0) round(rowSums(across(all_of(cols_prev_u)), na.rm = TRUE), 1) else 0,
-          Kg_Real_Semana = round(rowSums(across(all_of(cols_sem_u)), na.rm = TRUE), 1),
-          Kg_Proy_Oficial = round(coalesce(Proyección, 0), 1)
+          Kg_Real_Prev_Tot = if (length(cols_prev_u) > 0) round(rowSums(across(all_of(cols_prev_u)), na.rm = TRUE), 1) else 0,
+          Kg_Real_Sem_Tot  = round(rowSums(across(all_of(cols_sem_u)), na.rm = TRUE), 1),
+          Kg_Real_2da_Sem  = if ("Kg_Real_2da_Sem" %in% names(.)) coalesce(Kg_Real_2da_Sem, 0) else 0,
+          Kg_Real_1ra_Sem  = if ("Kg_Real_1ra_Sem" %in% names(.)) coalesce(Kg_Real_1ra_Sem, round(pmax(0, Kg_Real_Sem_Tot - Kg_Real_2da_Sem), 1)) else round(pmax(0, Kg_Real_Sem_Tot - Kg_Real_2da_Sem), 1),
+          Kg_Real_Semana   = Kg_Real_1ra_Sem,
+          Kg_Real_Prev     = round(pmin(Kg_Real_1ra_Sem, Kg_Real_Prev_Tot), 1),
+          Kg_Proy_Oficial  = round(coalesce(Proyección, 0), 1)
         ) %>%
         left_join(rc_avance_semana, by = c("Módulo_clean" = "Módulo", "Turno_clean" = "Turno", "Var_clean" = "Variedad")) %>%
         mutate(
           Sector             = Sector_clean,
           Ha_Real_Semana_1ra = coalesce(Ha_Real_Semana_1ra, 0),
           Ha_Real_Prev_U     = coalesce(`Ha Real 1ª Pas`, 0),
-          # En Comparativo se evalúa el cierre de la semana completa (Lunes a Sábado),
-          # evitando que quede en 0 si la cosecha fue en días posteriores al selector DESDE
+          # No considerar Ha de ruta si no hay kilos en SAP para la semana
           Ha_Campo = case_when(
-            Ha_Real_Semana_1ra > 0 ~ round(pmin(Área, Ha_Real_Semana_1ra), 2),
-            Ha_Real_Prev_U > 0     ~ round(pmin(Área, Ha_Real_Prev_U), 2),
-            Kg_Real_Semana > 0 & Área > 0 ~ Área,
-            TRUE                   ~ 0
+            coalesce(Kg_Real_Semana, 0) <= 0 ~ 0,
+            Ha_Real_Prev_U > 0               ~ round(pmin(Área, Ha_Real_Prev_U), 2),
+            Ha_Real_Semana_1ra > 0           ~ round(pmin(Área, Ha_Real_Semana_1ra), 2),
+            Área > 0                         ~ Área,
+            TRUE                             ~ 0
           ),
           Pct_Termino  = case_when(
-            Área > 0 & Ha_Campo >= (Área - 0.05) ~ 100,
-            Área > 0 & (Ha_Campo / Área) >= 0.98  ~ 100,
-            Área > 0 ~ round(pmin(100, (Ha_Campo / Área) * 100), 1),
+            # Para que el avance sea 100%, tanto campo debe reportar el área como SAP tener kilos registrados
+            coalesce(Kg_Real_Semana, 0) <= 0 ~ 0,
+            Área > 0 & (Ha_Campo >= (Área - 0.05) | (Ha_Campo / Área) >= 0.98) ~ 100,
+            Área > 0 & Ha_Campo > 0 ~ round(pmin(99, (Ha_Campo / Área) * 100), 1),
             TRUE ~ 0
           )
         ) %>%
-        left_join(ed_agg, by = c("Sector_clean" = "Sector", "Módulo_clean" = "Módulo", "Turno_clean" = "Turno", "Var_clean" = "Variedad")) %>%
+        left_join(ed_p1, by = c("Sector_clean" = "Sector", "Módulo_clean" = "Módulo", "Turno_clean" = "Turno", "Var_clean" = "Variedad")) %>%
         mutate(
           Ha_Ajustada_Esc    = coalesce(Ha_Ajustada_Esc, 0),
           Kg_Ajustado_Esc    = coalesce(Kg_Ajustado_Esc, 0),
           Kg_Ajustado_Semana = round(Kg_Real_Prev + Kg_Ajustado_Esc, 1),
-          Diferencia_Kg      = round(Kg_Ajustado_Semana - Kg_Real_Semana, 1),
-          Pct_Desvio         = ifelse(Kg_Real_Semana > 0, round((Diferencia_Kg / Kg_Real_Semana) * 100, 1), NA_real_),
+          Diferencia_Kg      = round(Kg_Real_Semana - Kg_Ajustado_Semana, 1),
+          Pct_Desvio         = ifelse(Kg_Ajustado_Semana > 0, round((Diferencia_Kg / Kg_Ajustado_Semana) * 100, 1), ifelse(Kg_Real_Semana > 0, 100, NA_real_)),
           Ha_Rend_Aj         = case_when(
             Ha_Ajustada_Esc > 0 ~ Ha_Ajustada_Esc,
             Ha_Campo > 0        ~ Ha_Campo,
@@ -18554,7 +19995,84 @@ server <- function(input, output, session) {
           Módulo             = Módulo_clean,
           Turno              = Turno_clean,
           Variedad           = Var_clean
+        ) %>%
+        select(-any_of(c("Kg_Real_Prev_Tot", "Kg_Real_Sem_Tot")))
+      
+      # 2. Base para 2ª Pasada (solo para ROCIO o turnos que registran 2ª pasada)
+      u_base_2da <- u_base %>%
+        filter(
+          limpiar_variedad(Variedad) == "ROCIO" |
+          coalesce(`Ha Real 2ª Pas`, 0) > 0 |
+          (if ("Kg_Real_2da_Sem" %in% names(.)) coalesce(Kg_Real_2da_Sem, 0) > 0 else FALSE) |
+          paste(trimws(as.character(Módulo)), trimws(as.character(Turno))) %in% paste(ed_p2$Módulo, ed_p2$Turno)
         )
+      
+      res_2da <- if (nrow(u_base_2da) > 0) {
+        u_base_2da %>%
+          mutate(
+            Turno_num    = suppressWarnings(as.numeric(Turno)),
+            Turno_clean  = ifelse(!is.na(Turno_num), as.character(Turno_num), trimws(as.character(Turno))),
+            Módulo_clean = trimws(as.character(Módulo)),
+            Sector_clean = trimws(as.character(Sector)),
+            Var_clean    = toupper(trimws(limpiar_variedad(Variedad))),
+            Pasada       = "2ª Pasada",
+            Kg_Real_Prev_Tot = if (length(cols_prev_u) > 0) round(rowSums(across(all_of(cols_prev_u)), na.rm = TRUE), 1) else 0,
+            Kg_Real_2da_Sem  = if ("Kg_Real_2da_Sem" %in% names(.)) coalesce(Kg_Real_2da_Sem, 0) else 0,
+            Kg_Real_1ra_Sem  = if ("Kg_Real_1ra_Sem" %in% names(.)) coalesce(Kg_Real_1ra_Sem, 0) else 0,
+            Kg_Real_Prev_1ra = round(pmin(Kg_Real_1ra_Sem, Kg_Real_Prev_Tot), 1),
+            Kg_Real_Prev     = round(pmax(0, Kg_Real_Prev_Tot - Kg_Real_Prev_1ra), 1),
+            Kg_Real_Semana   = Kg_Real_2da_Sem,
+            Kg_Proy_Oficial  = 0
+          ) %>%
+          left_join(rc_avance_semana, by = c("Módulo_clean" = "Módulo", "Turno_clean" = "Turno", "Var_clean" = "Variedad")) %>%
+          mutate(
+            Sector             = Sector_clean,
+            Ha_Real_Semana_2da = coalesce(Ha_Real_Semana_2da, 0),
+            Ha_Real_Prev_U     = coalesce(`Ha Real 2ª Pas`, 0),
+            # No considerar Ha de ruta si no hay kilos en SAP para la semana
+            Ha_Campo = case_when(
+              coalesce(Kg_Real_Semana, 0) <= 0 ~ 0,
+              Ha_Real_Prev_U > 0               ~ round(pmin(Área, Ha_Real_Prev_U), 2),
+              Ha_Real_Semana_2da > 0           ~ round(pmin(Área, Ha_Real_Semana_2da), 2),
+              Área > 0                         ~ Área,
+              TRUE                             ~ 0
+            ),
+            Pct_Termino  = case_when(
+              # Para que el avance sea 100%, tanto campo debe reportar el área como SAP tener kilos registrados
+              coalesce(Kg_Real_Semana, 0) <= 0 ~ 0,
+              Área > 0 & (Ha_Campo >= (Área - 0.05) | (Ha_Campo / Área) >= 0.98) ~ 100,
+              Área > 0 & Ha_Campo > 0 ~ round(pmin(99, (Ha_Campo / Área) * 100), 1),
+              TRUE ~ 0
+            )
+          ) %>%
+          left_join(ed_p2, by = c("Sector_clean" = "Sector", "Módulo_clean" = "Módulo", "Turno_clean" = "Turno", "Var_clean" = "Variedad")) %>%
+          mutate(
+            Ha_Ajustada_Esc    = coalesce(Ha_Ajustada_Esc, 0),
+            Kg_Ajustado_Esc    = coalesce(Kg_Ajustado_Esc, 0),
+            Kg_Ajustado_Semana = round(Kg_Real_Prev + Kg_Ajustado_Esc, 1),
+            Diferencia_Kg      = round(Kg_Real_Semana - Kg_Ajustado_Semana, 1),
+            Pct_Desvio         = ifelse(Kg_Ajustado_Semana > 0, round((Diferencia_Kg / Kg_Ajustado_Semana) * 100, 1), ifelse(Kg_Real_Semana > 0, 100, NA_real_)),
+            Ha_Rend_Aj         = case_when(
+              Ha_Ajustada_Esc > 0 ~ Ha_Ajustada_Esc,
+              Ha_Campo > 0        ~ Ha_Campo,
+              Área > 0            ~ Área,
+              TRUE                ~ 0
+            ),
+            Rend_Ajustado      = ifelse(Ha_Rend_Aj > 0 & Kg_Ajustado_Semana > 0, round(Kg_Ajustado_Semana / Ha_Rend_Aj, 1), NA_real_),
+            Rend_Real          = ifelse(Ha_Campo > 0 & Kg_Real_Semana > 0, round(Kg_Real_Semana / Ha_Campo, 1), NA_real_),
+            Delta_Rend         = ifelse(!is.na(Rend_Ajustado) & !is.na(Rend_Real), round(Rend_Ajustado - Rend_Real, 1), NA_real_),
+            Turno_Label        = sprintf("M%s-T%s (%s) 2ª Pas", Módulo_clean, Turno_clean, Var_clean),
+            Motivo_Ajuste      = coalesce(Motivo_Ajuste, "Sin ajuste 2ª pasada"),
+            Módulo             = Módulo_clean,
+            Turno              = Turno_clean,
+            Variedad           = Var_clean
+          ) %>%
+          select(-any_of(c("Kg_Real_Prev_Tot", "Kg_Real_Prev_1ra")))
+      } else {
+        tibble()
+      }
+      
+      res <- bind_rows(res_1ra, res_2da)
       return(res)
     }
     
@@ -18649,10 +20167,10 @@ server <- function(input, output, session) {
           Kg_Esc_A       = coalesce(Kg_Esc_A, 0),
           Kg_Esc_B       = coalesce(Kg_Esc_B, 0),
           Kg_Real_SAP    = coalesce(Kg_Real_SAP, 0),
-          Dif_A_vs_Real  = round(Kg_Esc_A - Kg_Real_SAP, 1),
-          Pct_A_vs_Real  = ifelse(Kg_Real_SAP > 0, round((Dif_A_vs_Real / Kg_Real_SAP) * 100, 1), NA_real_),
-          Dif_B_vs_Real  = round(Kg_Esc_B - Kg_Real_SAP, 1),
-          Pct_B_vs_Real  = ifelse(Kg_Real_SAP > 0, round((Dif_B_vs_Real / Kg_Real_SAP) * 100, 1), NA_real_),
+          Dif_A_vs_Real  = round(Kg_Real_SAP - Kg_Esc_A, 1),
+          Pct_A_vs_Real  = ifelse(Kg_Esc_A > 0, round((Dif_A_vs_Real / Kg_Esc_A) * 100, 1), ifelse(Kg_Real_SAP > 0, 100, NA_real_)),
+          Dif_B_vs_Real  = round(Kg_Real_SAP - Kg_Esc_B, 1),
+          Pct_B_vs_Real  = ifelse(Kg_Esc_B > 0, round((Dif_B_vs_Real / Kg_Esc_B) * 100, 1), ifelse(Kg_Real_SAP > 0, 100, NA_real_)),
           Diferencia_Kg  = round(Kg_Esc_B - Kg_Esc_A, 1),
           Pct_Desvio     = ifelse(Kg_Esc_A > 0, round(((Kg_Esc_B - Kg_Esc_A) / Kg_Esc_A) * 100, 1), NA_real_),
           Tipo_Enfoque   = "vs_escenarios"
@@ -18677,8 +20195,8 @@ server <- function(input, output, session) {
         mutate(
           Dif_Aj_vs_Proy = round(Kg_Ajustado_Semana - Kg_Proy_Oficial, 1),
           Pct_Aj_vs_Proy = ifelse(Kg_Proy_Oficial > 0, round((Dif_Aj_vs_Proy / Kg_Proy_Oficial) * 100, 1), NA_real_),
-          Dif_Aj_vs_Real = round(Kg_Ajustado_Semana - Kg_Real_Semana, 1),
-          Pct_Aj_vs_Real = ifelse(Kg_Real_Semana > 0, round((Dif_Aj_vs_Real / Kg_Real_Semana) * 100, 1), NA_real_),
+          Dif_Aj_vs_Real = round(Kg_Real_Semana - Kg_Ajustado_Semana, 1),
+          Pct_Aj_vs_Real = ifelse(Kg_Ajustado_Semana > 0, round((Dif_Aj_vs_Real / Kg_Ajustado_Semana) * 100, 1), ifelse(Kg_Real_Semana > 0, 100, NA_real_)),
           Tipo_Enfoque   = "semana_completa"
         ) %>%
         filter(Kg_Proy_Oficial > 0 | Kg_Ajustado_Semana > 0 | Kg_Real_Semana > 0)
@@ -18716,8 +20234,8 @@ server <- function(input, output, session) {
       tot_real <- sum(df$Kg_Real_Semana, na.rm = TRUE)
       dif_proy <- round(tot_aj - tot_proy, 0)
       pct_proy <- if (tot_proy > 0) round((dif_proy / tot_proy) * 100, 1) else 0
-      dif_real <- round(tot_aj - tot_real, 0)
-      pct_real <- if (tot_real > 0) round((dif_real / tot_real) * 100, 1) else 0
+      dif_real <- round(tot_real - tot_aj, 0)
+      pct_real <- if (tot_aj > 0) round((dif_real / tot_aj) * 100, 1) else if (tot_real > 0) 100 else 0
       
       div(class = "kpi-container", style = "grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px;",
           div(class = "kpi-card",
@@ -18748,11 +20266,11 @@ server <- function(input, output, session) {
       dif_ba   <- round(tot_b - tot_a, 0)
       pct_ba   <- if (tot_a > 0) round((dif_ba / tot_a) * 100, 1) else 0
       
-      dif_a_real <- round(tot_a - tot_real, 0)
-      pct_a_real <- if (tot_real > 0) round((dif_a_real / tot_real) * 100, 1) else 0
+      dif_a_real <- round(tot_real - tot_a, 0)
+      pct_a_real <- if (tot_a > 0) round((dif_a_real / tot_a) * 100, 1) else if (tot_real > 0) 100 else 0
       
-      dif_b_real <- round(tot_b - tot_real, 0)
-      pct_b_real <- if (tot_real > 0) round((dif_b_real / tot_real) * 100, 1) else 0
+      dif_b_real <- round(tot_real - tot_b, 0)
+      pct_b_real <- if (tot_b > 0) round((dif_b_real / tot_b) * 100, 1) else if (tot_real > 0) 100 else 0
       
       # Badge dinámico: qué escenario estuvo más cercano a la Cosecha Real SAP
       err_a <- abs(tot_a - tot_real)
@@ -18798,8 +20316,8 @@ server <- function(input, output, session) {
       tot_real <- sum(df$Kg_Real_Semana, na.rm = TRUE)
       tot_prev <- sum(df$Kg_Real_Prev, na.rm = TRUE)
       tot_esc  <- sum(df$Kg_Ajustado_Esc, na.rm = TRUE)
-      dif_neta <- round(tot_aj - tot_real, 0)
-      pct_desvio <- if (tot_real > 0) round((dif_neta / tot_real) * 100, 1) else 0
+      dif_neta <- round(tot_real - tot_aj, 0)
+      pct_desvio <- if (tot_aj > 0) round((dif_neta / tot_aj) * 100, 1) else if (tot_real > 0) 100 else 0
       err_abs  <- sum(abs(df$Kg_Ajustado_Semana - df$Kg_Real_Semana), na.rm = TRUE)
       precision <- if (tot_real > 0) round(pmax(0, pmin(100, (1 - (err_abs / tot_real)) * 100)), 1) else 0
       
@@ -18816,9 +20334,9 @@ server <- function(input, output, session) {
               span(class = "kpi-badge", style = "background: rgba(16, 185, 129, 0.10); color: #059669;", "Báscula Semana Completa")
           ),
           div(class = "kpi-card",
-              div(class = "kpi-label", "Desviación Neta (Semana)"),
+              div(class = "kpi-label", "Desviación Real vs Ajuste (Semana)"),
               div(class = "kpi-value", sprintf("%+s kg", format(dif_neta, big.mark = ","))),
-              span(class = "kpi-badge", style = if (abs(pct_desvio) <= 5) "background: rgba(52, 199, 89, 0.12); color: #34C759;" else "background: rgba(245, 158, 11, 0.12); color: #D97706;", sprintf("Desvío: %+1.1f%%", pct_desvio))
+              span(class = "kpi-badge", style = if (abs(pct_desvio) <= 5) "background: rgba(52, 199, 89, 0.12); color: #34C759;" else "background: rgba(245, 158, 11, 0.12); color: #D97706;", sprintf("Δ Real vs Ajuste: %+1.1f%%", pct_desvio))
           ),
           div(class = "kpi-card",
               div(class = "kpi-label", "Precisión del Escenario"),
@@ -18969,7 +20487,7 @@ server <- function(input, output, session) {
           layout(barmode = "group")
       } else if (metrica == "dif_kg") {
         colors_dif <- ifelse(df_plot$Diferencia_Kg >= 0, "#F59E0B", "#3B82F6")
-        p <- p %>% add_bars(x = ~Turno_Label, y = ~Diferencia_Kg, name = "Δ Kilos (Ajuste - Real)", marker = list(color = colors_dif, opacity = 0.88),
+        p <- p %>% add_bars(x = ~Turno_Label, y = ~Diferencia_Kg, name = "Δ Kilos (Real - Ajuste)", marker = list(color = colors_dif, opacity = 0.88),
                             hovertemplate = "<b>%{x}</b><br>Δ vs Real: %{y:+,.1f} kg<extra></extra>")
       } else {
         pct_clip <- pmax(-150, pmin(250, coalesce(df_plot$Pct_Desvio, 0)))
@@ -19071,7 +20589,7 @@ server <- function(input, output, session) {
           `Ajuste Escenario (kg)` = format(round(Kg_Ajustado_Esc, 1), big.mark = ","),
           `Cosecha Ajustada (kg)` = format(round(Kg_Ajustado_Semana, 1), big.mark = ","),
           `Cosecha Real SAP (kg)` = format(round(Kg_Real_Semana, 1), big.mark = ","),
-          `Δ vs Real` = sprintf("%+s kg", format(round(Diferencia_Kg, 1), big.mark = ",")),
+          `Δ Real vs Ajuste` = sprintf("%+s kg", format(round(Diferencia_Kg, 1), big.mark = ",")),
           `% Desvío`  = case_when(
             is.na(Pct_Desvio) & Kg_Ajustado_Semana > 0 ~ '<span style="background: rgba(245, 158, 11, 0.12); color: #D97706; padding: 2px 7px; border-radius: 6px; font-weight: 600; font-size: 11px;">● Sin Cosecha SAP</span>',
             is.na(Pct_Desvio) ~ "-",

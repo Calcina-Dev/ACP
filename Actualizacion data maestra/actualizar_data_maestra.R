@@ -805,6 +805,32 @@ leer_proyeccion_excel <- function(f_p, s_num, v_num) {
       select(-any_of(c('Kg_Delta', 'Base_Mod_Var', 'factor_aj')))
   }
   
+
+  # Reconciliación oficial con Resumen Proyección Edit (Semana 47)
+  # En el archivo oficial S47_V2, se aplicaron ajustes directos a nivel módulo (-28,200 kg totales)
+  # en la hoja 'Resumen Proyección Edit' que no fueron distribuidos en la hoja 'Calculo'.
+  if (s_num == 47) {
+    ajustes_s47 <- tibble(
+      Módulo   = c('1', '10', '10', '10', '10', '12', '12', '13', '14', '4', '5', '6', '7', '7'),
+      Variedad = c('SEKOYA POP', 'MADEIRA', 'MALIBU', 'ROCIO', 'SEKOYA BEAUTY', 'MADEIRA', 'ROCIO', 'ROCIO', 'ROCIO', 'MAGICA', 'MAGICA', 'MAGICA', 'BILOXI', 'VENTURA'),
+      Kg_Delta = c(-300, -300, -1000, -3000, -2000, -2000, -1000, -600, -1000, -1000, -4000, -2000, -1000, -9000)
+    )
+    raw_p_proc <- raw_p_proc %>%
+      left_join(ajustes_s47, by = c('Módulo', 'Variedad')) %>%
+      group_by(Módulo, Variedad) %>%
+      mutate(
+        Base_Mod_Var = sum(Proyección, na.rm = TRUE),
+        factor_aj    = if (!is.na(first(Kg_Delta)) && first(Base_Mod_Var) > 0) {
+          (1 + first(Kg_Delta) / first(Base_Mod_Var))
+        } else {
+          1
+        },
+        Proyección    = round(Proyección * factor_aj, 2),
+        Kg_Proy_Turno = Proyección
+      ) %>%
+      ungroup() %>%
+      select(-any_of(c('Kg_Delta', 'Base_Mod_Var', 'factor_aj')))
+  }
   raw_p_proc
 }
 
@@ -856,7 +882,8 @@ if (dir.exists(dir_proy_det)) {
           (nombre != nombre_prev) |
           (version != version_prev) |
           (mtime_str != mtime_prev) |
-          (fsize != fsize_prev)
+          (fsize != fsize_prev) |
+          (semana %in% c(46, 47))
       )
   } else {
     df_comp <- df_archivos_proy %>%

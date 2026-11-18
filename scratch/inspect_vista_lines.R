@@ -1,0 +1,5 @@
+lines <- readLines("Actualizacion Semanal/app.R", encoding = "UTF-8")
+cat("=== Lines 5550-5565 ===\n")
+cat(paste(lines[5550:5565], collapse = "\n"))
+cat("\n=== Lines 7050-7100 ===\n")
+cat(paste(lines[7050:7100], collapse = "\n"))
