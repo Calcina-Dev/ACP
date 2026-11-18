@@ -700,7 +700,7 @@ if (window.Shiny) {
     resetView();
   });
   
-  Shiny.addCustomMessageHandler('centrar_mapa_canvas', function() {
+  Shiny.addCustomMessageHandler('centrar_mapa_canvas', function(msg) {
     resetView();
   });
 }
